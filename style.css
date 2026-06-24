@@ -1,0 +1,2572 @@
+/* Theme Scopes */
+.rpg-tracker-panel {
+    /* Hacker (Default fallback) */
+    --rt-bg: rgba(20, 20, 20, 0.94);
+    --rt-blur: blur(12px);
+    --rt-border: var(--rt-border);
+    --rt-text: #eee;
+    --rt-text-muted: #888;
+    --rt-font: 'Consolas', 'Monaco', monospace;
+    --rt-font-mono: 'Consolas', 'Monaco', monospace;
+    --rt-accent: #00ffaa;
+    --rt-accent-dim: rgba(0, 255, 170, 0.4);
+    --rt-accent-bg: rgba(0, 255, 170, 0.1);
+    --rt-card-border: var(--rt-card-border);
+    --rt-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+    --rt-header-bg: rgba(255, 255, 255, 0.05);
+    --rt-card-bg: rgba(255, 255, 255, 0.03);
+    --rt-card-header: rgba(255, 255, 255, 0.04);
+    --rt-base-size: 13px;
+}
+
+.rpg-tracker-panel.rt-theme-native {
+    --rt-bg: var(--SmartThemeBlurTrans, rgba(30, 30, 30, 0.93));
+    --rt-blur: var(--smartThemeBlur, blur(10px));
+    --rt-border: var(--smartThemeBorder, 1px solid rgba(255,255,255,0.1));
+    --rt-text: var(--SmartThemeBodyColorText, #eee);
+    --rt-text-muted: var(--SmartThemeBodyColorTextMuted, #aaa);
+    --rt-font: var(--primaryFontFamily, system-ui, sans-serif);
+    --rt-font-mono: var(--monospaceFontFamily, 'Consolas', monospace);
+    --rt-accent: var(--smartThemeMenuColorText, #00ffaa);
+    --rt-accent-dim: var(--white30a, rgba(255, 255, 255, 0.3));
+    --rt-accent-bg: var(--white10a, rgba(255, 255, 255, 0.1));
+    --rt-card-border: var(--smartThemeBorder, 1px solid rgba(255, 255, 255, 0.1));
+    --rt-shadow: 0 10px 40px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.05);
+    --rt-header-bg: var(--black30a, rgba(0,0,0,0.3));
+    --rt-card-bg: var(--black50a, rgba(0,0,0,0.2));
+    --rt-card-header: var(--black30a, rgba(0,0,0,0.3));
+}
+
+.rpg-tracker-panel.rt-theme-hacker {
+    --rt-bg: rgba(10, 15, 10, 0.98);
+    --rt-blur: blur(0px);
+    --rt-border: 1px solid #00ffaa;
+    --rt-text: #00dd88;
+    --rt-text-muted: #007744;
+    --rt-font: 'Consolas', 'Courier New', monospace;
+    --rt-font-mono: 'Consolas', 'Courier New', monospace;
+    --rt-accent: #00ffaa;
+    --rt-accent-dim: rgba(0, 255, 170, 0.5);
+    --rt-accent-bg: rgba(0, 255, 170, 0.15);
+    --rt-card-border: 1px dashed rgba(0, 255, 170, 0.3);
+    --rt-shadow: 0 0 20px rgba(0, 255, 170, 0.15);
+    --rt-header-bg: rgba(0, 255, 170, 0.1);
+    --rt-card-bg: rgba(0, 0, 0, 0.5);
+    --rt-card-header: rgba(0, 255, 170, 0.05);
+}
+
+.rpg-tracker-panel.rt-theme-fantasy {
+    --rt-bg: rgba(45, 35, 25, 0.95);
+    --rt-blur: blur(4px);
+    --rt-border: 1px solid #8b6b4a;
+    --rt-text: #e6dac3;
+    --rt-text-muted: #a69176;
+    --rt-font: 'Georgia', 'Times New Roman', serif;
+    --rt-font-mono: 'Consolas', monospace;
+    --rt-accent: #ffd700;
+    --rt-accent-dim: rgba(255, 215, 0, 0.4);
+    --rt-accent-bg: rgba(255, 215, 0, 0.1);
+    --rt-card-border: 1px solid rgba(139, 107, 74, 0.4);
+    --rt-shadow: 0 10px 30px rgba(0, 0, 0, 0.7), inset 0 0 40px rgba(0,0,0,0.5);
+    --rt-header-bg: rgba(0, 0, 0, 0.4);
+    --rt-card-bg: rgba(20, 15, 10, 0.4);
+}
+
+.rpg-tracker-panel.rt-theme-hologram {
+    --rt-bg: rgba(10, 20, 30, 0.8);
+    --rt-blur: blur(16px);
+    --rt-border: 1px solid rgba(0, 255, 255, 0.3);
+    --rt-text: #e0ffff;
+    --rt-text-muted: #66b3cc;
+    --rt-font: 'Segoe UI', 'Roboto', sans-serif;
+    --rt-font-mono: 'Space Mono', 'Consolas', monospace;
+    --rt-accent: #00ffff;
+    --rt-accent-dim: rgba(0, 255, 255, 0.5);
+    --rt-accent-bg: rgba(0, 255, 255, 0.15);
+    --rt-card-border: 1px solid rgba(0, 255, 255, 0.2);
+    --rt-shadow: 0 8px 32px rgba(0, 0, 0, 0.4), 0 0 10px rgba(0, 255, 255, 0.2), inset 0 0 15px rgba(0, 255, 255, 0.1);
+    --rt-header-bg: rgba(0, 255, 255, 0.1);
+    --rt-card-bg: rgba(0, 50, 80, 0.2);
+    --rt-card-header: rgba(0, 255, 255, 0.05);
+}
+
+.rpg-tracker-panel.rt-theme-pacific {
+    --rt-bg: rgba(15, 35, 40, 0.96);
+    --rt-blur: blur(10px);
+    --rt-border: 1px solid rgba(32, 178, 170, 0.35);
+    --rt-text: #d4ede8;
+    --rt-text-muted: #7ab8b0;
+    --rt-font: 'Segoe UI', 'Roboto', sans-serif;
+    --rt-font-mono: 'Consolas', monospace;
+    --rt-accent: #3ecfb8;
+    --rt-accent-dim: rgba(62, 207, 184, 0.4);
+    --rt-accent-bg: rgba(62, 207, 184, 0.1);
+    --rt-card-border: 1px solid rgba(62, 207, 184, 0.18);
+    --rt-shadow: 0 12px 40px rgba(0, 30, 40, 0.7), inset 0 1px 0 rgba(62,207,184,0.07);
+    --rt-header-bg: rgba(0, 0, 0, 0.35);
+    --rt-card-bg: rgba(10, 50, 55, 0.45);
+    --rt-card-header: rgba(62, 207, 184, 0.07);
+}
+
+.rpg-tracker-panel.rt-theme-cherry {
+    --rt-bg: rgba(22, 14, 20, 0.97);
+    --rt-blur: blur(8px);
+    --rt-border: 1px solid rgba(220, 120, 160, 0.3);
+    --rt-text: #f0dce6;
+    --rt-text-muted: #c08898;
+    --rt-font: 'Segoe UI', 'Roboto', sans-serif;
+    --rt-font-mono: 'Consolas', monospace;
+    --rt-accent: #f07aaa;
+    --rt-accent-dim: rgba(240, 122, 170, 0.4);
+    --rt-accent-bg: rgba(240, 122, 170, 0.1);
+    --rt-card-border: 1px solid rgba(220, 120, 160, 0.18);
+    --rt-shadow: 0 10px 36px rgba(10, 0, 10, 0.7), inset 0 1px 0 rgba(240,122,170,0.06);
+    --rt-header-bg: rgba(0, 0, 0, 0.4);
+    --rt-card-bg: rgba(40, 18, 30, 0.5);
+    --rt-card-header: rgba(240, 122, 170, 0.06);
+}
+
+/* ── AI Wizard Custom Theme ── */
+/* Variables are injected dynamically by the Theme Wizard into #rt-custom-theme-style */
+.rpg-tracker-panel.rt-theme-custom {
+    --rt-bg: var(--rt-custom-bg, rgba(20, 20, 30, 0.96));
+    --rt-blur: var(--rt-custom-blur, blur(12px));
+    --rt-border: var(--rt-custom-border, 1px solid rgba(255,255,255,0.2));
+    --rt-text: var(--rt-custom-text, #eeeeee);
+    --rt-text-muted: var(--rt-custom-text-muted, #999999);
+    --rt-font: var(--rt-custom-font, system-ui, sans-serif);
+    --rt-font-mono: var(--rt-custom-font-mono, 'Consolas', monospace);
+    --rt-accent: var(--rt-custom-accent, #00ffaa);
+    --rt-accent-dim: var(--rt-custom-accent-dim, rgba(0,255,170,0.4));
+    --rt-accent-bg: var(--rt-custom-accent-bg, rgba(0,255,170,0.1));
+    --rt-card-border: var(--rt-custom-card-border, 1px solid rgba(255,255,255,0.1));
+    --rt-shadow: var(--rt-custom-shadow, 0 8px 32px rgba(0,0,0,0.5));
+    --rt-header-bg: var(--rt-custom-header-bg, rgba(255,255,255,0.05));
+    --rt-card-bg: var(--rt-custom-card-bg, rgba(255,255,255,0.03));
+    --rt-card-header: var(--rt-custom-card-header, rgba(255,255,255,0.04));
+}
+
+/* Pacific Cove Scrollbar */
+.rt-theme-pacific *::-webkit-scrollbar {
+    width: 6px;
+    background: rgba(10, 40, 45, 0.6);
+}
+.rt-theme-pacific *::-webkit-scrollbar-thumb {
+    background: linear-gradient(to bottom, #3ecfb8, #1a8a80);
+    border-radius: 6px;
+}
+
+/* Pacific Cove Accents */
+.rt-theme-pacific .rt-paren-highlight {
+    background: rgba(62, 207, 184, 0.12);
+    color: #3ecfb8;
+}
+.rt-theme-pacific .rt-hp-label { color: #3ecfb8; font-weight: bold; }
+.rt-theme-pacific .rt-status { background: rgba(62, 207, 184, 0.1); color: #7addd4; }
+
+/* Cherry Blossom Scrollbar */
+.rt-theme-cherry *::-webkit-scrollbar {
+    width: 6px;
+    background: rgba(22, 10, 18, 0.6);
+}
+.rt-theme-cherry *::-webkit-scrollbar-thumb {
+    background: linear-gradient(to bottom, #f07aaa, #a04468);
+    border-radius: 6px;
+}
+
+/* Cherry Blossom Accents */
+.rt-theme-cherry .rt-paren-highlight {
+    background: rgba(240, 122, 170, 0.12);
+    color: #f07aaa;
+}
+.rt-theme-cherry .rt-hp-label { color: #f07aaa; font-weight: bold; }
+.rt-theme-cherry .rt-status { background: rgba(240, 122, 170, 0.1); color: #d88baa; }
+
+
+/* Slim Scrollbars */
+.rpg-tracker-panel *::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+.rpg-tracker-panel *::-webkit-scrollbar-track {
+    background: transparent;
+}
+.rpg-tracker-panel *::-webkit-scrollbar-thumb {
+    background: var(--rt-text-muted);
+    border-radius: 3px;
+    border: 1px solid transparent;
+    background-clip: content-box;
+}
+.rpg-tracker-panel *::-webkit-scrollbar-corner {
+    background: transparent;
+}
+
+.rpg-tracker-panel {
+    position: fixed;
+    top: 100px;
+    right: 20px;
+    width: 300px;
+    height: 420px;
+    min-width: 220px;
+    min-height: 200px;
+    background: var(--rt-bg);
+    backdrop-filter: var(--rt-blur);
+    border: var(--rt-border);
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    z-index: 2000;
+    box-shadow: var(--rt-shadow);
+    color: var(--rt-text);
+    font-family: var(--rt-font);
+    font-size: var(--rt-base-size);
+    overflow: hidden;
+    resize: none !important;
+    container-type: inline-size;
+}
+
+#rpg-tracker-agent {
+    resize: none !important;
+}
+
+.rpg-tracker-panel *,
+#rpg-tracker-agent * {
+    resize: none !important;
+}
+
+/* When the agent flyout is open it needs to escape the panel bounds */
+.rpg-tracker-panel.rt-agent-open {
+    overflow: visible !important;
+}
+
+.rt-resizer-tr {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 12px;
+    height: 12px;
+    cursor: ne-resize;
+    z-index: 2005;
+    border-top: 2px solid var(--rt-accent-dim);
+    border-right: 2px solid var(--rt-accent-dim);
+    border-top-right-radius: 6px;
+    opacity: 0.4;
+    transition: opacity 0.2s, border-color 0.2s;
+}
+
+.rt-resizer-tr:hover {
+    opacity: 1;
+    border-color: var(--rt-accent);
+}
+
+.rt-resizer-br {
+    position: absolute;
+    bottom: 0;
+    right: 0;
+    width: 16px;
+    height: 16px;
+    cursor: se-resize;
+    z-index: 2005;
+    background-image: repeating-linear-gradient(
+        -45deg,
+        transparent,
+        transparent 2px,
+        rgba(255, 255, 255, 0.4) 2px,
+        rgba(255, 255, 255, 0.4) 3px
+    );
+    clip-path: polygon(100% 0, 100% 100%, 0 100%);
+    opacity: 0.45;
+    transition: opacity 0.2s;
+}
+
+.rt-resizer-br:hover {
+    opacity: 1;
+}
+
+.rt-resizer-bl {
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    width: 16px;
+    height: 16px;
+    cursor: sw-resize;
+    z-index: 2005;
+    background-image: repeating-linear-gradient(
+        45deg,
+        transparent,
+        transparent 2px,
+        rgba(255, 255, 255, 0.4) 2px,
+        rgba(255, 255, 255, 0.4) 3px
+    );
+    clip-path: polygon(0 0, 100% 100%, 0 100%);
+    opacity: 0.45;
+    transition: opacity 0.2s;
+}
+
+.rt-resizer-bl:hover {
+    opacity: 1;
+}
+
+/* Disabled via the settings checkbox — full transparency */
+.rpg-tracker-panel.is-disabled {
+    opacity: 0.68;
+    filter: grayscale(0.6) brightness(0.8);
+    pointer-events: none;
+}
+/* The header and its buttons must always be clickable so the user can re-enable */
+.rpg-tracker-panel.is-disabled .rpg-tracker-header {
+    pointer-events: auto;
+}
+
+/* Agent panel disabled — dim content but keep header interactive */
+.rpg-tracker-agent-panel.is-agent-disabled .rpg-tracker-content {
+    opacity: 0.45;
+    filter: grayscale(0.5) brightness(0.75);
+    pointer-events: none;
+}
+.rpg-tracker-agent-panel.is-agent-disabled .rpg-tracker-header {
+    opacity: 0.6;
+    filter: grayscale(0.4);
+    pointer-events: auto;
+}
+
+/* Paused via the pause button — visible but indicating pause */
+.rpg-tracker-panel.is-paused .rpg-tracker-memo-area,
+.rpg-tracker-panel.is-paused .rpg-tracker-render-view {
+    opacity: 0.93;
+}
+
+/* Header center for pause banner */
+.rpg-tracker-header-center {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 9px;
+    font-weight: bold;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--rt-accent, #f0a050);
+    opacity: 0.9;
+    pointer-events: none;
+    white-space: nowrap;
+}
+
+.rpg-tracker-header {
+    padding: 8px 12px;
+    background: var(--rt-header-bg);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px 8px 0 0;
+    cursor: move;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-weight: bold;
+    font-size: 0.9em;
+    user-select: none;
+    flex-shrink: 0;
+    position: relative;
+}
+
+.rpg-tracker-header-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.rpg-tracker-header-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.rpg-tracker-stop-btn {
+    background: transparent;
+    border: none;
+    color: #ff5555;
+    font-size: 1.07em;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    margin-left: 2px;
+    opacity: 0.7;
+    transition: opacity 0.2s, color 0.2s, transform 0.1s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1);
+    outline: none;
+}
+
+.rpg-tracker-stop-btn:hover {
+    opacity: 1;
+    color: #ff2222;
+    transform: scale(1.1);
+}
+
+.rpg-tracker-stop-btn:active {
+    transform: scale(0.9);
+}
+
+.rpg-tracker-icon-btn {
+    background: none;
+    border: none;
+    color: var(--rt-text-muted);
+    cursor: pointer;
+    font-size: 0.92em;
+    padding: 2px 5px;
+    border-radius: 4px;
+    line-height: 1;
+    transition: color 0.2s, background 0.2s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+
+.rpg-tracker-icon-btn:hover {
+    color: var(--rt-accent);
+    background: var(--rt-accent-bg);
+}
+
+.rpg-tracker-icon-btn.active {
+    color: var(--rt-accent);
+    background: var(--rt-accent-bg);
+    box-shadow: inset 0 0 0 1px var(--rt-accent-dim);
+}
+
+.rpg-tracker-content {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    padding: 0;
+    overflow: hidden;
+    position: relative;
+}
+
+.rpg-tracker-memo-area {
+    flex: 1;
+    width: 100%;
+    background: transparent;
+    border: none;
+    padding: 12px;
+    color: var(--rt-accent);
+    font-family: inherit;
+    font-size: 1em;
+    resize: none;
+    outline: none;
+    overflow-y: auto;
+    box-sizing: border-box;
+}
+
+.rpg-tracker-memo-area[readonly] {
+    color: var(--rt-text-muted);
+    background: rgba(0, 0, 0, 0.2);
+}
+
+/* ── Direct Prompt Bar ── */
+.rpg-tracker-prompt-bar {
+    display: flex;
+    gap: 6px;
+    padding: 6px 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.07);
+    background: rgba(0, 0, 0, 0.25);
+    flex-shrink: 0;
+    align-items: flex-end;
+}
+
+.rpg-tracker-prompt-input {
+    flex: 1;
+    background: var(--rt-card-header);
+    border: var(--rt-border);
+    border-radius: 6px;
+    color: var(--rt-text);
+    font-size: 0.9em;
+    padding: 6px 8px;
+    resize: none;
+    line-height: 1.4;
+    font-family: inherit;
+    outline: none;
+    transition: border-color 0.2s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1);
+    min-height: 44px;
+    max-height: 120px;
+    overflow-y: auto;
+}
+
+.rpg-tracker-prompt-input:focus {
+    border-color: var(--rt-accent-dim);
+}
+
+.rpg-tracker-prompt-input::placeholder {
+    color: var(--rt-text-muted);
+    font-style: italic;
+}
+
+.rpg-tracker-prompt-send {
+    flex-shrink: 0;
+    background: var(--rt-accent-bg);
+    border: 1px solid var(--rt-accent-dim);
+    color: var(--rt-accent);
+    border-radius: 6px;
+    width: 32px;
+    height: 32px;
+    font-size: 1em;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 0.2s, border-color 0.2s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+
+.rpg-tracker-prompt-send:hover {
+    background: var(--rt-accent-bg);
+    border-color: var(--rt-accent);
+}
+
+/* ── Update Menu ── */
+.rt-update-menu {
+    position: absolute;
+    background: var(--rt-card-bg);
+    backdrop-filter: var(--rt-blur);
+    border: var(--rt-border);
+    border-radius: 8px;
+    box-shadow: var(--rt-shadow);
+    display: none;
+    flex-direction: column;
+    padding: 6px;
+    z-index: 3000;
+    width: 180px;
+}
+
+.rt-menu-item {
+    padding: 8px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    transition: background 0.2s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+
+.rt-menu-item:hover {
+    background: var(--rt-accent-bg);
+}
+
+.rt-menu-item b {
+    font-size: 0.92em;
+    color: var(--rt-text);
+}
+
+.rt-menu-item small {
+    font-size: 0.7em;
+    color: var(--rt-text-muted);
+}
+
+/* ── Rendered Card View ── */
+.rpg-tracker-render-view {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.rt-empty {
+    color: var(--rt-text-muted);
+    font-style: italic;
+    font-size: 0.95em;
+    padding: 12px;
+    text-align: center;
+}
+
+.rt-section-card {
+    background: var(--rt-card-bg);
+    border: var(--rt-card-border);
+    border-radius: 6px;
+    overflow: hidden; /* Standard view */
+    position: relative;
+    z-index: 1;
+}
+
+/* Hoist the entire section and unlock overflow when a tooltip is active */
+.rt-section-card:has(.rt-unit-pill:hover),
+.rt-section-card:has(.rt-unit-pill.active) {
+    z-index: 100 !important;
+    overflow: visible !important;
+}
+
+
+.rt-section-header {
+    font-size: 0.88em;
+    font-weight: 700;
+    letter-spacing: 0.8px;
+    text-transform: uppercase;
+    color: var(--rt-text-muted);
+    padding: 5px 10px;
+    background: var(--rt-card-header);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    cursor: pointer;
+    user-select: none;
+    transition: background 0.15s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+
+.rt-section-header:hover {
+    background: rgba(255, 255, 255, 0.07);
+}
+
+.rt-section-header-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.rt-fullview-btn, .rt-category-settings-btn {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    cursor: pointer;
+    font-size: 0.92em;
+    opacity: 0.6;
+    color: var(--rt-text-muted);
+    transition: opacity 0.2s, color 0.2s, transform 0.1s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1);
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.rt-fullview-btn:hover, .rt-category-settings-btn:hover {
+    opacity: 1;
+    color: var(--rt-text);
+}
+
+.rt-fullview-btn.active {
+    opacity: 0.7;
+    filter: drop-shadow(0 0 2px rgba(255,255,255,0.2));
+}
+
+.rt-fullview-btn:active {
+    transform: scale(0.9);
+}
+
+.rt-item-count {
+    font-size: 0.7em;
+    color: var(--rt-text-muted);
+    font-weight: 400;
+    letter-spacing: 0;
+}
+
+.rt-collapse-icon {
+    font-size: 0.88em;
+    color: var(--rt-text-muted);
+}
+
+.rt-collapsed .rt-section-body {
+    display: none;
+}
+
+/* Pagination */
+.rt-pagination {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
+    padding: 5px 0 2px;
+    border-top: 1px solid rgba(255,255,255,0.05);
+    margin-top: 4px;
+    font-size: 0.92em;
+    color: var(--rt-text-muted);
+}
+
+.rt-page-btn {
+    background: none;
+    border: 1px solid rgba(255,255,255,0.1);
+    color: var(--rt-text-muted);
+    cursor: pointer;
+    font-size: 1.07em;
+    line-height: 1;
+    padding: 1px 7px;
+    border-radius: 4px;
+    transition: color 0.15s, border-color 0.15s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+
+.rt-page-btn:hover:not(:disabled) {
+    color: var(--rt-accent);
+    border-color: rgba(0,255,170,0.4);
+}
+
+.rt-page-btn:disabled {
+    opacity: 0.25;
+    cursor: default;
+}
+
+/* Onboarding empty state */
+.rt-empty {
+    color: var(--rt-text-muted);
+    font-size: 0.95em;
+    padding: 20px 16px;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    line-height: 1.5;
+}
+
+.rt-empty-icon {
+    font-size: 2.15em;
+    margin-bottom: 4px;
+}
+
+.rt-empty small {
+    color: var(--rt-text-muted);
+    font-size: 0.92em;
+}
+
+/* ── Spells ── */
+.rt-spell-row {
+    display: grid;
+    grid-template-columns: 70px 1fr;
+    align-items: start;
+    gap: 6px;
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+
+.rt-spell-inline-group {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 4px;
+    min-width: 0;
+}
+
+.rt-spell-row:last-child { border-bottom: none; }
+
+.rt-spell-level {
+    font-size: 0.88em;
+    color: inherit;
+    opacity: 0.7;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+    padding-top: 2px;
+    white-space: nowrap;
+}
+
+.rt-combat-round {
+    font-size: 0.92em;
+    font-weight: 700;
+    color: var(--rt-accent);
+    padding: 6px 0;
+    text-align: center;
+    border-bottom: 1px solid var(--rt-accent-dim);
+    letter-spacing: 1px;
+    text-transform: uppercase;
+    margin-bottom: 4px;
+}
+
+.rt-slot-pips {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-right: 6px;
+    flex-shrink: 0;
+    height: 1.4em; /* Match typical line height */
+    vertical-align: middle;
+}
+
+.rt-slot-pip {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    border: 1px solid rgba(255,255,255,0.15);
+    flex-shrink: 0;
+}
+
+.rt-slot-available {
+    background: #0088ff;
+    border-color: #0088ff;
+    box-shadow: 0 0 4px rgba(0, 136, 255, 0.4);
+}
+
+.rt-slot-used {
+    background: transparent;
+    border-color: rgba(255,255,255,0.15);
+}
+
+.rt-hd-pips {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    margin-left: 4px;
+    vertical-align: middle;
+}
+
+.rt-hd-pip {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    border: 1px solid rgba(255,255,255,0.15);
+    flex-shrink: 0;
+}
+
+.rt-hd-available {
+    background: #ffd700;
+    border-color: #ffd700;
+    box-shadow: 0 0 4px rgba(255, 215, 0, 0.4);
+}
+
+.rt-hd-label {
+    opacity: 0.8;
+}
+
+.rt-spell-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px;
+}
+
+.rt-spell-name {
+    font-size: 0.92em;
+    color: inherit;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 4px;
+    padding: 1px 5px;
+    text-decoration: none;
+    white-space: nowrap;
+    transition: all 0.2s ease;
+}
+
+.rt-spell-name:hover {
+    background: var(--rt-accent-bg);
+    border-color: var(--rt-accent);
+    color: var(--rt-text) !important;
+}
+
+.rt-section-body {
+    padding: 7px 10px;
+    font-size: var(--rt-cat-font-size, 0.95em);
+    font-style: var(--rt-cat-font-style, normal);
+    font-weight: var(--rt-cat-font-weight, normal);
+    font-family: var(--rt-cat-font-family, inherit);
+    color: var(--rt-cat-text-color, inherit);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+/* Combat / Party entity rows */
+.rt-entity-row {
+    display: grid;
+    grid-template-columns: 1fr 100px 50px;
+    align-items: center;
+    gap: 10px;
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+
+.rt-entity-row:last-child { border-bottom: none; }
+
+.rt-entity-name {
+    color: var(--rt-text);
+    font-weight: 600;
+    font-size: 1em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.rt-hp-bar-wrap {
+    height: 6px;
+    background: rgba(255,255,255,0.08);
+    border-radius: 3px;
+    overflow: hidden;
+}
+
+.rt-hp-bar {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.4s ease; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+
+.rt-hp-label {
+    font-size: 0.88em;
+    color: var(--rt-text-muted);
+    white-space: nowrap;
+    text-align: right;
+}
+
+.rt-status {
+    font-size: 0.88em;
+    color: #ffaa00;
+    background: rgba(255, 170, 0, 0.1);
+    border-radius: 10px;
+    padding: 1px 6px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+}
+
+.rt-units-container {
+    display: flex !important;
+    flex-wrap: wrap;
+    gap: 4px;
+    align-items: center;
+    padding-top: 2px;
+}
+
+.rt-unit-pill {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+    padding: 1px 6px;
+    cursor: pointer;
+    font-size: 0.88em;
+    transition: all 0.2s ease;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    white-space: nowrap;
+    position: relative; /* Anchor for the tooltip */
+}
+
+.rt-unit-pill:hover, .rt-unit-pill.active {
+    background: rgba(0, 255, 170, 0.12);
+    border-color: var(--rt-accent-dim);
+    z-index: 1000;
+}
+
+.rt-unit-name {
+    font-weight: 600;
+    color: inherit;
+}
+
+.rt-unit-icon {
+    min-width: 14px;
+    height: 14px;
+    padding: 0 4px;
+    background: var(--rt-accent-dim);
+    color: var(--rt-accent);
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 8.5px;
+    font-weight: 900;
+    line-height: 1;
+    font-family: "Inter", sans-serif;
+    opacity: 0.9;
+}
+
+.rt-unit-descr {
+    display: none;
+    position: absolute;
+    bottom: calc(100% + 8px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(15, 15, 15, 0.98);
+    backdrop-filter: blur(10px);
+    border: 1px solid var(--rt-accent-dim);
+    color: var(--rt-text);
+    padding: 6px 10px;
+    border-radius: 6px;
+    font-size: 1em;
+    font-weight: 400;
+    white-space: normal;
+    min-width: 120px;
+    max-width: 220px;
+    z-index: 10001;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.6);
+    pointer-events: none;
+    text-align: center;
+    line-height: 1.4;
+}
+
+/* Tooltip arrow */
+.rt-unit-descr::after {
+    content: '';
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    border-width: 5px;
+    border-style: solid;
+    border-color: var(--rt-accent-dim) transparent transparent transparent;
+}
+
+.rt-unit-pill:hover .rt-unit-descr,
+.rt-unit-pill.active .rt-unit-descr {
+    display: block;
+}
+
+/* Suppress hover reveals when another pill in the same container is active */
+.rt-units-container:has(.rt-unit-pill.active) .rt-unit-pill:not(.active):hover .rt-unit-descr,
+.rt-abilities-body:has(.rt-unit-pill.active) .rt-unit-pill:not(.active):hover .rt-unit-descr {
+    display: none !important;
+}
+
+/* Subtle dot on pills that have a tooltip, so users know to hover */
+.rt-unit-pill:not(.no-desc)::after {
+    content: '';
+    width: 4px;
+    height: 4px;
+    border-radius: 50%;
+    background: var(--rt-accent-dim);
+    flex-shrink: 0;
+    opacity: 0.6;
+    margin-left: 2px;
+    align-self: center;
+}
+
+/* ── Status Pill Color Variants ── */
+.rt-pill-buff {
+    background: rgba(0, 200, 100, 0.1);
+    border-color: rgba(0, 200, 100, 0.3);
+}
+.rt-pill-buff:hover, .rt-pill-buff.active {
+    background: rgba(0, 200, 100, 0.22);
+    border-color: rgba(0, 220, 120, 0.6);
+}
+.rt-pill-buff .rt-unit-icon {
+    background: rgba(0, 200, 100, 0.2);
+    color: rgb(0, 220, 120);
+}
+
+.rt-pill-debuff {
+    background: rgba(220, 50, 50, 0.1);
+    border-color: rgba(220, 50, 50, 0.3);
+}
+.rt-pill-debuff:hover, .rt-pill-debuff.active {
+    background: rgba(220, 50, 50, 0.22);
+    border-color: rgba(255, 80, 80, 0.6);
+}
+.rt-pill-debuff .rt-unit-icon {
+    background: rgba(220, 50, 50, 0.2);
+    color: rgb(255, 80, 80);
+}
+
+.rt-pill-magic {
+    background: rgba(52, 152, 219, 0.1);
+    border-color: rgba(52, 152, 219, 0.3);
+}
+.rt-pill-magic:hover, .rt-pill-magic.active {
+    background: rgba(52, 152, 219, 0.22);
+    border-color: rgba(52, 152, 219, 0.6);
+}
+.rt-pill-magic .rt-unit-icon {
+    background: rgba(52, 152, 219, 0.2);
+    color: rgb(52, 152, 219);
+}
+
+.rt-entity-sub-line {
+    font-size: 0.88em;
+    opacity: 0.8;
+    padding-left: 5px;
+    margin-top: -3px;
+    margin-bottom: 2px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    padding-bottom: 2px;
+}
+
+.rt-entity-sub-label {
+    color: inherit;
+    opacity: 0.7;
+}
+
+.rt-entity-attributes {
+    font-size: 0.88em;
+    color: var(--rt-text-muted);
+    font-family: var(--mono-font), monospace;
+}
+
+.rt-paren-highlight {
+    background: rgba(255, 170, 0, 0.1);
+    color: #ffaa00;
+    border-radius: 4px;
+    padding: 0 4px;
+    margin: 0 1px;
+    font-size: 0.95em;
+    display: inline-block;
+    font-weight: 500;
+}
+
+.rt-entity-other {
+    color: #aa88ff;
+    font-style: italic;
+}
+
+/* Inventory */
+.rt-card-item {
+    color: inherit;
+    padding: 1px 0;
+    font-size: inherit;
+    display: flex;
+    align-items: flex-start;
+}
+
+.rt-card-item::before {
+    content: var(--rt-cat-bullet-style, "\2022");
+    color: var(--rt-cat-bullet-color, inherit);
+    display: var(--rt-cat-bullet-display, inline-block);
+    margin-right: 8px;
+    flex-shrink: 0;
+    font-weight: bold;
+    font-family: var(--rt-font);
+    font-size: 1.1em;
+    line-height: 1;
+}
+
+/* Inventory item worth tooltip */
+.rt-inventory-item[title] {
+    cursor: help;
+    position: relative;
+}
+
+.rt-inventory-item[title]:hover {
+    background: rgba(255, 215, 0, 0.06);
+    border-radius: 3px;
+}
+
+/* Equipped item highlight ([E] tag) */
+.rt-inventory-item--equipped {
+    border-left: 2px solid rgba(180, 220, 100, 0.55);
+    padding-left: 5px;
+    background: rgba(140, 220, 80, 0.04);
+    border-radius: 3px;
+}
+.rt-inventory-item--equipped:hover {
+    background: rgba(140, 220, 80, 0.10);
+}
+
+/* Inventory section subheader (Gear / Other Items) */
+.rt-inventory-subheader {
+    font-size: 0.72em;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--rt-accent, #a0a0a0);
+    opacity: 0.75;
+    padding: 7px 0 3px 0;
+    margin-top: 2px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+.rt-inventory-subheader:first-child {
+    padding-top: 1px;
+    margin-top: 0;
+}
+
+/* ── Universal Rendering Tags ── */
+
+/* Objective checkboxes */
+.rt-objective {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 0;
+    font-size: 0.92em;
+}
+
+.rt-obj-icon {
+    font-weight: bold;
+    font-size: 1.1em;
+    flex-shrink: 0;
+    width: 16px;
+    text-align: center;
+}
+
+.rt-obj-pending .rt-obj-icon { color: rgba(255, 255, 255, 0.4); }
+.rt-obj-done .rt-obj-icon { color: #2ecc71; }
+.rt-obj-failed .rt-obj-icon { color: #e74c3c; }
+.rt-obj-done .rt-obj-text { opacity: 0.6; text-decoration: line-through; }
+.rt-obj-failed .rt-obj-text { opacity: 0.6; color: #e74c3c; }
+
+/* Reward chips */
+.rt-reward-chip {
+    display: inline-block;
+    background: rgba(255, 215, 0, 0.12);
+    border: 1px solid rgba(255, 215, 0, 0.3);
+    color: #ffd700;
+    border-radius: 12px;
+    padding: 2px 10px;
+    font-size: 0.88em;
+    font-weight: 500;
+}
+
+/* Difficulty badges */
+.rt-difficulty-badge {
+    display: inline-block;
+    border-radius: 10px;
+    padding: 1px 10px;
+    font-size: 0.85em;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+/* Progress bar */
+.rt-progress-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.rt-progress-bar-wrap {
+    flex: 1;
+    height: 10px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 5px;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.rt-progress-bar {
+    height: 100%;
+    background: linear-gradient(90deg, #00c88c, #00d4ff);
+    border-radius: 5px;
+    transition: width 0.4s ease;
+}
+
+.rt-progress-label {
+    font-size: 0.82em;
+    opacity: 0.85;
+    white-space: nowrap;
+}
+
+/* Abilities */
+.rt-abilities-body {
+    flex-direction: row !important;
+    flex-wrap: wrap;
+    gap: 5px;
+}
+
+.rt-ability-pill {
+    background: var(--rt-accent-bg);
+    border: 1px solid var(--rt-accent-dim);
+    color: inherit;
+    border-radius: 12px;
+    padding: 2px 9px;
+    font-size: 0.92em;
+}
+
+/* XP Bar */
+.rt-xp-row {
+    padding: 4px 0;
+}
+
+.rt-xp-label {
+    font-size: 0.88em;
+    color: inherit;
+    opacity: 0.7;
+    margin-bottom: 3px;
+    display: flex;
+    justify-content: space-between;
+}
+
+.rt-xp-bar-wrap {
+    height: 8px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    overflow: hidden;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.rt-xp-bar {
+    height: 100%;
+    background: linear-gradient(90deg, #0088ff, #00d4ff);
+    border-radius: 4px;
+    transition: width 0.6s cubic-bezier(0.25, 0.8, 0.25, 1);
+    box-shadow: 0 0 10px rgba(0, 136, 255, 0.4);
+}
+
+/* Character KV pairs */
+.rt-card-kv {
+    display: flex;
+    gap: 6px;
+    padding: 2px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+}
+
+.rt-card-kv:last-child { border-bottom: none; }
+
+.rt-card-key {
+    color: var(--rt-text-muted);
+    min-width: 70px;
+    flex-shrink: 0;
+    font-size: 0.92em;
+}
+
+.rt-card-val {
+    color: inherit;
+    font-size: 0.95em;
+}
+
+.rt-card-line {
+    color: inherit;
+    font-size: 0.95em;
+    padding: 1px 0;
+}
+
+/* ── Delta Resize Handle ── */
+
+.rpg-tracker-delta-resize-handle {
+    height: 5px;
+    background: var(--rt-card-header);
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    cursor: ns-resize;
+    flex-shrink: 0;
+    transition: background 0.2s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+
+.rpg-tracker-delta-resize-handle:hover {
+    background: var(--rt-accent-bg);
+}
+
+/* Delta Console */
+.rpg-tracker-delta-panel {
+    flex-shrink: 0;
+    overflow: hidden;
+    background: rgba(0, 0, 0, 0.4);
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    font-size: 0.92em;
+    line-height: 1.5;
+    display: flex;
+    flex-direction: column;
+    height: 120px;
+}
+
+.rpg-tracker-delta-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 3px 8px;
+    background: var(--rt-card-bg);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    flex-shrink: 0;
+}
+
+.rpg-tracker-delta-title {
+    font-size: 0.75em;
+    color: var(--rt-text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+#rpg-tracker-delta-content {
+    overflow-y: auto;
+    padding: 6px 10px;
+    flex: 1;
+}
+
+.rpg-tracker-delta-panel .delta-added {
+    color: var(--rt-accent);
+}
+
+.rpg-tracker-delta-panel .delta-removed {
+    color: #ff5555;
+    text-decoration: line-through;
+    opacity: 0.8;
+}
+
+.rpg-tracker-delta-panel .delta-empty {
+    color: var(--rt-text-muted);
+    font-style: italic;
+}
+
+/* Footer */
+.rpg-tracker-footer {
+    padding: 5px 10px;
+    background: rgba(0, 0, 0, 0.2);
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.78em;
+    color: var(--rt-text-muted);
+    flex-shrink: 0;
+    gap: 6px;
+    user-select: none;
+    flex-wrap: nowrap !important;
+}
+
+.rt-rng-footer-group {
+    display: flex;
+    flex-wrap: nowrap;
+    gap: 4px;
+    justify-content: center;
+    flex: 1 1 0%;
+    min-width: 0;
+}
+
+.rpg-tracker-nav {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.rpg-tracker-nav-btn {
+    background: none;
+    border: var(--rt-border);
+    color: var(--rt-text-muted);
+    cursor: pointer;
+    font-size: 0.92em;
+    padding: 1px 6px;
+    border-radius: 4px;
+    line-height: 1.4;
+    transition: color 0.2s, border-color 0.2s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+
+.rpg-tracker-nav-btn:hover:not(:disabled) {
+    color: var(--rt-accent);
+    border-color: var(--rt-accent-dim);
+}
+
+.rpg-tracker-nav-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+}
+
+.rpg-tracker-nav-label {
+    font-size: 0.8em;
+    color: var(--rt-text-muted);
+    min-width: 52px;
+    text-align: center;
+    padding: 2px 4px;
+    border-radius: 4px;
+    transition: background 0.2s, color 0.2s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+
+.rpg-tracker-nav-label.clickable {
+    cursor: pointer;
+    background: rgba(0, 255, 170, 0.05);
+    color: var(--rt-accent);
+    border: 1px solid rgba(0, 255, 170, 0.1);
+}
+
+.rpg-tracker-nav-label.clickable:hover {
+    background: var(--rt-accent-bg);
+    color: var(--rt-accent);
+    border-color: var(--rt-accent-dim);
+}
+
+/* Status dot */
+.rpg-tracker-status-indicator {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #555;
+    flex-shrink: 0;
+}
+
+.rpg-tracker-status-indicator.active {
+    background: #00ffaa;
+    box-shadow: 0 0 5px #00ffaa;
+}
+
+.rpg-tracker-status-indicator.running {
+    background: #ffaa00;
+    animation: rpg-pulse 1s infinite alternate;
+}
+
+@keyframes rpg-pulse {
+    from { opacity: 0.5; }
+    to { opacity: 1; }
+}
+
+/* Detached Panels */
+.rt-detached-panel {
+    position: fixed !important;
+    z-index: 5000 !important;
+    min-height: 120px;
+    min-width: 220px;
+    height: 300px; /* JS overrides with saved or default value */
+    max-height: none;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.rt-detached-panel .rpg-tracker-header {
+    cursor: move;
+    background: rgba(0, 0, 0, 0.4);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    padding: 6px 10px;
+}
+
+.rt-detached-panel .rt-section-card {
+    border: none;
+    border-radius: 0;
+    background: transparent;
+}
+
+.rt-detached-panel .rt-section-body,
+.rpg-tracker-detached-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: scroll !important;
+    overflow-x: hidden;
+    scrollbar-width: thin;
+    padding-bottom: 18px; /* Buffer for resize handle */
+}
+
+/* Allow content to flow freely inside detached panels so it can overflow and scroll */
+.rpg-tracker-detached-body .rt-section-card {
+    overflow: visible !important;
+    height: auto !important;
+    max-height: none !important;
+}
+
+.rpg-tracker-detached-body .rt-section-body {
+    overflow: visible !important;
+    height: auto !important;
+    max-height: none !important;
+}
+
+.rt-detached-panel .rt-section-header {
+    display: none; /* Hide internal header, use window header instead */
+}
+
+/* Detach Button */
+.rt-detach-btn {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    cursor: pointer;
+    font-size: 0.92em;
+    opacity: 0.6;
+    color: var(--rt-text-muted);
+    transition: opacity 0.2s, color 0.2s, transform 0.1s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1);
+    line-height: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.rt-detach-btn:hover {
+    opacity: 1;
+    color: var(--rt-accent);
+}
+
+.rt-detach-btn:active {
+    transform: scale(0.9);
+}
+
+.rt-detached-placeholder {
+    padding: 8px 10px;
+    color: var(--rt-text-muted);
+    font-size: 0.92em;
+    font-style: italic;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px dashed rgba(255, 255, 255, 0.05);
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.rt-placeholder-icon {
+    margin-right: 4px;
+    opacity: 0.5;
+}
+
+.rt-reattach-btn-inline {
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    color: var(--rt-text-muted);
+    border-radius: 3px;
+    padding: 2px 6px;
+    font-size: 0.88em;
+    cursor: pointer;
+    transition: all 0.2s; transition-timing-function: cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+
+.rt-reattach-btn-inline:hover {
+    background: rgba(0,255,170,0.1);
+    border-color: rgba(0,255,170,0.3);
+    color: var(--rt-accent);
+}
+
+/* Mobile UI overrides */
+@media screen and (max-width: 800px) {
+    .rpg-tracker-panel:not(.rt-detached-panel) {
+        top: 44px !important;
+        left: 3vw !important;
+        right: 3vw !important;
+        width: 94vw !important;
+        height: calc(100vh - 44px - 58px) !important; /* fallback */
+        height: calc(100dvh - 44px - 58px) !important; /* viewport minus ST toolbar and input bar */
+        bottom: auto !important;
+        min-width: unset !important;
+        max-width: 100% !important;
+        max-height: calc(100dvh - 44px - 58px) !important;
+        resize: none !important;
+    }
+
+    .rt-detached-panel {
+        /* Allow detached panels to be smaller and repositionable even on mobile */
+        max-width: 90vw;
+        max-height: 40vh;
+    }
+
+    .rpg-tracker-footer {
+        padding: 4px 6px !important;
+        gap: 4px !important;
+    }
+
+    /* Squeeze header elements on mobile screens to prevent button overflow/cutoff */
+    .rpg-tracker-header {
+        padding: 10px 8px !important; /* Vertically larger bar on mobile */
+        font-size: 0.9em !important;
+        gap: 6px !important;
+    }
+
+    .rpg-tracker-header-left {
+        min-width: 0 !important;
+        flex: 1 !important;
+        gap: 4px !important;
+        overflow: hidden !important;
+    }
+
+    .rpg-tracker-header-left span {
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        white-space: nowrap !important;
+        min-width: 0 !important;
+        display: inline-block !important;
+        max-width: 100% !important;
+    }
+
+    .rpg-tracker-header-right {
+        gap: 4px !important;
+        flex-shrink: 0 !important;
+    }
+
+    /* Hide the on/off (power) buttons on mobile screens to free up space */
+    #rpg-tracker-enable-btn,
+    #rt-agent-router-enable-btn {
+        display: none !important;
+    }
+
+    /* Make other header buttons larger and easier to tap on mobile */
+    .rpg-tracker-icon-btn {
+        padding: 4px 6px !important;
+        font-size: 1.05em !important;
+    }
+}
+
+
+/* ── Settings Module List ── */
+.rt-order-item {
+    transition: background 0.2s, opacity 0.2s;
+    user-select: none;
+}
+.rt-order-item:hover {
+    background: var(--black50a) !important;
+}
+.rt-order-btn {
+    min-width: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.92em !important;
+}
+.rt-order-btn i {
+    font-size: 0.88em;
+}
+.rt-order-btn:disabled {
+    opacity: 0.3;
+    pointer-events: none;
+}
+.rt-onboarding-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    justify-content: center;
+    margin-top: 10px;
+}
+
+.rt-random-char-btn {
+    background: var(--rt-accent-bg);
+    border: 1px solid var(--rt-accent-dim);
+    color: var(--rt-accent);
+    padding: 6px 14px;
+    border-radius: 6px;
+    font-size: 0.92em;
+    cursor: pointer;
+    margin-top: 8px;
+    font-family: var(--rt-font);
+    transition: all 0.2s ease;
+}
+
+.rt-random-char-btn:hover {
+    background: var(--rt-accent-bg);
+    border-color: var(--rt-accent);
+}
+
+.rt-random-char-btn:disabled {
+    opacity: 0.5;
+    cursor: wait;
+}
+
+.rt-rng-toggle-overlay {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: var(--rt-text-muted);
+    padding: 2px 8px;
+    font-size: 0.7em;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: all 0.2s ease;
+    font-family: var(--rt-font);
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    white-space: nowrap;
+    flex: 1 1 auto;
+    min-width: 24px;
+    max-width: fit-content;
+    overflow: hidden;
+}
+
+.rt-rng-label-text {
+    flex-shrink: 1;
+    overflow: hidden;
+    text-overflow: clip;
+    min-width: 0;
+}
+
+.rt-rng-status-text {
+    flex-shrink: 0;
+}
+
+.rt-rng-toggle-overlay:hover {
+    background: var(--rt-accent-bg);
+    border-color: var(--rt-accent-dim);
+    color: var(--rt-accent);
+}
+
+.rt-rng-toggle-overlay.active {
+    color: var(--rt-accent);
+    background: var(--rt-accent-bg);
+    border-color: var(--rt-accent-dim);
+}
+
+.rt-rng-toggle-overlay i {
+    font-size: 0.88em;
+}
+
+.rt-sysprompt-menu {
+    position: absolute;
+    bottom: 26px;
+    right: 0;
+    background: var(--rt-bg);
+    backdrop-filter: var(--rt-blur);
+    border: var(--rt-border);
+    border-radius: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 3px;
+    z-index: 2500;
+    box-shadow: var(--rt-shadow);
+    min-width: 140px;
+}
+
+.rt-sysprompt-opt {
+    background: transparent;
+    border: none;
+    color: var(--rt-text);
+    padding: 6px 10px;
+    text-align: left;
+    font-size: 0.7em;
+    cursor: pointer;
+    border-radius: 3px;
+    white-space: nowrap;
+    transition: background 0.2s;
+    font-family: var(--rt-font);
+}
+
+.rt-sysprompt-opt:hover {
+    background: var(--rt-accent-bg);
+    color: var(--rt-accent);
+}
+
+/* ── Mobile Layout Fixes ── */
+.rt-footer-toggle-btn {
+    display: none; /* Hide on desktop */
+}
+
+@media (max-width: 600px) {
+    /* Make the panel fill the screen between the ST toolbar and the input bar */
+    .rpg-tracker-panel {
+        top: 44px !important;                         /* clear the SillyTavern top toolbar */
+        left: 0 !important;
+        right: 0 !important;
+        width: 100% !important;
+        height: calc(100vh - 44px - 58px) !important;   /* fallback: viewport - toolbar - input bar */
+        height: calc(100dvh - 44px - 58px) !important;  /* dynamic viewport minus both bars */
+        max-height: calc(100dvh - 44px - 58px) !important;
+        border-radius: 0 !important;
+    }
+
+    .rpg-tracker-footer {
+        flex-direction: column !important;
+        gap: 0 !important;
+        padding: 4px !important;
+        height: auto !important;
+    }
+
+    /* Hide drawer sections by default on mobile */
+    .rpg-tracker-footer .rt-rng-footer-group,
+    .rpg-tracker-footer .rt-utility-footer-group {
+        display: none !important;
+    }
+
+    /* Show drawer sections when expanded */
+    .rpg-tracker-footer.rt-footer-expanded .rt-rng-footer-group,
+    .rpg-tracker-footer.rt-footer-expanded .rt-utility-footer-group {
+        display: flex !important;
+        width: 100%;
+        justify-content: center;
+        align-items: center;
+        gap: 8px;
+        margin-top: 6px;
+        padding: 0 8px;
+        box-sizing: border-box;
+    }
+
+    /* Hide character count on mobile */
+    #rpg-tracker-count {
+        display: none !important;
+    }
+
+    /* Hide long labels on mobile RNG buttons */
+    .rt-rng-label-text {
+        display: none !important;
+    }
+
+    /* RNG buttons: don't stretch, stay compact */
+    .rpg-tracker-footer .rt-rng-toggle-overlay {
+        flex: 0 0 auto !important;
+        padding: 6px 10px !important;
+        font-size: 0.88em !important;
+        min-height: 28px;
+    }
+
+    /* ? button in utility row */
+    .rt-utility-footer-group #rt-rng-help-btn {
+        margin-left: auto !important;
+    }
+
+    /* Top row: nav only — toggle button is removed */
+    .rt-mobile-top-row {
+        width: 100%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    /* Hide the green arrow footer-drawer toggle on mobile — no longer needed */
+    .rt-footer-toggle-btn {
+        display: none !important;
+    }
+
+    /* Balance centering spacer no longer needed without toggle */
+    .rt-mobile-top-row::after {
+        display: none;
+    }
+
+    .rt-mobile-top-row .rpg-tracker-nav {
+        flex: 1;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        gap: 8px;
+    }
+
+    /* Cap active-keys chip list so it cannot overflow into the terminal below */
+    #rt-agent-router-active-keys {
+        max-height: 110px;
+        overflow-y: auto;
+    }
+
+    /* Reduce campaign records list height so it doesn't crowd the bottom */
+    #rt-agent-manifest-list {
+        max-height: 220px !important;
+        padding-bottom: 12px !important; /* ensure last row isn't clipped mid-height */
+    }
+
+}
+
+
+/* ── Lorebook Agent panel: block flow in scroll area (all viewports; detached + desktop).
+   .rpg-tracker-content defaults to flex column — as a flex item that breaks wrapped chip layout. */
+#rpg-tracker-agent .rpg-tracker-content {
+    display: flex !important;
+    flex-direction: column !important;
+    min-height: 0 !important;
+    padding-bottom: 20px !important;
+}
+
+/* ── Connection Settings Panels ── */
+#rpg_tracker_profile_group,
+#rpg_tracker_ollama_group,
+#rpg_tracker_openai_group {
+    background: rgba(0, 0, 0, 0.15);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 6px;
+    padding: 10px;
+    margin-top: 8px;
+    margin-bottom: 4px;
+    box-shadow: inset 0 1px 3px rgba(0,0,0,0.2);
+}
+
+#rpg_tracker_ollama_group label,
+#rpg_tracker_openai_group label,
+#rpg_tracker_profile_group label {
+    font-size: 0.85em;
+    color: var(--rt-text-muted);
+    margin-bottom: 2px;
+}
+
+#rpg_tracker_ollama_group .menu_button,
+#rpg_tracker_openai_group .menu_button {
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+}
+
+#rpg_tracker_openai_test {
+    background: var(--rt-accent-bg);
+    border-color: var(--rt-accent-dim);
+    color: var(--rt-accent);
+}
+
+#rpg_tracker_openai_test:hover {
+    border-color: var(--rt-accent);
+    background: rgba(0, 255, 170, 0.15);
+}
+
+/* ── Bar Recoloring ── */
+.rt-hp-bar-wrap[data-recolor-id], 
+.rt-xp-bar-wrap[data-recolor-id] {
+    position: relative;
+    cursor: pointer;
+    transition: filter 0.2s, transform 0.1s;
+}
+
+.rt-hp-bar-wrap[data-recolor-id]:hover,
+.rt-xp-bar-wrap[data-recolor-id]:hover {
+    filter: brightness(1.2);
+}
+
+.rt-hp-bar-wrap[data-recolor-id]:active,
+.rt-xp-bar-wrap[data-recolor-id]:active {
+    transform: scale(0.98);
+}
+
+/* ── Quest Log ── */
+.rt-quest-card {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 6px;
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    transition: opacity 0.2s;
+}
+
+.rt-quest-inactive {
+    opacity: 0.55;
+}
+
+.rt-quest-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 6px;
+}
+
+.rt-quest-title {
+    font-weight: 700;
+    font-size: 0.97em;
+    color: inherit;
+    line-height: 1.3;
+}
+
+.rt-quest-badge {
+    font-size: 0.7em;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    border-radius: 4px;
+    padding: 1px 6px;
+    white-space: nowrap;
+    flex-shrink: 0;
+}
+
+.rt-quest-badge-active    { background: rgba(0,204,119,0.15); color: #00cc77; border: 1px solid rgba(0,204,119,0.3); }
+.rt-quest-badge-completed { background: rgba(80,160,255,0.15); color: #50a0ff; border: 1px solid rgba(80,160,255,0.3); }
+.rt-quest-badge-failed    { background: rgba(255,60,60,0.15);  color: #ff5555; border: 1px solid rgba(255,60,60,0.3); }
+
+.rt-quest-giver {
+    font-size: 0.82em;
+    color: var(--rt-text-muted);
+}
+
+.rt-quest-giver em {
+    font-style: italic;
+    color: var(--rt-accent-dim);
+}
+
+.rt-quest-objectives {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding-top: 2px;
+}
+
+.rt-quest-obj {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    font-size: 0.88em;
+    color: inherit;
+    line-height: 1.3;
+}
+
+.rt-quest-obj-done {
+    opacity: 0.45;
+    text-decoration: line-through;
+}
+
+.rt-quest-obj-failed {
+    color: #ff5555;
+    text-decoration: line-through;
+    opacity: 0.6;
+}
+
+.rt-quest-card-failed {
+    border-color: rgba(255, 60, 60, 0.3) !important;
+    background: rgba(255, 60, 60, 0.05) !important;
+}
+
+.rt-quest-check {
+    flex-shrink: 0;
+    font-size: 0.9em;
+    color: var(--rt-cat-bullet-color, var(--rt-accent));
+    margin-top: 1px;
+}
+
+.rt-quest-optional {
+    font-size: 0.82em;
+    color: var(--rt-text-muted);
+    font-style: italic;
+}
+
+.rt-quest-progress {
+    display: inline-block;
+    font-size: 0.78em;
+    font-weight: 600;
+    color: var(--rt-accent);
+    background: rgba(var(--rt-accent-rgb, 0, 204, 119), 0.12);
+    border: 1px solid rgba(var(--rt-accent-rgb, 0, 204, 119), 0.25);
+    border-radius: 4px;
+    padding: 0 5px;
+    margin-left: 5px;
+    vertical-align: middle;
+    letter-spacing: 0.03em;
+}
+
+.rt-quest-rewards {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding-top: 2px;
+}
+
+.rt-quest-reward {
+    font-size: 0.8em;
+    background: rgba(255,215,0,0.08);
+    border: 1px solid rgba(255,215,0,0.2);
+    color: #ffd700;
+    border-radius: 4px;
+    padding: 1px 6px;
+}
+
+.rt-quest-deadline {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.84em;
+    color: var(--rt-text-muted);
+    padding-top: 2px;
+    border-top: 1px solid rgba(255,255,255,0.05);
+    margin-top: 2px;
+}
+
+.rt-quest-deadline-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.rt-quest-mood-label {
+    margin-left: auto;
+    font-size: 0.82em;
+    font-style: italic;
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+/* Bidirectional mood bar: 0% = very pleased, 33% = neutral, 67% = deadline, 100% = furious */
+.rt-quest-mood-bar-wrap {
+    position: relative;
+    width: 100%;
+    height: 5px;
+    background: rgba(255,255,255,0.06);
+    border-radius: 3px;
+    overflow: visible;
+}
+
+.rt-quest-mood-bar {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.5s ease, background 0.5s ease;
+}
+
+/* Tick at 33% = neutral point */
+.rt-quest-mood-tick {
+    position: absolute;
+    top: -2px;
+    width: 1px;
+    height: 9px;
+    background: rgba(255,255,255,0.25);
+    pointer-events: none;
+}
+.rt-quest-mood-tick-neutral   { left: 33.3%; }
+.rt-quest-mood-tick-deadline  { left: 66.6%; }
+
+/* ── Context Debug Viewer ── */
+.rpg-debug-viewer {
+    position: fixed;
+    top: 50px;
+    left: 50px;
+    width: 800px;
+    height: 600px;
+    background: rgba(15, 15, 20, 0.95);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(0, 255, 170, 0.3);
+    border-radius: 12px;
+    display: flex;
+    flex-direction: column;
+    z-index: 10000;
+    box-shadow: 0 20px 50px rgba(0, 0, 0, 0.8), 0 0 20px rgba(0, 255, 170, 0.1);
+    color: #eee;
+    font-family: 'Consolas', 'Monaco', monospace;
+    overflow: hidden;
+}
+
+.rpg-debug-header {
+    padding: 12px 16px;
+    background: rgba(255, 255, 255, 0.05);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    cursor: move;
+    user-select: none;
+    flex-shrink: 0;
+}
+
+.rpg-debug-header-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.rpg-debug-title {
+    font-weight: bold;
+    font-size: 14px;
+    letter-spacing: 0.5px;
+    color: var(--rt-accent, #00ffaa);
+}
+
+.rpg-debug-header-right {
+    display: flex;
+    gap: 8px;
+}
+
+.rpg-debug-header-right button {
+    background: none;
+    border: none;
+    color: #aaa;
+    cursor: pointer;
+    font-size: 16px;
+    padding: 4px;
+    border-radius: 4px;
+    transition: all 0.2s;
+}
+
+.rpg-debug-header-right button:hover {
+    color: #fff;
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.rpg-debug-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.rpg-debug-empty {
+    text-align: center;
+    margin-top: 100px;
+    color: #666;
+    font-style: italic;
+}
+
+.rpg-debug-transaction {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.rpg-debug-trans-header {
+    padding: 8px 12px;
+    background: rgba(255, 255, 255, 0.04);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+    display: flex;
+    justify-content: space-between;
+    font-size: 11px;
+    color: #888;
+}
+
+.rpg-debug-trans-body {
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.rpg-debug-section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.rpg-debug-label {
+    font-size: 10px;
+    font-weight: bold;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    width: fit-content;
+}
+
+.rpg-debug-label.input {
+    background: rgba(0, 150, 255, 0.2);
+    color: #0096ff;
+}
+
+.rpg-debug-label.system {
+    background: rgba(150, 150, 150, 0.2);
+    color: #aaa;
+}
+
+.rpg-debug-label.output {
+    background: rgba(0, 255, 170, 0.2);
+    color: #00ffaa;
+}
+
+.rpg-debug-text {
+    background: rgba(0, 0, 0, 0.3);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 6px;
+    padding: 10px;
+    font-size: 11px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 500px;
+    overflow-y: auto;
+}
+
+.rpg-debug-text.response {
+    border-color: rgba(0, 255, 170, 0.15);
+}
+
+/* Custom scrollbar for debug viewer */
+.rpg-debug-content::-webkit-scrollbar {
+    width: 8px;
+}
+.rpg-debug-content::-webkit-scrollbar-track {
+    background: transparent;
+}
+.rpg-debug-content::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 4px;
+}
+.rpg-debug-content::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.2);
+}
+
+/* Nested Drawers Styling */
+.rpg-tracker-settings .inline-drawer {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    margin-bottom: 8px;
+}
+
+
+.rpg-tracker-settings .inline-drawer .inline-drawer {
+    margin-left: 12px;
+    border-left: 2px solid rgba(255, 255, 255, 0.08);
+    margin-top: 6px;
+    margin-bottom: 6px;
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.2);
+    overflow: hidden;
+}
+
+.rpg-tracker-settings .inline-drawer .inline-drawer .inline-drawer-header {
+    background: rgba(255, 255, 255, 0.04) !important;
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 0.9em;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+    transition: background 0.2s;
+}
+
+.rpg-tracker-settings .inline-drawer .inline-drawer .inline-drawer-header:hover {
+    background: rgba(255, 255, 255, 0.08) !important;
+}
+
+.rpg-tracker-settings .inline-drawer .inline-drawer .inline-drawer-content {
+    padding: 12px;
+    background: rgba(0, 0, 0, 0.25);
+    border-top: 1px solid rgba(255, 255, 255, 0.03);
+    border-bottom-left-radius: 8px;
+    border-bottom-right-radius: 8px;
+}
+
+
+
+.rpg-tracker-settings .inline-drawer .inline-drawer .inline-drawer-header b {
+    font-size: 0.95em;
+    opacity: 0.9;
+}
+
+.rpg-tracker-settings .inline-drawer-icon {
+    transition: transform 0.2s ease-in-out;
+}
+
+.rpg-tracker-settings .inline-drawer-icon.down {
+    transform: rotate(-180deg);
+}
+
+/* ── Panel Collapsed State (Immersion Mode) ─────────────────────────────────── */
+.rpg-tracker-panel.rt-panel-collapsed {
+    height: auto !important;
+    min-height: 0 !important;
+    max-height: none !important;
+    resize: none !important;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.25);
+}
+
+.rpg-tracker-panel.rt-panel-collapsed .rpg-tracker-header {
+    border-bottom: none !important;
+    border-radius: 8px !important;
+}
+
+.rpg-tracker-panel.rt-panel-collapsed .rpg-tracker-content,
+.rpg-tracker-panel.rt-panel-collapsed .rpg-tracker-delta-panel,
+.rpg-tracker-panel.rt-panel-collapsed .rpg-tracker-delta-resize-handle,
+.rpg-tracker-panel.rt-panel-collapsed .rpg-tracker-footer {
+    display: none !important;
+}
+
+/* When collapsed, all resizers stay visible but signal horizontal-only resize */
+.rpg-tracker-panel.rt-panel-collapsed .rt-resizer-tr,
+.rpg-tracker-panel.rt-panel-collapsed .rt-resizer-br,
+.rpg-tracker-panel.rt-panel-collapsed .rt-resizer-bl {
+    cursor: ew-resize;
+}
+
+/* When collapsed, replace the diagonal-stripe triangle on the BR handle with a
+   solid corner-bracket so it survives overflow:hidden + border-radius clipping */
+.rpg-tracker-panel.rt-panel-collapsed .rt-resizer-br {
+    width: 12px;
+    height: 12px;
+    background-image: none;
+    clip-path: none;
+    border-bottom: 2px solid var(--rt-accent-dim);
+    border-right: 2px solid var(--rt-accent-dim);
+    border-bottom-right-radius: 6px;
+    opacity: 0.4;
+    transition: opacity 0.2s, border-color 0.2s;
+}
+
+.rpg-tracker-panel.rt-panel-collapsed .rt-resizer-br:hover {
+    opacity: 1;
+    border-color: var(--rt-accent);
+}
+
+.rpg-tracker-panel.rt-panel-collapsed .rt-resizer-bl {
+    width: 12px;
+    height: 12px;
+    background-image: none;
+    clip-path: none;
+    border-bottom: 2px solid var(--rt-accent-dim);
+    border-left: 2px solid var(--rt-accent-dim);
+    border-bottom-left-radius: 6px;
+    opacity: 0.4;
+    transition: opacity 0.2s, border-color 0.2s;
+}
+
+.rpg-tracker-panel.rt-panel-collapsed .rt-resizer-bl:hover {
+    opacity: 1;
+    border-color: var(--rt-accent);
+}
+
+
+/* Override high-specificity ID-based block rules in `#rpg-tracker-agent` when collapsed */
+#rpg-tracker-agent.rt-panel-collapsed .rpg-tracker-content {
+    display: none !important;
+}
+
+
+/* ─── Remove Up/Down Spinners Globally for extension number inputs ─── */
+.rpg-tracker-panel input[type="number"]::-webkit-outer-spin-button,
+.rpg-tracker-panel input[type="number"]::-webkit-inner-spin-button,
+.rpg-tracker-settings input[type="number"]::-webkit-outer-spin-button,
+.rpg-tracker-settings input[type="number"]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+.rpg-tracker-panel input[type="number"],
+.rpg-tracker-settings input[type="number"] {
+    -moz-appearance: textfield;
+}
+
+
+
+/* ── Character Portrait System ───────────────────────────────────────────── */
+
+/* Outer wrapper: portrait on left, entity content on right */
+.rt-entity-container {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    padding: 6px 0;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+}
+.rt-entity-container:last-child { border-bottom: none; }
+
+/* When portraits are active, suppress the original row-level border
+   so the container border takes over */
+.rt-entity-container .rt-entity-row {
+    border-bottom: none;
+    padding: 0;
+}
+
+/* Portrait drop-zone box */
+.rt-entity-portrait-container {
+    width: 64px;
+    height: 64px;
+    flex-shrink: 0;
+    border: 1px dashed rgba(255,255,255,0.22);
+    border-radius: 6px;
+    background: rgba(0,0,0,0.22);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+}
+
+.rt-entity-portrait-container:hover {
+    border-color: var(--rt-accent, #00ffaa);
+    box-shadow: 0 0 8px rgba(0,255,170,0.25);
+    background: rgba(0,255,170,0.05);
+}
+
+/* Drag-over highlight */
+.rt-entity-portrait-container.dragover {
+    border-style: solid;
+    border-color: var(--rt-accent, #00ffaa);
+    box-shadow: 0 0 14px rgba(0,255,170,0.45);
+    background: rgba(0,255,170,0.1);
+    animation: rt-portrait-pulse 0.7s ease-in-out infinite alternate;
+}
+
+@keyframes rt-portrait-pulse {
+    from { box-shadow: 0 0 8px rgba(0,255,170,0.3); }
+    to   { box-shadow: 0 0 18px rgba(0,255,170,0.6); }
+}
+
+/* Actual portrait image */
+.rt-entity-portrait {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+    border-radius: 5px;
+    transition: opacity 0.2s ease;
+    pointer-events: none;
+}
+
+/* Placeholder icon when no portrait is set */
+.rt-entity-portrait-placeholder {
+    font-size: 26px;
+    opacity: 0.25;
+    pointer-events: none;
+}
+
+/* Entity content column (the stat block etc.) */
+.rt-entity-content {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+/* Manifest action buttons transition & hover opacity */
+.rpg-tracker-panel .rt-agent-entry-clean,
+.rpg-tracker-panel .rt-agent-entry-edit,
+.rpg-tracker-panel .rt-agent-entry-delete {
+    opacity: 0;
+    transition: opacity 0.15s ease-in-out !important;
+}
+
+/* Show buttons when header is hovered or entry parent is open (expanded) */
+.rpg-tracker-panel .rt-agent-entry-hdr:hover > .rt-agent-entry-clean,
+.rpg-tracker-panel .rt-agent-entry-hdr:hover > .rt-agent-entry-edit,
+.rpg-tracker-panel .rt-agent-entry-hdr:hover > .rt-agent-entry-delete,
+.rpg-tracker-panel .rt-agent-entry-el.open > .rt-agent-entry-hdr > .rt-agent-entry-clean,
+.rpg-tracker-panel .rt-agent-entry-el.open > .rt-agent-entry-hdr > .rt-agent-entry-edit,
+.rpg-tracker-panel .rt-agent-entry-el.open > .rt-agent-entry-hdr > .rt-agent-entry-delete {
+    opacity: 0.5;
+}
+
+/* Highlight buttons fully when hovered directly */
+.rpg-tracker-panel .rt-agent-entry-clean:hover,
+.rpg-tracker-panel .rt-agent-entry-edit:hover,
+.rpg-tracker-panel .rt-agent-entry-delete:hover {
+    opacity: 1 !important;
+}
+

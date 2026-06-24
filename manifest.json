@@ -1,0 +1,11 @@
+{
+    "display_name": "Multihog D&D Framework",
+    "version": "3.8.1",
+    "author": "Disgusting Fatbody",
+    "js": "index.js",
+    "css": "style.css",
+    "loading_order": 20,
+    "generate_interceptor": "rpgTrackerInterceptor",
+    "homePage": "https://github.com/MultihogAurelius/SillyTavern-MultihogDnDFramework",
+    "auto_update": false
+}

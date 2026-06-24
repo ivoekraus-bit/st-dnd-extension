@@ -1,0 +1,1554 @@
+import { getSettings, getBarBackground } from './state-manager.js';
+import { escapeHtml, highlightParens, highlightNumbers, parseInWorldTime, formatTimeDiff } from './memo-processor.js';
+import { BLOCK_ICONS, BLOCK_ORDER, PAGE_SIZE, NO_PAGINATE } from './constants.js';
+
+// ── Renderer module: pure HTML string producers, localStorage helpers ──
+// No live DOM mutations. All functions return strings or void (localStorage).
+
+const DEFAULT_HP_COLOR = '#00ffaa';
+const DEFAULT_XP_COLOR = 'linear-gradient(90deg, #0088ff, #00d4ff)';
+
+    export const STOCK_FIELD_RULES = {
+        'combat': 'numbers',
+        'gear': 'highlight',
+        'attr': 'highlight',
+        'attributes': 'highlight',
+        'skills': 'pills',
+        'key skills': 'pills',
+        'saves': 'numbers',
+        'status': 'pills',
+        'traits': 'pills',
+        'other': 'pills',
+        'resistances': 'pills',
+        'res': 'pills',
+        'hd': 'hd_pips',
+        'weapon': 'highlight',
+        'att/def': 'numbers',
+        'primary weapon': 'highlight',
+        'spells': 'spell_group',
+        'ac': 'text'
+    };
+
+    export function renderSubFieldByRule(rule, line, barId = null) {
+        const colonIdx = line.indexOf(':');
+        // If there's no colon, the whole line is the value (no label)
+        const hasLabel = colonIdx !== -1;
+        const labelText = hasLabel ? line.substring(0, colonIdx + 1).trim() : '';
+        const value     = hasLabel ? line.substring(colonIdx + 1).trim() : line.trim();
+        const labelStyle = rule.color ? ` style="color:${rule.color}"` : '';
+        const labelHtml  = labelText
+            ? `<span class="rt-entity-sub-label"${labelStyle}>${escapeHtml(labelText)}</span>`
+            : '';
+
+        switch (rule.renderType) {
+            case 'pills':
+                return `<div class="rt-entity-sub-line rt-units-container">${labelHtml} ${renderPills(value)}</div>`;
+            case 'badge':
+                return `<div class="rt-entity-sub-line rt-units-container">${labelHtml} <span class="rt-unit-pill no-desc"><span class="rt-unit-name">${escapeHtmlWithColor(value)}</span></span></div>`;
+            case 'highlight':
+                return `<div class="rt-entity-sub-line">${labelHtml} ${highlightParens(escapeHtmlWithColor(value))}</div>`;
+            case 'numbers':
+                return `<div class="rt-entity-sub-line">${labelHtml} ${highlightNumbers(escapeHtmlWithColor(value))}</div>`;
+            case 'hp_bar': {
+                // Flexible: parses any "X/Y" optionally with extra text e.g. "45/100 (5 temp)"
+                const m = value.match(/(\d[\d,]*)\s*\/\s*(\d[\d,]*)/);
+                if (m) {
+                    const cur = parseInt(m[1].replace(/,/g, ''), 10);
+                    const max = parseInt(m[2].replace(/,/g, ''), 10);
+                    const pct = max > 0 ? Math.max(0, Math.min(100, (cur / max) * 100)) : 0;
+                    const extra = value.replace(m[0], '').trim();
+                    // Use custom color if set, else fall back to red gradient
+                    let barBg = rule.color
+                        ? rule.color
+                        : 'linear-gradient(90deg,#e74c3c,#c0392b)';
+                    if (barId) barBg = getBarBackground(barId, barBg, pct);
+
+                    const recolorData = barId ? ` data-recolor-id="${escapeHtml(barId)}" data-recolor-current="${escapeHtml(barBg)}" title="Click to recolor"` : '';
+
+                    return `<div class="rt-entity-sub-line" style="gap:6px;">
+                        ${labelHtml}
+                        <div class="rt-hp-bar-wrap"${recolorData} style="flex:1; position:relative; height:14px; border-radius:4px; overflow:hidden; background:rgba(255,255,255,0.1);">
+                            <div class="rt-hp-bar" style="width:${pct.toFixed(1)}%; height:100%; border-radius:4px; background:${barBg}; transition:width 0.3s;"></div>
+                        </div>
+                        <span style="font-size:0.82em; opacity:0.85; white-space:nowrap;">${cur}/${max}${extra ? ' ' + escapeHtml(extra) : ''}</span>
+                    </div>`;
+                }
+                // Fallback: plain text
+                return `<div class="rt-entity-sub-line">${labelHtml} ${escapeHtmlWithColor(value)}</div>`;
+            }
+            case 'xp_bar': {
+                // Flexible: parses any "X/Y" with optional "Level N" anywhere in value
+                const xm = value.match(/(\d[\d,]*)\s*\/\s*(\d[\d,]*)/);
+                const lm = value.match(/level\s*(\d+)/i);
+                if (xm) {
+                    const cur = parseInt(xm[1].replace(/,/g, ''), 10);
+                    const max = parseInt(xm[2].replace(/,/g, ''), 10);
+                    const pct = max > 0 ? Math.max(0, Math.min(100, (cur / max) * 100)) : 0;
+                    const levelStr = lm ? `<span style="font-size:0.8em; opacity:0.75;">Lv ${lm[1]}</span> ` : '';
+                    let barBg = rule.color ? rule.color : DEFAULT_XP_COLOR;
+                    if (barId) barBg = getBarBackground(barId, barBg, pct);
+
+                    const recolorData = barId ? ` data-recolor-id="${escapeHtml(barId)}" data-recolor-current="${escapeHtml(barBg)}" title="Click to recolor"` : '';
+
+                    return `<div class="rt-entity-sub-line" style="gap:6px;">
+                        ${labelHtml}
+                        <div class="rt-xp-bar-wrap"${recolorData} style="flex:1; height:12px;">
+                            <div class="rt-xp-bar" style="width:${pct.toFixed(1)}%; background:${barBg};"></div>
+                        </div>
+                        <span style="font-size:0.82em; opacity:0.85; white-space:nowrap;">${levelStr}${xm[1]}/${xm[2]}</span>
+                    </div>`;
+                }
+                return `<div class="rt-entity-sub-line">${labelHtml} ${escapeHtmlWithColor(value)}</div>`;
+            }
+            case 'kv':
+                return `<div class="rt-card-kv"><span class="rt-card-key">${labelHtml}</span><span class="rt-card-val">${escapeHtmlWithColor(value)}</span></div>`;
+            case 'objective': {
+                // Objective with checkbox status: ○ (incomplete), ✓/✔ (done), ✗/✘ (failed)
+                const isDone = /^[✓✔☑]/.test(value);
+                const isFailed = /^[✗✘☒]/.test(value);
+                const isIncomplete = /^[○◯◦]/.test(value);
+                const cleanVal = value.replace(/^[✓✔☑✗✘☒○◯◦]\s*/, '').trim();
+                const statusClass = isDone ? 'rt-obj-done' : isFailed ? 'rt-obj-failed' : 'rt-obj-pending';
+                const icon = isDone ? '✓' : isFailed ? '✗' : '○';
+                return `<div class="rt-objective ${statusClass}">${labelHtml}<span class="rt-obj-icon">${icon}</span> <span class="rt-obj-text">${escapeHtmlWithColor(cleanVal)}</span></div>`;
+            }
+            case 'reward': {
+                return `<div class="rt-entity-sub-line"><span class="rt-reward-chip">${labelHtml ? labelHtml + ' ' : ''}🎁 ${escapeHtmlWithColor(value)}</span></div>`;
+            }
+            case 'difficulty': {
+                const diffColors = { 'very easy': '#2ecc71', 'easy': '#27ae60', 'medium': '#f1c40f', 'normal': '#f1c40f', 'hard': '#e67e22', 'very hard': '#e74c3c' };
+                const diffColor = diffColors[value.toLowerCase()] || '#aaa';
+                return `<div class="rt-entity-sub-line">${labelHtml}<span class="rt-difficulty-badge" style="background:${diffColor}22; color:${diffColor}; border:1px solid ${diffColor}55;">${escapeHtmlWithColor(value)}</span></div>`;
+            }
+            case 'progress': {
+                const pm = value.match(/(\d+)\s*\/\s*(\d+)/);
+                if (pm) {
+                    const cur = parseInt(pm[1], 10), max = parseInt(pm[2], 10);
+                    const pct = max > 0 ? Math.min(100, (cur / max) * 100) : 0;
+                    const extra = value.replace(pm[0], '').trim();
+                    return `<div class="rt-entity-sub-line rt-progress-row">${labelHtml}
+                        <div class="rt-progress-bar-wrap">
+                            <div class="rt-progress-bar" style="width:${pct.toFixed(1)}%;"></div>
+                        </div>
+                        <span class="rt-progress-label">${cur}/${max}${extra ? ' ' + escapeHtml(extra) : ''}</span>
+                    </div>`;
+                }
+                return `<div class="rt-entity-sub-line">${labelHtml} ${escapeHtmlWithColor(value)}</div>`;
+            }
+            case 'pill_colored': {
+                const pClass = rule.pillClass || '';
+                const pillHtml = splitSmart(value).map(p => {
+                    p = p.trim();
+                    const descMatch = p.match(/^(.*?)\s*\((.*?)\)$/);
+                    const name = descMatch ? descMatch[1].trim() : p;
+                    const desc = descMatch ? descMatch[2].trim() : '';
+                    const descHtml = desc ? `<div class="rt-unit-descr">${escapeHtml(desc)}</div>` : '';
+                    const titleAttr = desc ? ` title="${escapeHtml(desc)}"` : '';
+                    const noDescClass = desc ? '' : ' no-desc';
+                    return `<span class="rt-unit-pill ${pClass}${noDescClass}"${titleAttr}><span class="rt-unit-name">${escapeHtml(name)}</span>${descHtml}</span>`;
+                }).join(' ');
+                return `<div class="rt-entity-sub-line rt-units-container">${labelHtml} ${pillHtml}</div>`;
+            }
+            case 'badge_colored': {
+                const bColor = rule.color || '#fff';
+                return `<div class="rt-entity-sub-line">${labelHtml}<span class="rt-difficulty-badge" style="background:${bColor}22; color:${bColor}; border:1px solid ${bColor}55;">${escapeHtmlWithColor(value)}</span></div>`;
+            }
+            case 'coin': {
+                const cColor = rule.color || '#fff';
+                const icon = rule.icon || '🪙';
+                return `<div class="rt-entity-sub-line">${labelHtml}<span class="rt-coin-badge" style="color:${cColor}; font-weight:bold; background:rgba(255,255,255,0.05); padding:2px 8px; border-radius:12px; border:1px solid ${cColor}44;">${icon} ${escapeHtmlWithColor(value)}</span></div>`;
+            }
+            case 'dice_roll': {
+                // value is something like "1d20+5 = 18"
+                return `<div class="rt-entity-sub-line">${labelHtml}<span class="rt-dice-roll" style="background:rgba(255,255,255,0.1); border:1px solid rgba(255,255,255,0.2); padding:2px 6px; border-radius:4px; font-family:monospace; display:inline-flex; align-items:center; gap:4px;"><i class="fa-solid fa-dice-d20" style="opacity:0.7"></i> ${escapeHtmlWithColor(value)}</span></div>`;
+            }
+            case 'text':
+            default:
+                return `<div class="rt-entity-sub-line">${labelHtml} ${escapeHtmlWithColor(value)}</div>`;
+        }
+    }
+
+    export function renderHDPips(val) {
+        let pipsHtml = escapeHtmlWithColor(val);
+        const hm = val.match(/^([^(]+?)\s*(?:\(([\d,]+)\/([\d,]+)\))?$/);
+        if (hm && hm[2] && hm[3]) {
+            const cur = parseInt(hm[2].replace(/,/g, ''), 10);
+            const max = parseInt(hm[3].replace(/,/g, ''), 10);
+            pipsHtml = `<span class="rt-hd-label">[ ${escapeHtmlWithColor(hm[1].trim())} ]</span> <span class="rt-hd-pips">${Array.from({ length: max }, (_, i) => `<span class="rt-hd-pip${i < cur ? ' rt-hd-available' : ''}"></span>`).join('')}</span>`;
+        }
+        return `<div class="rt-entity-sub-line"><span class="rt-entity-sub-label">HD:</span> <span>${pipsHtml}</span></div>`;
+    }
+
+    export function renderSpellGroups(val) {
+        const isCompound = /\|/.test(val) && /(?:Level\s*\d+|Cantrips?)/i.test(val);
+        const groups = isCompound ? val.split(/\s*\|\s*/) : [val];
+        let html = '';
+        for (const group of groups) {
+            const m = group.trim().match(/^(Level\s*\d+|Cantrips?)\s*(?:\((\d+)\/(\d+)[^)]*\))?\s*(?::\s*(.+))?$/i);
+            if (!m) continue;
+            const [, lbl, availStr, maxStr, spellList] = m;
+            const isCantrip = /cantrip/i.test(lbl);
+            let pipsHtml = '';
+            if (!isCantrip && availStr !== undefined && maxStr !== undefined) {
+                const avail = parseInt(availStr, 10), maxSlots = parseInt(maxStr, 10);
+                pipsHtml = `<span class="rt-slot-pips">${Array.from({ length: maxSlots }, (_, i) =>
+                    `<span class="rt-slot-pip${i < avail ? ' rt-slot-available' : ' rt-slot-used'}"></span>`).join('')}</span>`;
+            }
+            let spellsHtml = '';
+            if (spellList) {
+                spellsHtml = spellList.split(',').map(s => {
+                    const name = s.trim();
+                    const slug = name.toLowerCase().replace(/'/g, '').replace(/[^a-z0-9]+/g, '-');
+                    return `<a href="https://dnd5e.wikidot.com/spell:${slug}" target="_blank" class="rt-spell-name" title="View spell on Wikidot">${escapeHtmlWithColor(name)}</a>`;
+                }).join('');
+            }
+            html += `<div class="rt-spell-row"><span class="rt-spell-level">${escapeHtmlWithColor(lbl.trim())}</span><div class="rt-spell-inline-group"><div class="rt-spell-list">${pipsHtml}${spellsHtml}</div></div></div>`;
+        }
+        return html || `<div class="rt-entity-sub-line"><span class="rt-entity-sub-label">Spells:</span> ${highlightParens(escapeHtmlWithColor(val))}</div>`;
+    }
+
+
+    /**
+     * If `line` begins with a ((MARKER)) prefix, renders it and returns HTML.
+     * Returns null if no marker is present, so callers can fall through to
+     * their own renderer. This makes markers work in ALL stock blocks.
+     */
+    export function tryRenderMarker(line, tag = '', entityName = '') {
+        const markerRegex = /^(.*?)\(\((PILLS|BAR|HPBAR|XPBAR|TEXT|BADGE|HIGHLIGHT|PLS|B|HPB|XB|HGT|BDG|HP|OBJ|REWARD|DIFFICULTY|PROGRESS|BARRED|BARBLUE|BARGREEN|BARYELLOW|BARPURPLE|BARORANGE|PILLRED|PILLGREEN|PILLBLUE|WARNING|DANGER|SUCCESS|INFO|GOLD|SILVER|BRONZE|DOLLAR|HEART|SKULL|SOUL|ROLL)\)\)\s*(.*)$/i;
+        const m = line.match(markerRegex);
+        if (!m) return null;
+
+        const typeMap = {
+            PILLS:{ renderType: 'pills' }, PLS:{ renderType: 'pills' },
+            BAR:{ renderType: 'hp_bar' }, B:{ renderType: 'hp_bar' }, HPBAR:{ renderType: 'hp_bar' }, HPB:{ renderType: 'hp_bar' }, HP: { renderType: 'hp_bar' },
+            BARRED:{ renderType: 'hp_bar', color: 'linear-gradient(90deg,#e74c3c,#c0392b)' },
+            BARBLUE:{ renderType: 'hp_bar', color: 'linear-gradient(90deg,#3498db,#2980b9)' },
+            BARGREEN:{ renderType: 'hp_bar', color: 'linear-gradient(90deg,#2ecc71,#27ae60)' },
+            BARYELLOW:{ renderType: 'hp_bar', color: 'linear-gradient(90deg,#f1c40f,#f39c12)' },
+            BARPURPLE:{ renderType: 'hp_bar', color: 'linear-gradient(90deg,#9b59b6,#8e44ad)' },
+            BARORANGE:{ renderType: 'hp_bar', color: 'linear-gradient(90deg,#e67e22,#d35400)' },
+            XPBAR:{ renderType: 'xp_bar' }, XB:{ renderType: 'xp_bar' },
+            TEXT:{ renderType: 'text' },
+            BADGE:{ renderType: 'badge' }, BDG:{ renderType: 'badge' },
+            HIGHLIGHT:{ renderType: 'highlight' }, HGT:{ renderType: 'highlight' },
+            OBJ:{ renderType: 'objective' },
+            REWARD:{ renderType: 'reward' },
+            DIFFICULTY:{ renderType: 'difficulty' },
+            PROGRESS:{ renderType: 'progress' },
+            PILLRED:{ renderType: 'pill_colored', pillClass: 'rt-pill-debuff' },
+            PILLGREEN:{ renderType: 'pill_colored', pillClass: 'rt-pill-buff' },
+            PILLBLUE:{ renderType: 'pill_colored', pillClass: 'rt-pill-magic' },
+            WARNING:{ renderType: 'badge_colored', color: '#f1c40f' },
+            DANGER:{ renderType: 'badge_colored', color: '#e74c3c' },
+            SUCCESS:{ renderType: 'badge_colored', color: '#2ecc71' },
+            INFO:{ renderType: 'badge_colored', color: '#3498db' },
+            GOLD:{ renderType: 'coin', color: '#ffd700', icon: '💰' },
+            SILVER:{ renderType: 'coin', color: '#c0c0c0', icon: '🪙' },
+            BRONZE:{ renderType: 'coin', color: '#cd7f32', icon: '🪙' },
+            DOLLAR:{ renderType: 'coin', color: '#85bb65', icon: '💵' },
+            HEART:{ renderType: 'coin', color: '#ff4466', icon: '❤️' },
+            SKULL:{ renderType: 'coin', color: '#aaaaaa', icon: '💀' },
+            SOUL:{ renderType: 'coin', color: '#aa88ff', icon: '👻' },
+            ROLL:{ renderType: 'dice_roll' }
+        };
+
+        const preText = m[1].trim();
+        const markerType = m[2].toUpperCase();
+        const postText = m[3].trim();
+        const rule = typeMap[markerType] || { renderType: 'text' };
+
+        // Reconstruct a line for renderSubFieldByRule
+        const reconstructedContent = preText ? `${preText} ${postText}`.trim() : postText;
+
+        let barId = null;
+        if (rule.renderType === 'hp_bar' || rule.renderType === 'xp_bar') {
+            const colonIdx = reconstructedContent.indexOf(':');
+            const labelText = colonIdx !== -1 ? reconstructedContent.substring(0, colonIdx).trim() : 'Bar';
+            barId = `${tag}:${entityName}:${labelText}`;
+        }
+
+        return renderSubFieldByRule(rule, reconstructedContent, barId);
+    }
+
+    export function renderLineInEntityContext(tag, line, entityName, rawLine) {
+        // 1. Try marker first
+        const asMarker = tryRenderMarker(rawLine, tag, entityName);
+        if (asMarker) return asMarker;
+
+        const ll = line.toLowerCase();
+        const colonIdx = line.indexOf(':');
+
+        // 2. Try known stock keywords
+        for (const [key, ruleType] of Object.entries(STOCK_FIELD_RULES)) {
+            if (ll.startsWith(key + ':') || ll === key) {
+                const val = colonIdx !== -1 ? line.substring(colonIdx + 1).trim() : '';
+                if (ruleType === 'hd_pips') return renderHDPips(val);
+                if (ruleType === 'spell_group') return renderSpellGroups(val);
+                return renderSubFieldByRule({ renderType: ruleType }, line);
+            }
+        }
+
+        // 3. Fallback: unknown KV pair or plain line (always attached to entity if we are here)
+        if (colonIdx !== -1) {
+            return renderSubFieldByRule({ renderType: 'highlight' }, line);
+        }
+        return `<div class="rt-entity-sub-line">${escapeHtmlWithColor(line)}</div>`;
+    }
+
+    /**
+     * Renders a single line from a custom block (non-built-in tag).
+     */
+    export function renderCustomBlockLine(tag, line, lineIdx = 0) {
+        const asMarker = tryRenderMarker(line, tag);
+        if (asMarker !== null) return asMarker;
+
+        // Plain kv fallback
+        const kv = line.match(/^([^:]+):\s*(.+)$/);
+        if (kv) return `<div class="rt-card-kv"><span class="rt-card-key">${escapeHtmlWithColor(kv[1].trim())}:</span><span class="rt-card-val">${escapeHtmlWithColor(kv[2].trim())}</span></div>`;
+        return `<div class="rt-card-item">${escapeHtmlWithColor(line.trim())}</div>`;
+    }
+
+    /**
+     * Strip HTML tags from a memo string, preserving inner text.
+     * Used before sending the memo to the AI to avoid token bloat from
+     * color markup (<font>, <span>, etc.) that is purely for display.
+     * NOTE: ((MARKERS)) like ((PILLS)), ((BAR)), etc. are intentionally
+     * preserved so the AI can faithfully echo them back in its output.
+     */
+    export function stripMemoHtml(text) {
+        if (!text) return text;
+        // Convert <br> variants to newlines so line structure is preserved
+        let stripped = text.replace(/<br\s*\/?>/gi, '\n');
+        // Remove all HTML tags, keeping their inner text
+        stripped = stripped.replace(/<[^>]+>/g, '');
+        return stripped;
+    }
+
+    /**
+     * Like escapeHtml but allows <font color="#hex"> and <font color="name"> tags through,
+     * converting them to safe <span style="color:"> elements.
+     * Use this for all AI/user content rendered into tracker cards.
+     */
+    export function escapeHtmlWithColor(str) {
+        if (!str) return '';
+
+        // Rarity tag map (WoW-style item quality)
+        const RARITY_COLORS = {
+            'poor': '#9d9d9d',
+            'common': '#ffffff',
+            'uncommon': '#1eff00',
+            'rare': '#0070dd',
+            'epic': '#a335ee',
+            'legendary': '#ff8000',
+            'artifact': '#e6cc80',
+            'heirloom': '#00ccff'
+        };
+
+        // Shared placeholder system — placeholders survive escapeHtml unchanged
+        const OPEN = '\x01';
+        const CLOSE = '\x02';
+        const spans = [];
+
+        // 1. Process [Rarity] tags. They hide the tag and color everything that follows them.
+        const rarityRx = /\[(poor|common|uncommon|rare|epic|legendary|artifact|heirloom)\]\s*([\s\S]*)/gi;
+        let processed = str.replace(rarityRx, (match, rarity, rest) => {
+            const color = RARITY_COLORS[rarity.toLowerCase()];
+            // Recursively process 'rest' for any font tags, but skip rarity tags (already handled)
+            const safeInner = escapeHtmlWithColor(rest);
+            spans.push(`<span style="color:${color}">${safeInner}</span>`);
+            return OPEN + (spans.length - 1) + CLOSE;
+        });
+
+        // 2. Replace <font color=...>inner</font> tags (author-written color markup).
+        //    The inner text is recursively processed so nested tags work correctly.
+        const colorRx = /<font\s+color\s*=\s*["']?(#[0-9a-fA-F]{3,8}|[a-zA-Z]+)["']?>([\s\S]*?)<\/font>/gi;
+        const tokenized = processed.replace(colorRx, (_, color, inner) => {
+            // inner may contain more font tags but NOT rarity tags (already replaced above)
+            const safeInner = escapeHtmlWithColor(inner);
+            spans.push(`<span style="color:${color}">${safeInner}</span>`);
+            return OPEN + (spans.length - 1) + CLOSE;
+        });
+
+        // 3. Escape everything that remains, then restore the safe span placeholders.
+        return escapeHtml(tokenized).replace(/\x01(\d+)\x02/g, (_, i) => spans[parseInt(i)]);
+    }
+
+    const splitSmart = (text) => {
+        const res = [];
+        let cur = '', depth = 0;
+        for (const c of text) {
+            if (c === '(') depth++; else if (c === ')') depth--;
+            if (c === ',' && depth === 0) { res.push(cur.trim()); cur = ''; }
+            else cur += c;
+        }
+        if (cur.trim()) res.push(cur.trim());
+        return res;
+    };
+
+    const renderPills = (text) => {
+        return splitSmart(text).map(t => {
+            // Detect buff/debuff prefix
+            let pillClass = 'rt-unit-pill';
+            let displayText = t;
+            if (t.startsWith('(+)') || t.startsWith('(+) ')) {
+                pillClass += ' rt-pill-buff';
+                displayText = t.replace(/^\(\+\)\s*/, '');
+            } else if (t.startsWith('(-)') || t.startsWith('(-) ')) {
+                pillClass += ' rt-pill-debuff';
+                displayText = t.replace(/^\(-\)\s*/, '');
+            }
+
+            const m = displayText.match(/^(.+?)\s*\((.+)\)$/);
+            if (m) {
+                const [, name, desc] = m;
+
+                // Extract resource count if present (e.g., "2/3")
+                let iconHtml = '';
+                const resourceMatch = desc.match(/(\d+)\s*\/\s*(\d+)/);
+                if (resourceMatch) {
+                    iconHtml = `<span class="rt-unit-icon">${escapeHtmlWithColor(resourceMatch[0])}</span>`;
+                }
+
+                return `<span class="${pillClass}">
+                    <span class="rt-unit-name">${escapeHtmlWithColor(name)}</span>
+                    ${iconHtml}
+                    <span class="rt-unit-descr">(${escapeHtmlWithColor(desc)})</span>
+                </span>`;
+            }
+            return `<span class="${pillClass} no-desc"><span class="rt-unit-name">${escapeHtmlWithColor(displayText)}</span></span>`;
+        }).join('');
+    };
+
+
+    /**
+     * Parse the memo's [TAG]...[/TAG] blocks and return structured object.
+     */
+    export function parseMemoBlocks(memo) {
+        const blocks = {};
+        const pattern = /\[([^\]\/][^\]]*)\]([\s\S]*?)\[\/\1\]/gi;
+        for (const [, tag, content] of memo.matchAll(pattern)) {
+            blocks[tag.trim().toUpperCase()] = content.trim();
+        }
+        return blocks;
+    }
+
+    const COLLAPSE_KEY = 'rpg_tracker_collapsed';
+    const DETACHED_KEY = 'rpg_tracker_detached';
+
+
+
+    export function getPageSize(tag) {
+        const s = getSettings();
+        if (s.modulePageSizes && s.modulePageSizes[tag]) {
+            return s.modulePageSizes[tag];
+        }
+        // Fallback to stock defaults
+        return tag === 'SPELLS' ? 5 : PAGE_SIZE;
+    }
+
+    export function loadCollapsed() {
+        try { return new Set(JSON.parse(localStorage.getItem(COLLAPSE_KEY) || '[]')); }
+        catch { return new Set(); }
+    }
+    export function saveCollapsed(set) {
+        localStorage.setItem(COLLAPSE_KEY, JSON.stringify([...set]));
+    }
+
+    export function loadDetached() {
+        try { return new Set(JSON.parse(localStorage.getItem(DETACHED_KEY) || '[]')); }
+        catch { return new Set(); }
+    }
+    export function saveDetached(set) {
+        localStorage.setItem(DETACHED_KEY, JSON.stringify([...set]));
+    }
+
+
+
+// ── Portrait rendering helpers ──────────────────────────────────────────────
+
+/**
+ * Returns the inner HTML for the portrait box of an entity.
+ * Checks customPortraits (per-chat) first; falls back to a placeholder icon.
+ * @param {string} entityName
+ * @returns {string}
+ */
+function renderPortraitHtml(entityName) {
+    const s = getSettings();
+    const src = (s.customPortraits || {})[entityName];
+    if (src) {
+        return `<img class="rt-entity-portrait" src="${escapeHtml(src)}" alt="${escapeHtml(entityName)}" />`;
+    }
+    return `<i class="fa-solid fa-user-shield rt-entity-portrait-placeholder" aria-hidden="true"></i>`;
+}
+
+/**
+ * Wraps entity content HTML in a flex container with a portrait box on the left.
+ * Returns content unmodified when enablePortraits is false.
+ * @param {string} entityName
+ * @param {string} contentHtml
+ * @returns {string}
+ */
+function wrapEntityHtml(entityName, contentHtml) {
+    if (!getSettings().enablePortraits) return contentHtml;
+    return `<div class="rt-entity-container" data-entity-name="${escapeHtml(entityName)}">
+        <div class="rt-entity-portrait-container" title="Drop image here or click to set portrait">
+            ${renderPortraitHtml(entityName)}
+        </div>
+        <div class="rt-entity-content">${contentHtml}</div>
+    </div>`;
+}
+
+/**
+ * Helper to parse a currency/worth string to a total value in Copper Pieces (CP).
+ * Supports both D&D standard pieces (GP, SP, CP) and generic dollar/euro/pound.
+ * @param {string} str 
+ * @returns {number}
+ */
+function parseValueToCopper(str) {
+    let totalCp = 0;
+    
+    // Suffix regex (matching gp, sp, cp, gold, silver, bronze, copper, usd, eur, gbp, dollar, euro, pound, etc.)
+    const suffixRx = /([\d,]+(?:\.\d+)?)\s*(gp|sp|cp|gold|silver|bronze|copper|usd|eur|gbp|dollar|euros?|pounds?)\b/gi;
+    // Prefix regex (matching $, £, €)
+    const prefixRx = /([$£€])\s*([\d,]+(?:\.\d+)?)/gi;
+
+    let match;
+    let found = false;
+
+    const cleanNum = (numStr) => parseFloat(numStr.replace(/,/g, ''));
+
+    // Reset regex indices since they are global
+    suffixRx.lastIndex = 0;
+    prefixRx.lastIndex = 0;
+
+    // Check suffix matches
+    while ((match = suffixRx.exec(str)) !== null) {
+        found = true;
+        const num = cleanNum(match[1]);
+        const unit = match[2].toLowerCase();
+        if (/\b(gold|gp|usd|eur|gbp|dollar|euro|pound)\b/.test(unit)) {
+            totalCp += num * 100;
+        } else if (/\b(silver|sp)\b/.test(unit)) {
+            totalCp += num * 10;
+        } else if (/\b(bronze|copper|cp)\b/.test(unit)) {
+            totalCp += num;
+        }
+    }
+
+    // Check prefix matches
+    while ((match = prefixRx.exec(str)) !== null) {
+        found = true;
+        const num = cleanNum(match[2]);
+        totalCp += num * 100;
+    }
+
+    return found ? totalCp : 0;
+}
+
+/**
+ * Helper to detect currency type from a string.
+ * @param {string} str
+ * @returns {string|null}
+ */
+function detectCurrency(str) {
+    if (/\$|\b(usd|dollars?)\b/i.test(str)) return 'usd';
+    if (/€|\b(eur|euros?)\b/i.test(str)) return 'eur';
+    if (/£|\b(gbp|pounds?)\b/i.test(str)) return 'gbp';
+    if (/\b(gp|sp|cp|gold|silver|bronze|copper)\b/i.test(str)) return 'gp';
+    return null;
+}
+
+/**
+ * Helper to format a Copper Pieces value back to a standard GP, SP, CP string or modern currency representation.
+ * @param {number} totalCp 
+ * @param {string} detectedCurrency
+ * @returns {string}
+ */
+function formatValueToCurrency(totalCp, detectedCurrency) {
+    if (totalCp <= 0) return '';
+    const amount = totalCp / 100;
+    const formattedAmount = amount.toLocaleString('en-US', {
+        minimumFractionDigits: totalCp % 100 === 0 ? 0 : 2,
+        maximumFractionDigits: 2
+    });
+    
+    switch (detectedCurrency) {
+        case 'usd':
+            return `$${formattedAmount}`;
+        case 'eur':
+            return `€${formattedAmount}`;
+        case 'gbp':
+            return `£${formattedAmount}`;
+        case 'gp':
+        default: {
+            const gp = Math.floor(totalCp / 100);
+            const sp = Math.floor((totalCp % 100) / 10);
+            const cp = Math.floor(totalCp % 10);
+
+            const parts = [];
+            if (gp > 0) parts.push(`${gp.toLocaleString('en-US')} GP`);
+            if (sp > 0) parts.push(`${sp} SP`);
+            if (cp > 0) parts.push(`${cp} CP`);
+
+            return parts.join(', ');
+        }
+    }
+}
+
+    export function blockToItems(tag, content, renderTypeOverride = null) {
+        const rawLines = content.split('\n').map(l => l.trim()).filter(Boolean);
+        const lines = rawLines.map(line => {
+            // Strip leading bullet markers (-, *, +, •, en-dash, em-dash)
+            // but only if followed by space(s) or a letter (prevents stripping negative numbers like -5)
+            return line.replace(/^\s*[-*+•–—](?:\s+|(?=[A-Za-z]))/, '');
+        });
+        let renderType = renderTypeOverride || tag;
+        const customField = (getSettings().customFields || []).find(f => f.tag.toUpperCase() === tag);
+        if (!renderTypeOverride && customField && customField.renderType) {
+            renderType = customField.renderType;
+        }
+
+        switch (renderType) {
+            case 'COMBAT':
+            case 'PARTY':
+            case 'CHARACTER': {
+                const results = [];
+                let lastEntityIdx = -1;
+                let currentEntity = '';
+
+                const MARKER_RX = /^\(\((PILLS|BAR|XPBAR|TEXT|BADGE|HIGHLIGHT|HPBAR|PLS|B|XB|HGT|HPB|BDG|HP)\)\)\s*(.*)/i;
+                const MARKER_TYPE_MAP = {
+                    'PILLS': 'pills', 'PLS': 'pills',
+                    'BAR': 'hp_bar', 'B': 'hp_bar',
+                    'HPBAR': 'hp_bar', 'HPB': 'hp_bar',
+                    'HP': 'hp_bar',
+                    'XPBAR': 'xp_bar', 'XB': 'xp_bar',
+                    'TEXT': 'text',
+                    'BADGE': 'badge', 'BDG': 'badge',
+                    'HIGHLIGHT': 'highlight', 'HGT': 'highlight'
+                };
+
+                for (let i = 0; i < lines.length; i++) {
+                    const rawLine = lines[i];
+                    const mm = rawLine.match(MARKER_RX);
+                    const markerCode = mm ? mm[1].toUpperCase() : null;
+                    const explicitType = mm ? MARKER_TYPE_MAP[markerCode] : null;
+                    const line = mm ? mm[2].trim() : rawLine;
+
+                    // 1. Combat Round header
+                    if (tag === 'COMBAT' && /Combat Round\s*\d+/i.test(line)) {
+                        results.push(`<div class="rt-combat-round">${escapeHtmlWithColor(line)}</div>`);
+                        lastEntityIdx = -1;
+                        continue;
+                    }
+
+                    // 2. Entity anchor: classic "Name: X/Y HP ..." or explicit ((HP)) marker
+                    let hpMatch = line.match(/^(.+?):\s*([\d,]+)(?:\/([\d,]+))?\s*HP\s*[:|,]?\s*(.*)$/i);
+                    const isHpMarker = (markerCode === 'HP' || markerCode === 'HPB' || markerCode === 'HPBAR');
+
+                    // If marker is specifically ((HP)), try a more relaxed regex (optional HP suffix)
+                    if (!hpMatch && isHpMarker) {
+                        hpMatch = line.match(/^(.+?):\s*([\d,]+)(?:\/([\d,]+))?(?:\s*HP)?\s*[:|,]?\s*(.*)$/i);
+                    }
+
+                    if (hpMatch) {
+                        const [, name, curRaw, maxRaw, rest] = hpMatch;
+                        const cur = Number(curRaw.replace(/,/g, ''));
+                        const max = maxRaw ? Number(maxRaw.replace(/,/g, '')) : undefined;
+                        const hasMax = max !== undefined;
+                        const pct = hasMax ? Math.max(0, Math.min(100, (cur / max) * 100)) : 100;
+                        const hpColor = !hasMax ? DEFAULT_HP_COLOR : pct > 60 ? DEFAULT_HP_COLOR : pct > 30 ? '#ffaa00' : '#ff5555';
+                        const status = (rest || '').trim().replace(/^\|\s*/, '');
+                        const label = hasMax ? `${curRaw}/${maxRaw}` : `${curRaw}`;
+
+                        currentEntity = name.trim();
+                        const barId = `${tag}:${currentEntity}:HP`;
+                        const barBg = getBarBackground(barId, hpColor, pct);
+
+                        lastEntityIdx = results.length;
+                        results.push(`<div class="rt-entity-row"><div class="rt-entity-name">${escapeHtmlWithColor(currentEntity)}</div><div class="rt-hp-bar-wrap" title="Click to recolor HP" data-recolor-id="${escapeHtml(barId)}" data-recolor-current="${escapeHtml(barBg)}"><div class="rt-hp-bar" style="width:${pct.toFixed(1)}%;background:${barBg};"></div></div><span class="rt-hp-label">${label}</span></div>`);
+
+                        if (status) {
+                            const parts = status.split('|').map(p => p.trim()).filter(Boolean);
+                            let genericInfo = [];
+                            for (const part of parts) {
+                                if (part.toLowerCase().startsWith('ac:')) {
+                                    results[lastEntityIdx] += `<div class="rt-entity-sub-line"><span class="rt-entity-sub-label">AC:</span> ${escapeHtmlWithColor(part.substring(3).trim())}</div>`;
+                                } else if (part.toLowerCase().startsWith('saves:')) {
+                                    results[lastEntityIdx] += `<div class="rt-entity-sub-line"><span class="rt-entity-sub-label">Saves:</span> ${highlightParens(escapeHtmlWithColor(part.substring(6).trim()))}</div>`;
+                                } else if (part.toLowerCase().startsWith('status:')) {
+                                    results[lastEntityIdx] += `<div class="rt-entity-sub-line rt-units-container"><span class="rt-entity-sub-label">Status:</span> ${renderPills(part.substring(7).trim())}</div>`;
+                                } else if (part.toLowerCase().startsWith('other:') || part.toLowerCase().startsWith('res:')) {
+                                    const lbl = part.toLowerCase().startsWith('res:') ? 'Res:' : 'Other:';
+                                    const start = part.toLowerCase().startsWith('res:') ? 4 : 6;
+                                    results[lastEntityIdx] += `<div class="rt-entity-sub-line rt-units-container"><span class="rt-entity-sub-label">${lbl}</span> ${renderPills(part.substring(start).trim())}</div>`;
+                                } else { genericInfo.push(part); }
+                            }
+                            if (genericInfo.length > 0) {
+                                results[lastEntityIdx] += `<div class="rt-entity-sub-line"><span class="rt-entity-sub-label">Info:</span> ${highlightParens(escapeHtmlWithColor(genericInfo.join(' | ')))}</div>`;
+                            }
+                        }
+                        continue;
+                    }
+
+                    // 3. Sub-field Logic (Sticky Context)
+                    if (lastEntityIdx !== -1) {
+                        results[lastEntityIdx] += renderLineInEntityContext(tag, line, currentEntity, rawLine);
+                    } else {
+                        // No active entity: render as a standalone card line
+                        results.push(`<div class="rt-card-item">${escapeHtmlWithColor(rawLine)}</div>`);
+                    }
+                }
+                // Wrap each entity's accumulated HTML in portrait container before returning
+                return results.map((html, idx) => {
+                    // Only wrap entity rows (ones that have the entity-row class start), not round headers
+                    if (html.startsWith('<div class="rt-combat-round">')) return html;
+                    // Extract entity name from the first rt-entity-name span
+                    const nameMatch = html.match(/class="rt-entity-name"[^>]*>([^<]+)</);
+                    if (!nameMatch) return html;
+                    return wrapEntityHtml(nameMatch[1].trim(), html);
+                });
+            }
+
+            case 'TIME': {
+                let currentTotalMins = 0;
+                let parsedCurrent = false;
+
+                // parseTimeStr removed, using shared parseInWorldTime from memo-processor.js
+
+                // Extracts the 24-hour from a free-form "HH:MM[ AM/PM]" pattern in a line.
+                // Returns -1 if no clock pattern is found.
+                const hourOfLine = (s) => {
+                    const m = String(s || '').match(/(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+                    if (!m) return -1;
+                    let h = parseInt(m[1], 10);
+                    if (m[3]) {
+                        const mer = m[3].toUpperCase();
+                        if (mer === 'AM' && h === 12) h = 0;
+                        if (mer === 'PM' && h !== 12) h += 12;
+                    }
+                    if (!Number.isFinite(h) || h < 0 || h > 23) return -1;
+                    return h;
+                };
+                // Maps a 24-hour value to a time-of-day emoji.
+                const todEmoji = (h) => {
+                    if (h < 0) return '';
+                    if (h < 5)  return '🌙'; // late night
+                    if (h < 7)  return '🌅'; // dawn
+                    if (h < 12) return '☀️'; // morning
+                    if (h < 14) return '🌞'; // midday
+                    if (h < 18) return '🌤️'; // afternoon
+                    if (h < 20) return '🌇'; // sunset
+                    return '🌃';             // night
+                };
+                const todColor = (h) => {
+                    if (h < 0) return 'inherit';
+                    if (h < 5)  return '#9999ff'; // late night (cool blue)
+                    if (h < 7)  return '#ffccaa'; // dawn (peach)
+                    if (h < 12) return '#ffffbb'; // morning (pale yellow)
+                    if (h < 14) return '#ffffff'; // midday (white)
+                    if (h < 18) return '#fff2cc'; // afternoon (warm cream)
+                    if (h < 20) return '#ffaa55'; // sunset (orange)
+                    return '#7777ee';             // night (indigo)
+                };
+
+                for (let line of lines) {
+                    if (line.toLowerCase().startsWith('last rest:')) continue;
+                    if (!parsedCurrent) {
+                        const t = parseInWorldTime(line);
+                        if (t !== 0) {
+                            currentTotalMins = t;
+                            parsedCurrent = true;
+                        }
+                    }
+                }
+
+                return lines.map(line => {
+                    if (line.toLowerCase().startsWith('last rest:')) {
+                        const restVal = line.substring(line.indexOf(':') + 1).trim();
+                        let append = "";
+                        if (parsedCurrent) {
+                            const restMins = parseInWorldTime(restVal);
+                            if (restMins !== null) {
+                                const diff = currentTotalMins - restMins;
+                                if (diff >= 0) {
+                                    append = `&nbsp;<span style="opacity: 0.7; font-size: 1em;">(${formatTimeDiff(diff, false)})</span>`;
+                                }
+                            }
+                        }
+                        return `<div class="rt-card-line"><b>Last Rest:</b>&nbsp;${escapeHtmlWithColor(restVal)}${append}</div>`;
+                    }
+                    const asMarker = tryRenderMarker(line, tag);
+                    if (asMarker !== null) return asMarker;
+                    const h = hourOfLine(line);
+                    const lineEmoji = todEmoji(h);
+                    const linePrefix = lineEmoji ? `<span class="rt-tod-emoji" style="margin-right:4px;">${lineEmoji}</span>` : '';
+                    const color = todColor(h);
+                    const content = (color !== 'inherit') 
+                        ? `<span style="color: ${color};">${escapeHtmlWithColor(line)}</span>`
+                        : escapeHtmlWithColor(line);
+                    return `<div class="rt-card-line">${linePrefix}${content}</div>`;
+                });
+            }
+            case 'XP':
+                return lines.map(line => {
+                    const asMarker = tryRenderMarker(line, tag);
+                    if (asMarker !== null) return asMarker;
+
+                    // New format: Total: 1,200 / 2,700 XP (Level 3)
+                    let m = line.match(/Total:\s*([\d,]+)\s*\/\s*([\d,]+)\s*XP\s*\(Level\s*(\d+)\)/i);
+                    if (m) {
+                        const [, curRaw, maxRaw, level] = m;
+                        const cur = Number(curRaw.replace(/,/g, ''));
+                        const max = Number(maxRaw.replace(/,/g, ''));
+                        const pct = Math.max(0, Math.min(100, (cur / max) * 100));
+                        const barId = 'XP::XP';
+                        const barBg = getBarBackground(barId, 'linear-gradient(90deg, #f39c12, #e67e22)', pct);
+
+                        return `<div class="rt-xp-row">
+                            <div class="rt-xp-label"><span>Level ${level}</span><span>XP: ${curRaw} / ${maxRaw}</span></div>
+                            <div class="rt-xp-bar-wrap" title="Click to recolor XP" data-recolor-id="${escapeHtml(barId)}" data-recolor-current="${escapeHtml(barBg)}">
+                                <div class="rt-xp-bar" style="width:${pct.toFixed(1)}%; background:${barBg};"></div>
+                            </div>
+                        </div>`;
+                    }
+
+                    // Legacy format: XP: 1,200/2,700 or Level: 3 | XP: 1,200/2,700
+                    m = line.match(/(?:Level:\s*(\d+)\s*\|?\s*)?XP:\s*([\d,]+)\/([\d,]+)/i);
+                    if (m) {
+                        const [, level, curRaw, maxRaw] = m;
+                        const cur = Number(curRaw.replace(/,/g, ''));
+                        const max = Number(maxRaw.replace(/,/g, ''));
+                        const pct = Math.max(0, Math.min(100, (cur / max) * 100));
+                        const levelHtml = level ? `<span>Level ${level}</span>` : '';
+                        const barId = 'XP::XP';
+                        const barBg = getBarBackground(barId, 'linear-gradient(90deg, #f39c12, #e67e22)', pct);
+
+                        return `<div class="rt-xp-row">
+                            <div class="rt-xp-label">${levelHtml}<span>XP: ${curRaw} / ${maxRaw}</span></div>
+                            <div class="rt-xp-bar-wrap" title="Click to recolor XP" data-recolor-id="${escapeHtml(barId)}" data-recolor-current="${escapeHtml(barBg)}">
+                                <div class="rt-xp-bar" style="width:${pct.toFixed(1)}%; background:${barBg};"></div>
+                            </div>
+                        </div>`;
+                    }
+
+                    return `<div class="rt-card-item">${escapeHtmlWithColor(line)}</div>`;
+                });
+            case 'SPELLS': {
+                // Lines: "Level N (avail/max): Spell1, Spell2" or "Cantrips: Spell1, Spell2"
+                return lines.map(line => {
+                    const asMarker = tryRenderMarker(line, tag);
+                    if (asMarker !== null) return asMarker;
+
+                    const m = line.match(/^(Level\s*\d+|Cantrips?)\s*(?:\((\d+)\/(\d+)[^)]*\))?\s*:\s*(.+)$/i);
+                    if (!m) return `<div class="rt-card-item">${escapeHtmlWithColor(line)}</div>`;
+                    const [, label, availStr, maxStr, spellList] = m;
+                    const isCantrip = /cantrip/i.test(label);
+                    let pipsHtml = '';
+                    if (!isCantrip && availStr !== undefined && maxStr !== undefined) {
+                        const avail = parseInt(availStr, 10), max = parseInt(maxStr, 10);
+                        const pips = Array.from({ length: max }, (_, i) =>
+                            `<span class="rt-slot-pip${i < avail ? ' rt-slot-available' : ' rt-slot-used'}"></span>`
+                        ).join('');
+                        pipsHtml = `<span class="rt-slot-pips">${pips}</span>`;
+                    }
+                    const spells = spellList.split(',').map(s => {
+                        const name = s.trim();
+                        const slug = name.toLowerCase()
+                            .replace(/'/g, '')
+                            .replace(/[^a-z0-9]+/g, '-');
+                        const url = `https://dnd5e.wikidot.com/spell:${slug}`;
+                        return `<a href="${url}" target="_blank" class="rt-spell-name" title="View spell on Wikidot">${escapeHtmlWithColor(name)}</a>`;
+                    }).join('');
+                    return `<div class="rt-spell-row">
+                        <span class="rt-spell-level">${escapeHtmlWithColor(label.trim())}</span>
+                        <div class="rt-spell-inline-group">
+                            <div class="rt-spell-list">${pipsHtml}${spells}</div>
+                        </div>
+                    </div>`;
+                });
+            }
+            case 'INVENTORY': {
+                // Lines with a ((MARKER)) prefix bypass the bullet-list renderer
+                const inventoryResults = [];
+                const pendingBullets = [];
+                let totalCp = 0;
+                const currencyCounts = { gp: 0, usd: 0, eur: 0, gbp: 0 };
+
+                const trackCurrency = (val) => {
+                    const cur = detectCurrency(val);
+                    if (cur) currencyCounts[cur]++;
+                };
+
+                const flushBullets = () => {
+                    if (!pendingBullets.length) return;
+
+                    // Currency detection map: pattern → { color, icon }
+                    const CURRENCY_STYLES = [
+                        { rx: /\b(gold|gp)\b/i,                               color: '#ffd700', icon: '💰' },
+                        { rx: /\b(dollar|usd|euro|eur|pound|gbp)s?\b|[$£€]/i,  color: '#85bb65', icon: '💵' },
+                        { rx: /\b(silver|sp)\b/i,                              color: '#c0c0c0', icon: '🪙' },
+                        { rx: /\b(bronze|copper|cp)\b/i,                       color: '#cd7f32', icon: '🪙' },
+                    ];
+
+                    // Bare currency item: a line that IS the currency (e.g. "45 GP", "💰 45 GP", "$500")
+                    // — no parenthesised worth annotation, just a number + currency unit
+                    const BARE_CURRENCY_RX = /^[^(]*?(?:([$£€])\s*\d[\d,]*|\d[\d,]*\s*(gp|sp|cp|gold|silver|bronze|copper|dollar|usd|euro|eur|pound|gbp|£|\$|€))\s*$/i;
+
+                    const worthMode = getSettings().inventoryWorthMode || 'hover'; // 'hover' | 'display'
+                    const worthRx = /\s*\(~([^)]+)\)\s*$|\s*\(Worth:\s*([^)]+)\)\s*$/i;
+
+                    pendingBullets.forEach(i => {
+                        // ── Equipped tag: detect [E] and strip from display ──────────────────
+                        const equippedRx = /\s*\[E\]\s*/i;
+                        const isEquipped = equippedRx.test(i);
+                        if (isEquipped) i = i.replace(equippedRx, ' ').trim();
+                        const equippedClass = isEquipped ? ' rt-inventory-item--equipped' : '';
+
+                        const worthMatch = i.match(worthRx);
+                        let displayText = i;
+                        let titleAttr = '';
+                        let coinBadge = '';
+
+                        if (worthMatch) {
+                            // Item has a (~X GP) or (Worth: X GP) annotation
+                            const worthVal = (worthMatch[1] || worthMatch[2]).trim();
+                            trackCurrency(worthVal);
+                            totalCp += parseValueToCopper(worthVal);
+                            displayText = i.replace(worthRx, '').trim();
+
+                            // Extract effect/stats parenthetical: last (...) group before the worth
+                            // that looks mechanical (contains at least one digit)
+                            const effectRx = /\s*\(([^)~][^)]*)\)\s*$/;
+                            const effectMatch = displayText.match(effectRx);
+                            let effectVal = '';
+                            if (effectMatch && /\d/.test(effectMatch[1])) {
+                                effectVal = effectMatch[1].trim();
+                                displayText = displayText.replace(effectRx, '').trim();
+                            }
+
+                            // Build tooltip combining effect (if any) and worth
+                            const tooltipParts = [];
+                            if (effectVal) tooltipParts.push(`Effect: ${effectVal}`);
+                            tooltipParts.push(`Worth: ${worthVal}`);
+                            titleAttr = ` title="${escapeHtml(tooltipParts.join('\n'))}"`;
+
+                            if (worthMode === 'display') {
+                                // Show coin badge inline next to item text
+                                const matched = CURRENCY_STYLES.find(s => s.rx.test(worthVal));
+                                if (matched) {
+                                    coinBadge = ` <span class="rt-coin-badge" style="color:${matched.color}; font-weight:bold; background:rgba(255,255,255,0.05); padding:1px 6px; border-radius:10px; border:1px solid ${matched.color}44; font-size:0.85em; margin-left:4px; white-space:nowrap;">${matched.icon} ${escapeHtml(worthVal)}</span>`;
+                                }
+                            }
+                            // In 'hover' mode: worth is tooltip only — no badge
+                            inventoryResults.push(`<div class="rt-card-item rt-inventory-item${equippedClass}"${titleAttr}>${escapeHtmlWithColor(displayText)}${coinBadge}</div>`);
+                        } else if (BARE_CURRENCY_RX.test(i.trim())) {
+                            // This line IS a currency amount (e.g. "45 GP", "💰 45 GP")
+                            // Strip any leading bullet dash — safety guard (pendingBullets already strips it,
+                            // but comma-split path might not)
+                            const cleanText = i.trim().replace(/^\s*[-*]\s*/, '');
+                            trackCurrency(cleanText);
+                            totalCp += parseValueToCopper(cleanText);
+                            const COIN_COLORS = [
+                                { rx: /\b(gold|gp)\b/i,                               color: '#ffd700' },
+                                { rx: /\b(dollar|usd|euro|eur|pound|gbp)s?\b|[$£€]/i,  color: '#85bb65' },
+                                { rx: /\b(silver|sp)\b/i,                              color: '#c0c0c0' },
+                                { rx: /\b(bronze|copper|cp)\b/i,                       color: '#cd7f32' },
+                            ];
+                            const matchedCoin = COIN_COLORS.find(s => s.rx.test(cleanText));
+                            if (matchedCoin) {
+                                const c = matchedCoin.color;
+                                // Same outer wrapper as all other inventory items → keeps bullet • styling
+                                // Same badge style as display-mode worth badges → consistent shininess
+                                inventoryResults.push(`<div class="rt-card-item rt-inventory-item"><span class="rt-coin-badge" style="color:${c}; font-weight:bold; background:rgba(255,255,255,0.05); padding:1px 6px; border-radius:10px; border:1px solid ${c}44; font-size:0.85em; white-space:nowrap;">${escapeHtmlWithColor(cleanText)}</span></div>`);
+                            } else {
+                                inventoryResults.push(`<div class="rt-card-item rt-inventory-item">${escapeHtmlWithColor(cleanText)}</div>`);
+                            }
+                        } else {
+                            inventoryResults.push(`<div class="rt-card-item rt-inventory-item${equippedClass}">${escapeHtmlWithColor(displayText)}</div>`);
+                        }
+                    });
+                    pendingBullets.length = 0;
+                };
+
+                for (const line of lines) {
+                    const asMarker = tryRenderMarker(line, tag);
+                    if (asMarker !== null) {
+                        flushBullets();
+                        inventoryResults.push(asMarker);
+                        continue;
+                    }
+                    // Section subheader (e.g. "Gear:", "Other Items:") — plain text header line
+                    if (/^[A-Za-z][A-Za-z\s]*:\s*$/.test(line.trim())) {
+                        flushBullets();
+                        const headerText = line.trim().replace(/:$/, '').trim();
+                        inventoryResults.push(`<div class="rt-inventory-subheader">${escapeHtml(headerText)}</div>`);
+                        continue;
+                    }
+                    // Original bullet/comma logic
+                    if (line.trim().match(/^[-*]\s+/)) {
+                        pendingBullets.push(line.trim().replace(/^[-*]\s*/, ''));
+                    } else {
+                        line.split(/,(?![^(]*\))/).map(i => i.trim()).filter(Boolean)
+                            .forEach(i => pendingBullets.push(i));
+                    }
+                }
+                flushBullets();
+
+                if (totalCp > 0) {
+                    // Find currency with highest count, default to 'gp'
+                    let detectedCurrency = 'gp';
+                    let maxCount = 0;
+                    for (const [cur, count] of Object.entries(currencyCounts)) {
+                        if (count > maxCount) {
+                            maxCount = count;
+                            detectedCurrency = cur;
+                        }
+                    }
+                    inventoryResults.totalValueGP = formatValueToCurrency(totalCp, detectedCurrency);
+                    inventoryResults.detectedCurrency = detectedCurrency;
+                }
+                return inventoryResults;
+            }
+            case 'ABILITIES': {
+                const abilityResults = [];
+                for (const line of lines) {
+                    const asMarker = tryRenderMarker(line, tag);
+                    if (asMarker !== null) { abilityResults.push(asMarker); continue; }
+                    const l = line.trim();
+                    const items = l.match(/^[-*]\s+/) ? [l.replace(/^[-*]\s*/, '')] : splitSmart(l);
+                    items.forEach(t => abilityResults.push(renderPills(t)));
+                }
+                return abilityResults;
+            }
+            default:
+                // Custom blocks: resolve each line via module rows → global rules → kv fallback
+                // Pass line index so positional row matching works even without label prefixes
+                return lines.map((line, idx) => renderCustomBlockLine(tag, line, idx));
+        }
+    }
+
+    export function renderMemoAsCards(memo, filterTag, sectionPages) {
+        if (!memo || !memo.trim()) {
+            return `<div class="rt-empty" style="text-align: left; align-items: flex-start; padding: 12px; gap: 10px; overflow-y: auto;">
+                <div style="text-align: center; width: 100%; margin-bottom: 4px; flex-shrink: 0;">
+                    <div class="rt-empty-icon">📜</div>
+                    <div style="font-size: 17px; font-weight: bold; color: var(--rt-text);">Multihog D&D Framework</div>
+                </div>
+
+                <div style="display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; margin: 8px 0 4px 0; flex-shrink: 0;">
+                    <span style="font-size: 12px; opacity: 0.8; font-weight: bold; font-style: italic;">Starting Level:</span>
+                    <select id="rt-starting-level" class="text_pole" style="width: auto; min-width: 60px; padding: 2px 4px; font-size: 12px; height: 24px; border-radius: 4px; background: var(--black70a);">
+                        ${[...Array(20).keys()].map(i => `<option value="${i + 1}">Level ${i + 1}</option>`).join('')}
+                    </select>
+                </div>
+                <div class="rt-onboarding-buttons" style="width: 100%; justify-content: center; margin: 4px 0; flex-shrink: 0;">
+                    <button class="rt-random-char-btn" data-archetype="magic">✨ Magic</button>
+                    <button class="rt-random-char-btn" data-archetype="melee">⚔️ Melee</button>
+                    <button class="rt-random-char-btn" data-archetype="rogue">🗡️ Rogue</button>
+                    <button class="rt-random-char-btn" data-archetype="persona">🎭 Persona</button>
+                </div>
+
+                <div style="font-size: 13px; opacity: 0.9; display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; line-height: 1.4;">
+                    <div><b style="color: var(--rt-accent);">Auto-Tracking:</b> As you roleplay, the extension intelligently parses assistant responses. It detects losses of HP, new loot, or combat triggers, running background passes to update the state.</div>
+
+                    <div><b style="color: var(--rt-accent);">Prompt Injection:</b> The State Memo and RNG Queue are injected seamlessly into your outgoing prompt. It acts as the "source of truth," assuring the model accurately remembers HP, inventory, and mechanical outcomes.</div>
+
+                    <div><b style="color: var(--rt-accent);">Validation:</b> Use the Delta Log (δ) to verify changes. If the AI ever makes a mistake, step backwards using the Snapshot Navigation (←/→) to restore a clean state. A capable model like Gemini 3 Flash should almost never make a mistake, so you probably will not need the Delta Log often — but it is there when you want it.</div>
+
+                    <div><b style="color: var(--rt-accent);">Lorebook Agent &#x1F916;:</b> Open it from the robot button in the header. It autonomously manages your lorebook — creating, updating, activating, deactivating, and deleting entries as your story evolves. Click <b>?</b> inside the agent panel for full documentation.</div>
+
+                    <div><b style="color: var(--rt-accent);">World Progression 🌍:</b> Simulates off-screen world activity by generating reports of background events at regular in-world intervals (such as daily). You can seed the simulation with an optional <b>World Skeleton</b> to introduce undiscovered factions, locations, NPCs, and conflicts outside the narrative. It includes <b>Focus Randomization</b> to keep events varied, and <b>Backlog Consolidation</b> to periodically compress older reports and prevent token bloat. <i>Configure these options inside the <b>World Progression</b> section of the Extension Settings menu (accessible via SillyTavern's Extensions panel).</i></div>
+                </div>
+
+                <div style="font-size: 13px; opacity: 0.9; margin-top: 12px; flex-shrink: 0; line-height: 1.4; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 12px;">
+                    <b style="color: var(--rt-accent); font-size: 14px;">Initial Setup:</b><br><br>
+                    1. Use the archetype buttons above to roll a new character, or <b>manually describe a character</b> by clicking 💬.<br><br>
+                    2. Create a character card for your "narrator" (e.g. Game Master). <b>Leave the card fields empty</b>, as the framework handles all logic via the system prompt.<br><br>
+                    3. Toggle the options below — the system prompt is <b>applied automatically</b> whenever you change a setting.<br><br>
+                    💡 <b>Model Recommendation:</b> I highly recommend using <b>Gemini 3.1 Flash Lite</b>. It is 100% reliable for both ReAct tool-use and standard parsing, and is extremely cheap. Set it up inside SillyTavern's Extension Settings drawer:
+                    <ul style="margin: 4px 0 0 16px; padding: 0;">
+                        <li><b>State Tracker:</b> <code>State Tracker Model</code> &rarr; <code>Connection Settings</code></li>
+                        <li><b>Lorebook Agent &amp; World Progression:</b> <code>Lorebook Agent</code> &rarr; <code>Connection Settings</code></li>
+                    </ul>
+                    <div style="margin-top: 8px;">
+                        🪙 <b>Token Optimization:</b> To reduce token costs, especially when in tool use mode, consider using a summarizer such as the <b>Summaryception</b> extension. Summarization combined with <b>Lorebook Agent</b> will guarantee the AI stays on track and keep token costs low.
+                    </div>
+                    <div style="margin-top: 12px;">
+                        🤖 <b>Recommended Models:</b>
+                        <ol style="margin: 6px 0 0 16px; padding: 0; display: flex; flex-direction: column; gap: 6px;">
+                            <li><b>Mistral Le Chaton Fat:</b> The new uncontested heavyweight champion.</li>
+                            <li><b>MiMo 2.5 Pro:</b> Great bang for the buck; high output quality.</li>
+                            <li><b>Gemini 3 Flash (or 3.5 Flash):</b> Good quality, costs quite low. Handles everything well and doesn't get bogged down thinking. Probably a good idea to put reasoning effort to medium to force them to think at least a little.</li>
+                            <li><b>DeepSeek 4 Pro:</b> Very good overall and very low cost but sometimes fails to obey formatting rules. May forget status footer sometimes.</li>
+                            <li><b>DeepSeek 3.2:</b> Extremely low cost and decent quality. Next to free.</li>
+                            <li><b>Kimi, GLM:</b> Good models but sometimes think too long, Kimi especially. Adjusting reasoning effort may help.</li>
+                            <li><b>Claude Sonnet+, GPT, Gemini Pro, etc.:</b> Obviously amazing but expensive.</li>
+                        </ol>
+                    </div>
+                </div>
+
+                <!-- Narrator Configuration (Salad Bar) -->
+                <div style="margin-top: 12px; border: 1px solid rgba(255,255,255,0.12); border-radius: 6px; padding: 10px; background: rgba(255,255,255,0.03); width: 100%; box-sizing: border-box;">
+                    <b style="color: var(--rt-accent); font-size: 14px; display: block; margin-bottom: 6px;">Narrator Configuration</b>
+                    <small style="display: block; margin-bottom: 8px; opacity: 0.65; font-style: italic; line-height: 1.3;">Select your preferred modes and components. Changes apply to your system prompt automatically (unless Custom Sysprompt Mode is on).</small>
+                    
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 4px;">
+                        <span style="font-size: 0.85em; font-weight: bold; opacity: 0.8;">RNG</span>
+                        <button class="rt-rng-help-icon" style="background: none; border: 1px solid rgba(255,255,255,0.2); border-radius: 4px; color: inherit; font-size: 0.72em; opacity: 0.7; padding: 1px 7px; cursor: pointer;" title="Open RNG systems explanation">What are these?</button>
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; padding-left: 5px;">
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="radio" name="rt_onboarding_rng_mode" value="hybrid" id="rt_onboarding_rng_hybrid" />
+                            <span>Pre-Seeded + Tool Calls</span>
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="radio" name="rt_onboarding_rng_mode" value="legacy" id="rt_onboarding_rng_legacy" />
+                            <span>Pre-Seeded Only</span>
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="radio" name="rt_onboarding_rng_mode" value="none" id="rt_onboarding_rng_none" />
+                            <span>No RNG (LLM makes up numbers)</span>
+                        </label>
+                    </div>
+
+                    <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 2px;">
+                        <span style="font-size: 0.85em; font-weight: bold; opacity: 0.8;">Quests</span>
+                        <button class="rt-quests-hardcore-help" style="background: none; border: 1px solid rgba(255,255,255,0.2); border-radius: 4px; color: inherit; font-size: 0.72em; opacity: 0.7; padding: 1px 7px; cursor: pointer;" title="Explain hardcore quest mechanics">What are these?</button>
+                    </div>
+                    <div style="display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; padding-left: 5px;">
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="rt_onboarding_quests_enabled" />
+                            <span>Enable Quests</span>
+                        </label>
+                        <div id="rt_onboarding_quest_options" style="padding-left: 20px; display: none; flex-direction: column; gap: 4px;">
+                            <div style="margin-top: 4px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 2px;">
+                                <span style="font-size: 0.75em; opacity: 0.6; text-transform: uppercase; font-weight: bold;">Hardcore / Optional</span>
+                            </div>
+                            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                                <input type="checkbox" id="rt_onboarding_quests_deadlines" />
+                                <span>Deadlines</span>
+                            </label>
+                            <div id="rt_onboarding_quests_frustration_wrap" style="padding-left: 20px; display: none;">
+                                <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                                    <input type="checkbox" id="rt_onboarding_quests_frustration" />
+                                    <span style="opacity: 0.9;">↳ Frustration (Experimental)</span>
+                                </label>
+                            </div>
+                            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                                <input type="checkbox" id="rt_onboarding_quests_difficulty" />
+                                <span>Difficulty</span>
+                            </label>
+                            <div style="margin-top: 4px; display: flex; flex-direction: column; gap: 4px;">
+                                <div style="font-size: 0.75em; opacity: 0.6; text-transform: uppercase; font-weight: bold;">
+                                    Processing Mode <i class="fa-solid fa-circle-question interactable" style="font-size: 0.9em; opacity: 0.7; margin-left: 4px;" title="Standard: AI manages quests via Tool Calls. Legacy: AI uses formatted text blocks."></i>
+                                </div>
+                                <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                                    <input type="radio" name="rt_onboarding_quest_mode" value="standard" id="rt_onboarding_quest_standard" />
+                                    <span>Standard (Tool Calls)</span>
+                                </label>
+                                <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                                    <input type="radio" name="rt_onboarding_quest_mode" value="legacy" id="rt_onboarding_quest_legacy" />
+                                    <span>Legacy (Without Tool Calls)</span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div style="font-size: 0.85em; font-weight: bold; opacity: 0.8; margin-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 2px;">Optional Components</div>
+                    <div style="display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; padding-left: 5px;">
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="rt_onboarding_mod_loot" />
+                            <span>🎲 Loot (Roll for Loot Quality)</span>
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="rt_onboarding_mod_random_events" />
+                            <span>🌍 Random Events (Rolls on time skips and travel)</span>
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="rt_onboarding_mod_resting" />
+                            <span>💤 Time-Limited Resting and interruption rolls based on location danger</span>
+                        </label>
+                    </div>
+
+                    <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin-top: 4px; padding-top: 8px; border-top: 1px solid rgba(255,255,255,0.1);">
+                        <input type="checkbox" id="rt_onboarding_custom_sysprompt" />
+                        <span style="font-size: 0.88em; opacity: 0.8;">Custom Sysprompt Mode — I'll manage my own system prompt</span>
+                    </label>
+
+                    <button id="rt_onboarding_btn_update_sysprompt" style="width: 100%; margin-top: 10px; padding: 7px 12px; background: rgba(0, 200, 140, 0.18); border: 1px solid #00c88c; border-radius: 4px; color: var(--rt-text, #eee); font-size: 0.88em; cursor: pointer;" title="Writes the system prompt to your Quick Prompt Main box based on the options selected above.">
+                        ↑ Apply System Prompt
+                    </button>
+                </div>
+            </div>`;
+        }
+
+        const blocks = parseMemoBlocks(memo);
+        if (Object.keys(blocks).length === 0) {
+            return `<div class="rt-empty">No structured blocks found.<br><small>Switch to Raw view to inspect the memo.</small></div>`;
+        }
+
+        const s = getSettings();
+        const order = s.blockOrder || BLOCK_ORDER;
+        const sorted = [
+            ...order.filter(k => blocks[k] !== undefined),
+            ...Object.keys(blocks).filter(k => !order.includes(k)).sort()
+        ];
+
+        const collapsed = loadCollapsed();
+        const detached = loadDetached();
+
+        // If filtering by a single tag (detached window context)
+        const tagsToRender = arguments[1] ? [arguments[1]] : sorted;
+
+        return tagsToRender.map(tag => {
+            if (tag === 'QUESTS') return ''; // Quest log has dedicated high-fidelity renderer, skip standard card
+            const content = blocks[tag];
+            if (content === undefined && arguments[1]) {
+                return `<div class="rt-empty">Waiting for ${tag} data...</div>`;
+            }
+            if (content === undefined) return '';
+
+            // If main panel context, filter out detached windows
+            if (!arguments[1] && detached.has(tag)) {
+                return `<div class="rt-detached-placeholder" data-tag="${tag}">
+                    <span class="rt-placeholder-icon">⧉</span> ${tag} is detached
+                    <button class="rt-reattach-btn-inline" data-tag="${tag}" title="Re-attach">↓</button>
+                </div>`;
+            }
+
+            const customField = (getSettings().customFields || []).find(f => f.tag.toUpperCase() === tag);
+            const icon = customField?.icon || BLOCK_ICONS[tag] || '📄';
+            const displayName = customField?.label || tag;
+            const items = blockToItems(tag, content);
+            const isCollapsed = collapsed.has(tag);
+
+            let totalValueBadge = '';
+            if (tag === 'INVENTORY' && items.totalValueGP && getSettings().showTotalInventoryValue !== false) {
+                const isModern = ['usd', 'eur', 'gbp'].includes(items.detectedCurrency);
+                const badgeColor = isModern ? '#85bb65' : '#ffd700';
+                const badgeBg = isModern ? 'rgba(133, 187, 101, 0.08)' : 'rgba(255, 215, 0, 0.08)';
+                const badgeBorder = isModern ? 'rgba(133, 187, 101, 0.3)' : 'rgba(255, 215, 0, 0.3)';
+                const badgeIcon = isModern ? '💵' : '💰';
+                totalValueBadge = `<span class="rt-total-value-badge" style="color: ${badgeColor}; font-weight: bold; background: ${badgeBg}; padding: 2px 8px; border-radius: 12px; border: 1px solid ${badgeBorder}; font-size: 0.85em; white-space: nowrap; text-transform: none; letter-spacing: 0;">${badgeIcon} ${items.totalValueGP}</span>`;
+            }
+
+            const renderType = customField?.renderType || tag;
+            const isFullView = getSettings().fullViewSections.includes(tag) || NO_PAGINATE.has(renderType);
+            const localPageSize = getPageSize(tag);
+
+            const page = isFullView ? 0 : (sectionPages[tag] ?? 0);
+            const totalPages = isFullView ? 1 : Math.ceil(items.length / localPageSize);
+            const safePage = Math.min(page, Math.max(0, totalPages - 1));
+            if (!isFullView) sectionPages[tag] = safePage;
+
+            const pageItems = isFullView ? items : items.slice(safePage * localPageSize, (safePage + 1) * localPageSize);
+            const bodyClass = `rt-section-body${renderType === 'ABILITIES' ? ' rt-abilities-body' : ''}`;
+
+            const pagination = totalPages > 1 ? `
+                <div class="rt-pagination">
+                    <button class="rt-page-btn" data-tag="${tag}" data-dir="-1"${safePage === 0 ? ' disabled' : ''}>&#8249;</button>
+                    <span>${safePage + 1}&thinsp;/&thinsp;${totalPages}</span>
+                    <button class="rt-page-btn" data-tag="${tag}" data-dir="1"${safePage >= totalPages - 1 ? ' disabled' : ''}>&#8250;</button>
+                </div>` : '';
+
+            // Don't show detach button if already in detached context (filterTag provided)
+            const detachBtn = !arguments[1] ? `
+                <button class="rt-detach-btn" data-tag="${tag}" title="Detach panel">
+                    ⧉
+                </button>
+            ` : '';
+
+            const fullViewBtn = NO_PAGINATE.has(renderType) ? '' : `
+                <button class="rt-fullview-btn${isFullView ? ' active' : ''}" data-tag="${tag}" title="${isFullView ? 'Switch to Paged View' : 'Switch to Full List'}">
+                    ${isFullView ? '📜' : '📑'}
+                </button>
+            `;
+
+            const renderOptions = getSettings().categoryRenderOptions?.[tag] || {};
+            const catStyles = [];
+            if (renderOptions.fontSize) catStyles.push(`--rt-cat-font-size: ${(renderOptions.fontSize / 13).toFixed(4)}em`);
+            if (renderOptions.italic) catStyles.push(`--rt-cat-font-style: italic`);
+            if (renderOptions.bold) catStyles.push(`--rt-cat-font-weight: bold`);
+            if (renderOptions.bullets === false) catStyles.push(`--rt-cat-bullet-display: none`);
+            if (renderOptions.bulletColor) catStyles.push(`--rt-cat-bullet-color: ${renderOptions.bulletColor}`);
+            if (renderOptions.bulletStyle) catStyles.push(`--rt-cat-bullet-style: "${renderOptions.bulletStyle}"`);
+            if (renderOptions.fontFamily) catStyles.push(`--rt-cat-font-family: ${renderOptions.fontFamily}`);
+            if (renderOptions.textColor && renderOptions.textColor !== 'inherit') catStyles.push(`--rt-cat-text-color: ${renderOptions.textColor}`);
+            const catStyleAttr = catStyles.length ? ` style='${catStyles.join('; ')}'` : '';
+
+            return `<div class="rt-section-card${isCollapsed ? ' rt-collapsed' : ''}" data-tag="${tag}">
+                <div class="rt-section-header" data-tag="${tag}">
+                    <span>${icon} ${displayName}</span>
+                    <div class="rt-section-header-right">
+                        ${totalValueBadge}
+                        ${detachBtn}
+                        ${fullViewBtn}
+                        <button class="rt-category-settings-btn" data-tag="${tag}" title="Category Rendering Options">
+                            <i class="fa-solid fa-cog"></i>
+                        </button>
+                        <span class="rt-item-count">${items.length} ${items.length === 1 ? 'entry' : 'entries'}</span>
+                        <span class="rt-collapse-icon">${isCollapsed ? '&#9656;' : '&#9662;'}</span>
+                    </div>
+                </div>
+                <div class="${bodyClass}"${catStyleAttr}>${pageItems.join('')}${pagination}</div>
+            </div>`;
+        }).join('');
+    }
+
+// ── Quest Log Renderer ─────────────────────────────────────────────────────
+
+/**
+ * Renders the quest log as a section card, matching the rt-section-card structure
+ * so collapse/detach/reattach work identically to other blocks.
+ * @param {object[]} quests
+ * @param {string} currentTime  in-world time string e.g. "08:00 AM, Day 2"
+ * @param {Set<string>} collapsed
+ * @param {Set<string>} detached
+ * @param {string|null} filterTag  if set, only render if tag === 'QUESTS'
+ * @returns {string}
+ */
+export function renderQuestLog(quests, currentTime, collapsed, detached, filterTag = null) {
+    const TAG = 'QUESTS';
+
+    if (filterTag && filterTag !== TAG) return '';
+
+    if (!filterTag && detached.has(TAG)) {
+        return `<div class="rt-detached-placeholder" data-tag="${TAG}">
+            <span class="rt-placeholder-icon">⧉</span> QUESTS is detached
+            <button class="rt-reattach-btn-inline" data-tag="${TAG}" title="Re-attach">↓</button>
+        </div>`;
+    }
+
+    const allQuests = quests || [];
+    const isCollapsed = collapsed.has(TAG);
+    const detachBtn = !filterTag ? `<button class="rt-detach-btn" data-tag="${TAG}" title="Detach panel">⧉</button>` : '';
+
+    if (allQuests.length === 0) {
+        return `<div class="rt-section-card${isCollapsed ? ' rt-collapsed' : ''}" data-tag="${TAG}">
+            <div class="rt-section-header" data-tag="${TAG}">
+                <span>📋 QUESTS</span>
+                <div class="rt-section-header-right">
+                    ${detachBtn}
+                    <span class="rt-item-count">0 entries</span>
+                    <span class="rt-collapse-icon">${isCollapsed ? '&#9656;' : '&#9662;'}</span>
+                </div>
+            </div>
+            <div class="rt-section-body"><div class="rt-card-line" style="opacity:0.6;">No active quests.</div></div>
+        </div>`;
+    }
+
+    const settings = getSettings();
+    const showFrustration = !!settings.syspromptModules?.questsFrustration;
+    const showDeadlines = !!settings.syspromptModules?.questsDeadlines;
+
+    const renderQuestCard = (quest) => {
+
+        const { getQuestMood } = /** @type {any} */ (globalThis.__rpgQuestUtils || {});
+        const moodData = typeof getQuestMood === 'function' 
+            ? getQuestMood(quest, currentTime, showFrustration) 
+            : { label: 'Active', color: '#00cc77', value: 0 };
+
+        const frust = moodData.value;
+        const label = moodData.label;
+        const barColor = moodData.color;
+
+        // frust: -1 = very pleased/just accepted, 0 = neutral/halfway, 1 = frustrated at deadline, >1 = overdue
+        // Map to a centered display: 50% = neutral, 0% = very pleased, 100% = max frustrated
+        // Clamp display to [-1, 2] range (values beyond 2 are "off the chart")
+        const displayFrust = Math.max(-1, Math.min(2, frust));
+        const scale        = 100 / 3; // -1→0%, 0→33%, 1→67%, 2→100%
+        const fillPct      = Math.round((displayFrust + 1) * scale);
+
+        const barTitle = showFrustration 
+            ? `NPC Mood: ${label} (${frust >= 0 ? '+' : ''}${frust.toFixed(2)})`
+            : `Time Progress: ${label}`;
+
+        // Tick mark at the neutral position (33%) and deadline position (67%)
+        const moodBarHtml = `
+            <div class="rt-quest-mood-bar-wrap" title="${escapeHtml(barTitle)}">
+                <div class="rt-quest-mood-bar" style="width:${fillPct}%; background:${barColor};"></div>
+                <div class="rt-quest-mood-tick rt-quest-mood-tick-neutral"></div>
+                <div class="rt-quest-mood-tick rt-quest-mood-tick-deadline"></div>
+            </div>`;
+
+        let statusBadgeClass = 'rt-quest-badge-active';
+        let statusLabel = 'Active';
+        if (quest.status === 'completed') { statusBadgeClass = 'rt-quest-badge-completed'; statusLabel = 'Completed'; }
+        if (quest.status === 'past deadline') { statusBadgeClass = 'rt-quest-badge-failed'; statusLabel = 'Past Deadline'; }
+        if (quest.status === 'failed')    { statusBadgeClass = 'rt-quest-badge-failed';    statusLabel = 'Failed'; }
+
+        const objectives = (quest.objectives || []).map(obj => {
+            const done = obj.status === 'completed';
+            const failed = obj.status === 'failed';
+            const optLabel = obj.required ? '' : ' <span class="rt-quest-optional">(Optional)</span>';
+            let objClass = 'rt-quest-obj';
+            if (done) objClass += ' rt-quest-obj-done';
+            if (failed) objClass += ' rt-quest-obj-failed';
+
+            // Progress counter (e.g. "4/6")
+            const hasProgress = typeof obj.total === 'number' && !done && !failed;
+            const progressHtml = hasProgress
+                ? ` <span class="rt-quest-progress">${obj.progress ?? 0}/${obj.total}</span>`
+                : '';
+
+            return `<div class="${objClass}">
+                <span class="rt-quest-check">${done ? '✓' : (failed ? '✗' : '○')}</span>
+                <span>${escapeHtml(obj.text)}${progressHtml}${optLabel}</span>
+            </div>`;
+        }).join('');
+
+        const rewards = (quest.rewards || []).map(r =>
+            `<span class="rt-quest-reward">${escapeHtml(r)}</span>`
+        ).join('');
+
+        const currentTotalMins = parseInWorldTime(currentTime);
+        const deadlineMins = parseInWorldTime(quest.deadline_time);
+        let timeLeftHtml = '';
+        if (currentTotalMins > 0 && deadlineMins > 0) {
+            const diff = deadlineMins - currentTotalMins;
+            timeLeftHtml = ` <i style="opacity: 0.7; font-size: 0.9em;">(${formatTimeDiff(diff, diff > 0)})</i>`;
+        }
+
+        const acceptedMins = parseInWorldTime(quest.accepted_time);
+        let acceptedRow = '';
+        if (currentTotalMins > 0 && acceptedMins > 0) {
+            const diff = currentTotalMins - acceptedMins;
+            acceptedRow = `
+                <div class="rt-quest-deadline">
+                    <div class="rt-quest-deadline-header">
+                        <span class="rt-entity-sub-label">Accepted:</span> ${escapeHtml(quest.accepted_time)} <i style="opacity: 0.7; font-size: 0.9em;">(${formatTimeDiff(diff, false)})</i>
+                    </div>
+                </div>`;
+        }
+
+        const deadlineRow = (quest.deadline_time && showDeadlines) ? `
+            <div class="rt-quest-deadline" style="${acceptedRow ? 'border-top: none; margin-top: 0;' : ''}">
+                <div class="rt-quest-deadline-header">
+                    <span class="rt-entity-sub-label">Deadline:</span> ${escapeHtml(quest.deadline_time)}${timeLeftHtml}
+                    ${showFrustration ? `<span class="rt-quest-mood-label" style="color:${barColor};">${label}</span>` : ''}
+                </div>
+                ${moodBarHtml}
+            </div>` : '';
+
+        const isFailed = quest.status === 'failed' || quest.status === 'past deadline';
+        let cardClass = 'rt-quest-card';
+        if (quest.status !== 'active') cardClass += ' rt-quest-inactive';
+        if (isFailed) cardClass += ' rt-quest-card-failed';
+
+        const diffColors = {
+            'Very Easy': '#a3e635', // Lime
+            'Easy': '#22c55e',      // Green
+            'Medium': '#f59e0b',    // Amber
+            'Hard': '#f97316',      // Orange
+            'Very Hard': '#ef4444'  // Red
+        };
+        const badgeBg = diffColors[quest.difficulty] || 'rgba(120, 120, 120, 0.2)';
+        const badgeColor = diffColors[quest.difficulty] ? '#000' : 'rgba(255,255,255,0.9)';
+        const diffBadge = quest.difficulty ? `<span class="rt-quest-badge" style="background: ${badgeBg}; color: ${badgeColor}; font-weight: 800; border: none;">${escapeHtml(String(quest.difficulty)).toUpperCase()}</span>` : '';
+
+        return `<div class="${cardClass}">
+            <div class="rt-quest-header">
+                <span class="rt-quest-title">${escapeHtml(quest.title)}</span>
+                <div class="rt-quest-badges">
+                    ${diffBadge}
+                    <span class="rt-quest-badge ${statusBadgeClass}">${statusLabel}</span>
+                </div>
+            </div>
+            <div class="rt-quest-giver">${escapeHtml(quest.giver_name)} · <em>${escapeHtml(quest.giver_location)}</em></div>
+            <div class="rt-quest-objectives">${objectives}</div>
+            ${rewards ? `<div class="rt-quest-rewards">${rewards}</div>` : ''}
+            ${acceptedRow}
+            ${deadlineRow}
+        </div>`;
+    };
+
+    const activeQuests = allQuests.filter(q => q.status !== 'completed');
+    const completedQuests = allQuests.filter(q => q.status === 'completed');
+
+    const activeCardsHtml = activeQuests.map(renderQuestCard).join('');
+    const completedCardsHtml = completedQuests.map(renderQuestCard).join('');
+
+    let bodyHtml = activeCardsHtml || '<div class="rt-card-line" style="opacity:0.6; padding: 10px;">No active quests.</div>';
+
+    if (completedQuests.length > 0) {
+        const isCompletedCollapsed = collapsed.has(TAG + '_COMPLETED');
+        bodyHtml += `
+        <div class="rt-section-card rt-sub-section${isCompletedCollapsed ? ' rt-collapsed' : ''}" data-tag="${TAG}_COMPLETED" style="margin-top: 10px; background: rgba(0,0,0,0.2); border-color: rgba(255,255,255,0.05); border-radius: 6px;">
+            <div class="rt-section-header" data-tag="${TAG}_COMPLETED" style="padding: 6px 10px; font-size: 0.9em; background: rgba(0,0,0,0.2); border-top-left-radius: 6px; border-top-right-radius: 6px;">
+                <span style="opacity:0.8;">✅ COMPLETED</span>
+                <div class="rt-section-header-right">
+                    <span class="rt-item-count" style="opacity:0.6;">${completedQuests.length} ${completedQuests.length === 1 ? 'entry' : 'entries'}</span>
+                    <span class="rt-collapse-icon" style="opacity:0.6;">${isCompletedCollapsed ? '&#9656;' : '&#9662;'}</span>
+                </div>
+            </div>
+            <div class="rt-section-body" style="padding: 5px;">${completedCardsHtml}</div>
+        </div>`;
+    }
+
+    const renderOptions = getSettings().categoryRenderOptions?.[TAG] || {};
+    const catStyles = [];
+    if (renderOptions.fontSize) catStyles.push(`--rt-cat-font-size: ${(renderOptions.fontSize / 13).toFixed(4)}em`);
+    if (renderOptions.italic) catStyles.push(`--rt-cat-font-style: italic`);
+    if (renderOptions.bold) catStyles.push(`--rt-cat-font-weight: bold`);
+    if (renderOptions.bullets === false) catStyles.push(`--rt-cat-bullet-display: none`);
+    if (renderOptions.bulletColor) catStyles.push(`--rt-cat-bullet-color: ${renderOptions.bulletColor}`);
+    if (renderOptions.bulletStyle) catStyles.push(`--rt-cat-bullet-style: "${renderOptions.bulletStyle}"`);
+    if (renderOptions.fontFamily) catStyles.push(`--rt-cat-font-family: ${renderOptions.fontFamily}`);
+    if (renderOptions.textColor && renderOptions.textColor !== 'inherit') catStyles.push(`--rt-cat-text-color: ${renderOptions.textColor}`);
+    const catStyleAttr = catStyles.length ? ` style='${catStyles.join('; ')}'` : '';
+
+    return `<div class="rt-section-card${isCollapsed ? ' rt-collapsed' : ''}" data-tag="${TAG}">
+        <div class="rt-section-header" data-tag="${TAG}">
+            <span>📋 QUESTS</span>
+            <div class="rt-section-header-right">
+                ${detachBtn}
+                <button class="rt-category-settings-btn" data-tag="${TAG}" title="Category Rendering Options">
+                    <i class="fa-solid fa-cog"></i>
+                </button>
+                <span class="rt-item-count">${activeQuests.length} active</span>
+                <span class="rt-collapse-icon">${isCollapsed ? '&#9656;' : '&#9662;'}</span>
+            </div>
+        </div>
+        <div class="rt-section-body"${catStyleAttr} style="padding-bottom: 5px;">${bodyHtml}</div>
+    </div>`;
+}
+    /**
+     * Renders the Lorebook Agent's thought process into a terminal-like view.
+     * @param {object[]} steps
+     * @returns {string}
+     */
+    export function renderLorebookTerminal(steps) {
+        if (!steps || steps.length === 0) return '';
+
+        return steps.map(step => {
+            const time = new Date(step.timestamp).toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+            let icon = 'fa-brain';
+            let color = 'var(--rt-custom-text-muted)';
+            let title = 'Thought';
+
+            switch (step.type) {
+                case 'tool': icon = 'fa-screwdriver-wrench'; color = '#3498db'; title = 'Tool'; break;
+                case 'result': icon = 'fa-list-ul'; color = '#9b59b6'; title = 'Result'; break;
+                case 'error': icon = 'fa-circle-exclamation'; color = '#e74c3c'; title = 'Error'; break;
+                case 'finish': icon = 'fa-circle-check'; color = '#2ecc71'; title = 'Finished'; break;
+                case 'start': icon = 'fa-play'; color = '#f1c40f'; title = 'Starting'; break;
+            }
+
+            const content = escapeHtml(step.content);
+            const metadata = step.metadata || {};
+
+            return `
+            <div class="rt-terminal-step" style="margin-bottom: 8px; font-family: var(--rt-custom-font-mono, monospace); font-size: 11px;">
+                <div class="rt-terminal-header" style="display: flex; align-items: center; gap: 8px; opacity: 0.8;">
+                    <span style="font-size: 9px; opacity: 0.5;">${time}</span>
+                    <i class="fa-solid ${icon}" style="color: ${color}; width: 14px; text-align: center;"></i>
+                    <b style="color: ${color}; text-transform: uppercase; letter-spacing: 0.5px;">${title}</b>
+                    ${metadata.time ? `<span style="margin-left: auto; font-size: 10px; opacity: 0.6;">Worked for ${metadata.time}s</span>` : ''}
+                </div>
+                <div class="rt-terminal-content" style="margin-top: 4px; padding-left: 22px; line-height: 1.4; white-space: pre-wrap; word-break: break-all; color: var(--rt-custom-text);">
+                    ${content}
+                </div>
+            </div>`;
+        }).join('');
+    }

@@ -12,15 +12,126 @@
  * circular import. This will be cleaned up when index.js is split.
  */
 
-import { getSettings } from './state-manager.js';
-import { parseQuestsFromMemo, extractCurrentTimeStr, cleanMessageContent } from './memo-processor.js';
-import { runRouterPass, saveSceneToLorebook, scanAssistantOutputForKeywords, parseInWorldMinutes, runWorldProgressionPass } from './router.js';
+import { getSettings, hydrateWorldProgressionFromChatState, persistWorldProgressionTimer, persistRouterLastRunWatermark, getNpcRelationshipMax, clampRelationshipValue, relationshipBarPct, getFriendshipTier, getAffectionTier, applyRelTierBadgeElement, showRelationshipFloatFeedback, saveChatState, getActiveChatId, getRelationshipUpdateMode, RELATIONSHIP_UPDATE_MODES, shouldProcessRegexRelationshipUpdates } from './state-manager.js';
+import { syncCombatProfile, isCombatActive } from './llm-client.js';
+import { parseQuestsFromMemo, extractCurrentTimeStr, cleanMessageContent, formatInWorldTime, memoForGmContext } from './memo-processor.js';
+import { runRouterPass, saveSceneToLorebook, scanAssistantOutputForKeywords, parseInWorldMinutes, runWorldProgressionPass, updateLorebookEntry, getLorebookManifest, rollbackRouterPass, isRouterRunning } from './router.js';
 import { logTransaction } from './debug-viewer.js';
+import { recordSchedulerEvent } from './swipe-scheduler-debug.js';
+import { saveSettings } from './src/app/runtime-bridge.js';
+
+/** Resolve ST macros (e.g. {{user}}) in lore text at injection time — storage keeps macros verbatim. */
+function substituteLoreMacros(content) {
+    if (!content) return '';
+    try {
+        const substituteParams = SillyTavern.getContext()?.substituteParams;
+        return typeof substituteParams === 'function' ? substituteParams(content) : content;
+    } catch (_) {
+        return content;
+    }
+}
+
+/**
+ * Resolve Control Room / unlocked state for `<end_of_output_footer>`.
+ * @param {object} settings
+ * @returns {{ enabled: boolean, inner: string }}
+ */
+function resolveEndOfOutputFooterSection(settings) {
+    const library = settings.customSyspromptLibrary || [];
+    const override = library.find(p =>
+        p.origin === 'unlocked_base'
+        && p.baseTag === 'end_of_output_footer'
+        && p._chatSetupMember !== false,
+    );
+    if (override) {
+        const raw = String(override.content || '').trim();
+        const innerMatch = raw.match(/<end_of_output_footer>([\s\S]*?)<\/end_of_output_footer>/i);
+        return { enabled: !!override.enabled, inner: (innerMatch ? innerMatch[1] : raw).trim() };
+    }
+
+    const enabled = settings.syspromptModules?.end_of_output_footer !== false;
+    if (!enabled) return { enabled: false, inner: '' };
+
+    // Prefer the live Main prompt (already Control-Room-assembled + time-format transforms).
+    const mainTa = /** @type {HTMLTextAreaElement|null} */ (document.getElementById('main_prompt_quick_edit_textarea'));
+    const mainVal = mainTa?.value || '';
+    const liveMatch = mainVal.match(/<end_of_output_footer>([\s\S]*?)<\/end_of_output_footer>/i);
+    if (liveMatch) return { enabled: true, inner: liveMatch[1].trim() };
+
+    // Fallback: shipped default body with the same time/date transforms as transformBaseSectionContent.
+    let inner = `ALWAYS end every output (even after tool chains) with:
+*(Status: [HP]) | (XP: [current]/[next level]) | (Location: [Main, Sub, Sub-sub, etc])*
+*Level [X] | [HH:MM AM/PM], Day [X]*
+Footer shows ONLY {{user}}'s HP/XP/level/location — never party/NPC status or names.`;
+    if (settings.use24hTime) {
+        inner = inner.replace(/\[HH:MM AM\/PM\]/g, '[HH:MM] (24-hour clock, NO AM/PM)');
+    }
+    if (settings.useDdMmYyFormat) {
+        inner = inner.replace(/Day\s+\[X\]/g, '[DD/MM/YYYY]');
+    }
+    return { enabled: true, inner };
+}
+
+/**
+ * Take only the footer format that follows the first "with" in the section body.
+ * @param {string} inner
+ * @returns {string}
+ */
+function extractFooterFormatAfterWith(inner) {
+    if (!inner) return '';
+    const m = String(inner).match(/\bwith\b\s*:?\s*([\s\S]*)/i);
+    return (m ? m[1] : '').trim();
+}
+
+/**
+ * Stealth end-of-output footer reminder for the first user turn of a chat.
+ * Honors System Prompt Control Room enable/disable and uses the live section's
+ * format (the part after "with") instead of a hardcoded template.
+ * @param {object} settings
+ * @returns {string} empty when footer section is disabled or has no format
+ */
+function buildEndOfOutputFooterReminder(settings) {
+    const { enabled, inner } = resolveEndOfOutputFooterSection(settings);
+    if (!enabled) return '';
+
+    const afterWith = extractFooterFormatAfterWith(inner);
+    if (!afterWith) return '';
+
+    const block = `<end_of_output_footer>
+ALWAYS end every output (even after tool chains) with:
+${afterWith}
+</end_of_output_footer>
+
+`;
+    return substituteLoreMacros(block);
+}
+
+/** @param {any[]} chat */
+function countUserMessagesInChat(chat) {
+    if (!Array.isArray(chat)) return 0;
+    let n = 0;
+    for (const m of chat) {
+        if (m?.is_user) {
+            n++;
+            continue;
+        }
+        const role = String(m?.role || m?.Role || '').toLowerCase().trim();
+        if (role === 'user') n++;
+    }
+    return n;
+}
+
+/** True when this generation is the chat's first user turn (inject footer once). */
+function shouldInjectEndOfOutputFooterReminder(chat, content) {
+    if (content && content.includes('<end_of_output_footer>')) return false;
+    return countUserMessagesInChat(chat) <= 1;
+}
 
 // ── Dice naming helpers ────────────────────────────────────────────────────────
 
 export function getDiceToolName() {
-    return 'RollTheDice';
+    const settings = getSettings();
+    return settings.diceD100Mode ? 'RollTheDiceD100' : 'RollTheDice';
 }
 
 export function getDiceCommandName() {
@@ -34,6 +145,9 @@ export function getDiceCommandAliases() {
 // ── RNG Engine ─────────────────────────────────────────────────────────────────
 
 export const RNG_QUEUE_LEN = 12;
+export const RNG_QUEUE_VERSION = 'v7.0';
+export const RNG_QUEUE_TAG_D20 = `[RNG_QUEUE ${RNG_QUEUE_VERSION}]`;
+export const RNG_QUEUE_TAG_D100 = `[RNG_QUEUE_d100 ${RNG_QUEUE_VERSION}]`;
 
 export function rollDie(sides) {
     const buf = new Uint32Array(1);
@@ -43,92 +157,178 @@ export function rollDie(sides) {
     return (roll % sides) + 1;
 }
 
-export function makeRngQueue(n = RNG_QUEUE_LEN) {
+export function makeRngQueue(n, forceD100) {
+    const settings = getSettings();
+    const d100Mode = forceD100 !== undefined ? !!forceD100 : !!settings.diceD100Mode;
+    const len = n !== undefined && n !== RNG_QUEUE_LEN ? n : (d100Mode ? 30 : RNG_QUEUE_LEN);
     const out = [];
-    for (let i = 0; i < n; i++) {
-        out.push({
-            d20: rollDie(20),
-            d4:  rollDie(4),
-            d6:  rollDie(6),
-            d8:  rollDie(8),
-            d10: rollDie(10),
-            d12: rollDie(12),
-        });
+    for (let i = 0; i < len; i++) {
+        if (d100Mode) {
+            out.push({
+                d100: rollDie(100),
+            });
+        } else {
+            out.push({
+                d20: rollDie(20),
+                d4:  rollDie(4),
+                d6:  rollDie(6),
+                d8:  rollDie(8),
+                d10: rollDie(10),
+                d12: rollDie(12),
+            });
+        }
     }
     return out;
 }
 
-export function buildRngBlock(queue) {
+export function formatRngQueueLine(lineNum, dice, d100Mode = false) {
+    if (d100Mode) {
+        return `${lineNum}: d100=${dice.d100}`;
+    }
+    return `${lineNum}: d20=${dice.d20} d4=${dice.d4} d6=${dice.d6} d8=${dice.d8} d10=${dice.d10} d12=${dice.d12}`;
+}
+
+export function buildRngBlock(queue, d100Mode = false) {
     const turnId = Date.now();
-    const formattedQueue = queue.map(dice =>
-        `${dice.d20}(d4:${dice.d4},d6:${dice.d6},d8:${dice.d8},d10:${dice.d10},d12:${dice.d12})`
-    ).join(", ");
-    return `[RNG_QUEUE v6.0_PROPER]\nturn_id=${turnId}\nscope=this_response\nqueue=[${formattedQueue}]\n[/RNG_QUEUE]\n\n`;
+    const lines = queue.map((dice, i) => formatRngQueueLine(i + 1, dice, d100Mode));
+    if (d100Mode) {
+        return `${RNG_QUEUE_TAG_D100}\nturn_id=${turnId}\nscope=this_response\n${lines.join('\n')}\n[/RNG_QUEUE_d100]\n\n`;
+    }
+    return `${RNG_QUEUE_TAG_D20}\nturn_id=${turnId}\nscope=this_response\n${lines.join('\n')}\n[/RNG_QUEUE]\n\n`;
 }
 
 // ── Dice rolling ───────────────────────────────────────────────────────────────
 
-function parseAndRoll(formula) {
-    const cleanFormula = formula.replace(/\s+/g, '');
-    // Regex matches e.g. "2d20k1+5+2", "1d20+7", "d20-1", "2d20kh1", "2d20dl1"
+/**
+ * Rolls a single die-group term (e.g. "2d6kh1", "d20", "3d8dl1") and returns
+ * the sum of the kept dice, plus an array of all individual raw rolls.
+ * Returns null if the token isn't a valid die-group.
+ */
+function rollSingleGroup(token) {
+    // Matches: optional count, dSides, optional keep/drop op, optional trailing int modifiers
     const regex = /^([1-9]\d*)?d([1-9]\d*)(?:([kd][hl]?)([1-9]\d*))?((?:[+-]\d+)*)$/i;
-    const match = cleanFormula.match(regex);
+    const match = token.match(regex);
     if (!match) return null;
 
     const numDice = match[1] ? parseInt(match[1], 10) : 1;
     const numSides = parseInt(match[2], 10);
-    const opType = match[3] ? match[3].toLowerCase() : null;
-    const opCount = match[4] ? parseInt(match[4], 10) : 0;
+    const opType   = match[3] ? match[3].toLowerCase() : null;
+    const opCount  = match[4] ? parseInt(match[4], 10) : 0;
     const modifierStr = match[5] || '';
 
-    // Safety limit to prevent locking the execution thread
     if (numDice > 100) return null;
 
     const rolls = [];
-    for (let i = 0; i < numDice; i++) {
-        rolls.push(rollDie(numSides));
-    }
+    for (let i = 0; i < numDice; i++) rolls.push(rollDie(numSides));
 
     let keptRolls = [...rolls];
     if (opType && opCount > 0) {
         keptRolls.sort((a, b) => a - b);
         if (opType.startsWith('k')) {
-            if (opType === 'kl') {
-                keptRolls = keptRolls.slice(0, opCount);
-            } else {
-                keptRolls = keptRolls.slice(-opCount);
-            }
+            keptRolls = opType === 'kl'
+                ? keptRolls.slice(0, opCount)
+                : keptRolls.slice(-opCount);
         } else if (opType.startsWith('d')) {
-            if (opType === 'dh') {
-                keptRolls = keptRolls.slice(0, Math.max(0, numDice - opCount));
-            } else {
-                keptRolls = keptRolls.slice(opCount);
-            }
+            keptRolls = opType === 'dh'
+                ? keptRolls.slice(0, Math.max(0, numDice - opCount))
+                : keptRolls.slice(opCount);
         }
     }
 
     let modifier = 0;
-    if (modifierStr) {
-        const modMatches = modifierStr.match(/[+-]\d+/g);
-        if (modMatches) {
-            for (const m of modMatches) {
-                modifier += parseInt(m, 10);
-            }
-        }
+    const modMatches = modifierStr.match(/[+-]\d+/g);
+    if (modMatches) {
+        for (const m of modMatches) modifier += parseInt(m, 10);
     }
 
-    const diceSum = keptRolls.reduce((sum, val) => sum + val, 0);
-    const total = diceSum + modifier;
-
     return {
-        total: String(total),
-        rolls: rolls.map(String)
+        kept: keptRolls.reduce((s, v) => s + v, 0) + modifier,
+        rolls,
     };
 }
 
+/**
+ * Parses and rolls a (possibly compound) dice formula such as:
+ *   "1d20+1d4+10"  →  rolls 1d20, rolls 1d4, adds flat 10
+ *   "2d6kh1-1"     →  keep-highest-1 of 2d6, subtract 1
+ *   "d20+7"        →  simple 1d20 + 7
+ *
+ * Returns { total: string, rolls: string[] } or null if the formula is invalid.
+ * The `rolls` array contains every individual raw die value across all groups,
+ * in left-to-right order.
+ */
+function parseAndRoll(formula) {
+    const cleanFormula = formula.replace(/\s+/g, '');
+
+    // Tokenise into signed terms: split on + or - that is NOT inside a die-group's
+    // trailing modifier (we re-attach the sign to each token for signed integers).
+    // Strategy: split on any + or - that is preceded by a digit (end of a term).
+    const tokenRegex = /([+-]?(?:[1-9]\d*)?d[1-9]\d*(?:[kd][hl]?[1-9]\d*)?(?:[+-]\d+)*|[+-]?\d+)/gi;
+    const tokens = cleanFormula.match(tokenRegex);
+
+    // Must have at least one token and the whole formula must be covered
+    if (!tokens || tokens.join('').replace(/\+/g, '').length !== cleanFormula.replace(/\+/g, '').length) {
+        // Fallback: try legacy single-group path for full backwards compat
+        return rollSingleGroup(cleanFormula);
+    }
+
+    // Need at least one die-group for this to be meaningful
+    const hasDie = tokens.some(t => /d/i.test(t));
+    if (!hasDie) return null;
+
+    let total = 0;
+    const allRolls = [];
+
+    for (const rawToken of tokens) {
+        // Determine sign prefix
+        const sign   = rawToken.startsWith('-') ? -1 : 1;
+        const token  = rawToken.replace(/^[+-]/, '');
+
+        if (/d/i.test(token)) {
+            // Die group
+            const result = rollSingleGroup(token);
+            if (!result) return null;           // malformed — abort entirely
+            total += sign * result.kept;
+            for (const r of result.rolls) allRolls.push(String(sign < 0 ? -r : r));
+        } else {
+            // Plain integer
+            const n = parseInt(token, 10);
+            if (isNaN(n)) return null;
+            total += sign * n;
+        }
+    }
+
+    return {
+        total: String(total),
+        rolls: allRolls,
+    };
+}
+
+/**
+ * Some callers (usually an LLM tool call) mangle the formula by joining
+ * multiple die groups with a comma instead of `+` (e.g. "1d20+1,1d20+1"),
+ * often just the same formula repeated. Since the tool only ever returns a
+ * single result, we recover by taking the first comma-separated segment
+ * that parses as a valid formula, rather than failing the whole roll.
+ * Returns the original string unchanged if there's no comma.
+ */
+function sanitizeFormula(value) {
+    if (!value.includes(',')) return value;
+    const parts = value.split(',').map(p => p.trim()).filter(Boolean);
+    for (const part of parts) {
+        if (parseAndRoll(part) || (SillyTavern.libs.droll && SillyTavern.libs.droll.validate(part))) {
+            return part;
+        }
+    }
+    return parts[0] || value;
+}
+
 export async function doDiceRoll(customDiceFormula, quiet = false) {
+    const settings = getSettings();
+    const d100Mode = !!settings.diceD100Mode;
+    const defaultFormula = d100Mode ? '1d100' : '1d20';
     const nullValue = { total: '', rolls: [] };
-    let value = typeof customDiceFormula === 'string' ? customDiceFormula.trim() : '1d20';
+    let value = typeof customDiceFormula === 'string' ? customDiceFormula.trim() : defaultFormula;
 
     if (value === 'custom') {
         const { Popup } = SillyTavern.getContext();
@@ -137,6 +337,8 @@ export async function doDiceRoll(customDiceFormula, quiet = false) {
 
     if (!value) return nullValue;
 
+    value = sanitizeFormula(value);
+
     // Try custom/advanced parser first
     const customResult = parseAndRoll(value);
     if (customResult) {
@@ -144,29 +346,35 @@ export async function doDiceRoll(customDiceFormula, quiet = false) {
             const context = SillyTavern.getContext();
             context.sendSystemMessage('generic', `${context.name1} rolls a ${value}. The result is: ${customResult.total} (${customResult.rolls.join(', ')})`, { isSmallSys: true });
         }
-        return customResult;
+        return { ...customResult, formula: value };
     }
 
     // Fall back to standard droll library
     const droll = SillyTavern.libs.droll;
-    if (!droll) {
+    if (droll) {
+        const isValid = droll.validate(value);
+        if (isValid) {
+            const result = droll.roll(value);
+            if (result) {
+                if (!quiet) {
+                    const context = SillyTavern.getContext();
+                    context.sendSystemMessage('generic', `${context.name1} rolls a ${value}. The result is: ${result.total} (${result.rolls.join(', ')})`, { isSmallSys: true });
+                }
+                return { total: String(result.total), rolls: result.rolls.map(String), formula: value };
+            }
+        }
+    } else {
         toastr['error']('Dice library (droll) not found.');
-        return nullValue;
     }
 
-    const isValid = droll.validate(value);
-    if (isValid) {
-        const result = droll.roll(value);
-        if (!result) return nullValue;
-        if (!quiet) {
-            const context = SillyTavern.getContext();
-            context.sendSystemMessage('generic', `${context.name1} rolls a ${value}. The result is: ${result.total} (${result.rolls.join(', ')})`, { isSmallSys: true });
-        }
-        return { total: String(result.total), rolls: result.rolls.map(String) };
-    } else {
-        toastr['warning']('Invalid dice formula');
-        return nullValue;
+    // Failsafe: never return empty/zero — that would auto-fail any DC check.
+    toastr['warning'](`Invalid dice formula "${value}" — defaulting to ${defaultFormula}.`);
+    const fallbackRoll = rollDie(d100Mode ? 100 : 20);
+    if (!quiet) {
+        const context = SillyTavern.getContext();
+        context.sendSystemMessage('generic', `${context.name1} tried to roll an invalid formula ("${value}"), defaulting to ${defaultFormula}. The result is: ${fallbackRoll}`, { isSmallSys: true });
     }
+    return { total: String(fallbackRoll), rolls: [String(fallbackRoll)], formula: defaultFormula, invalidFormula: value };
 }
 
 // ── Tool & slash command registration ─────────────────────────────────────────
@@ -178,62 +386,134 @@ export function registerDiceFunctionTool() {
         if (!registerFunctionTool || !unregisterFunctionTool) return;
 
         unregisterFunctionTool('RollTheDice');
+        unregisterFunctionTool('RollTheDiceD100');
         unregisterFunctionTool('FatbodyRollTheDice');
         unregisterFunctionTool('MultihogRollTheDice');
 
         const settings = getSettings();
-        if (!settings.rngEnabled || !settings.diceFunctionTool) return;
-
-        const toolName = getDiceToolName();
         const isLegacy = settings.legacyDiceNaming;
 
-        const rollDiceSchema = isLegacy ? {
-            type: 'object',
-            properties: {
-                who: { type: 'string', description: 'The name of the persona rolling the dice' },
-                formula: { type: 'string', description: 'A dice formula to roll, e.g. 1d6' },
-            },
-            required: ['who', 'formula'],
-        } : {
-            type: 'object',
-            properties: {
-                who: { type: 'string', description: 'The name of the persona rolling the dice' },
-                formula: { type: 'string', description: 'A dice formula to roll, e.g. 1d20' },
-                dc: { type: 'number', description: 'The Difficulty Class (DC) for this roll. Anchors the difficulty before the roll is made.' },
-            },
-            required: ['who', 'formula', 'dc'],
-        };
+        // Register d20 tool if enabled
+        if (settings.rngToolD20) {
+            const baseFormula = '1d20';
+            const formulaDescription = `A SINGLE dice formula to roll per invocation, e.g. "${baseFormula}", "2d6+3", "${baseFormula}+5". Supports one or more die groups joined by + or - (e.g. "${baseFormula}+1d4+2"), and keep/drop modifiers (e.g. "2d20kh1" for advantage, "2d20kl1" for disadvantage). Provide EXACTLY ONE formula string per call — do NOT comma-separate multiple formulas in one invocation. When several independent rolls are needed, issue multiple parallel RollTheDice invocations in the same turn (e.g. initiative for each combatant, or random-event occurrence + type).`;
 
-        registerFunctionTool({
-            name: toolName,
-            displayName: isLegacy ? 'Dice Roll' : 'Dice Roll (with DC)',
-            description: 'Rolls the dice using the provided formula and returns the numeric result. Use when it is necessary to roll the dice to determine the outcome of an action or when the user requests it.',
-            parameters: rollDiceSchema,
-            action: async (args) => {
-                const formula = args?.formula || (isLegacy ? '1d6' : '1d20');
-                const roll = await doDiceRoll(formula, true);
-                const total = parseInt(roll.total) || 0;
+            const rollDiceSchema = isLegacy ? {
+                type: 'object',
+                properties: {
+                    who: { type: 'string', description: 'The name of the persona rolling the dice' },
+                    formula: { type: 'string', description: formulaDescription.replace(baseFormula, '1d6') },
+                },
+                required: ['who', 'formula'],
+            } : {
+                type: 'object',
+                properties: {
+                    who: { type: 'string', description: 'The name of the persona rolling the dice' },
+                    formula: { type: 'string', description: formulaDescription },
+                    dc: { type: 'number', description: 'The Difficulty Class (DC) for this roll. Anchors the difficulty before the roll is made. A roll ≥ dc = SUCCESS.' },
+                },
+                required: ['who', 'formula', 'dc'],
+            };
 
-                if (isLegacy) {
-                    return args.who
-                        ? `${args.who} rolls a ${formula}. The result is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`
-                        : `The result of a ${formula} roll is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`;
-                }
+            registerFunctionTool({
+                name: 'RollTheDice',
+                displayName: isLegacy ? 'Dice Roll' : 'Dice Roll (with DC)',
+                description: 'Rolls the dice using the provided formula and returns the numeric result. Use when it is necessary to roll the dice to determine the outcome of an action or when the user requests it. Each invocation takes one formula (e.g. "1d20+3"). For multiple independent rolls, issue parallel invocations in the same turn — never comma-join formulas into one call.',
+                parameters: rollDiceSchema,
+                action: async (args) => {
+                    const requestedFormula = args?.formula || (isLegacy ? '1d6' : '1d20');
+                    const roll = await doDiceRoll(requestedFormula, true);
+                    const total = parseInt(roll.total) || 0;
+                    const formula = roll.formula || requestedFormula;
+                    const invalidNote = roll.invalidFormula ? ` (requested formula "${roll.invalidFormula}" was invalid, defaulted to ${formula})` : '';
 
-                const dc = Number(args?.dc) || 0;
-                let result = args.who
-                    ? `${args.who} rolls a ${formula} against DC ${dc}. The result is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`
-                    : `The result of a ${formula} roll against DC ${dc} is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`;
+                    if (isLegacy) {
+                        return (args.who
+                            ? `${args.who} rolls a ${formula}. The result is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`
+                            : `The result of a ${formula} roll is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`) + invalidNote;
+                    }
 
-                if (dc > 0) {
-                    result += ` (Result: ${total >= dc ? 'SUCCESS' : 'FAILURE'})`;
-                }
-                return result;
-            },
-            formatMessage: () => '',
-        });
+                    const dc = Number(args?.dc) || 0;
+                    let result = (args.who
+                        ? `${args.who} rolls a ${formula} against DC ${dc}. The result is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`
+                        : `The result of a ${formula} roll against DC ${dc} is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`) + invalidNote;
+
+                    if (dc > 0) {
+                        const success = (total >= dc);
+                        result += ` (Result: ${success ? 'SUCCESS' : 'FAILURE'})`;
+                    }
+                    return result;
+                },
+                formatMessage: () => '',
+            });
+        }
+
+        // Register d100 tool if enabled
+        if (settings.rngToolD100) {
+            const baseFormula = '1d100';
+            const formulaDescription = `A SINGLE dice formula to roll per invocation, e.g. "${baseFormula}", "2d6+3", "${baseFormula}+5". Supports one or more die groups joined by + or - (e.g. "${baseFormula}+1d4+2"), and keep/drop modifiers. Provide EXACTLY ONE formula string per call — do NOT comma-separate multiple formulas in one invocation. When several independent rolls are needed, issue multiple parallel RollTheDiceD100 invocations in the same turn.`;
+
+            const rollDiceSchema = {
+                type: 'object',
+                properties: {
+                    who: { type: 'string', description: 'The name of the persona rolling the dice' },
+                    formula: { type: 'string', description: formulaDescription },
+                    dc: { type: 'number', description: 'The success/trigger percentage chance for this roll (roll-under system). Set this to the actual % probability of success or occurrence (e.g. 83 for an 83% chance to hit/succeed, or 25 for a 25% hazard failure chance). A roll ≤ dc = HIT/SUCCESS/TRIGGER, a roll > dc = MISS/FAILURE/NO-TRIGGER. Do NOT invert the percentage — always pass the probability directly.' },
+                },
+                required: ['who', 'formula', 'dc'],
+            };
+
+            registerFunctionTool({
+                name: 'RollTheDiceD100',
+                displayName: 'Dice Roll d100 (with DC)',
+                description: 'Rolls a d100 (1-100) using the provided formula and returns the numeric result. Use for percentage probability checks. Each invocation takes one formula (e.g. "1d100"). For multiple independent rolls, issue parallel invocations in the same turn. The dc parameter is the direct success/trigger percentage (roll ≤ dc = success).',
+                parameters: rollDiceSchema,
+                action: async (args) => {
+                    const requestedFormula = args?.formula || '1d100';
+                    const roll = await doDiceRoll(requestedFormula, true);
+                    const total = parseInt(roll.total) || 0;
+                    const formula = roll.formula || requestedFormula;
+                    const invalidNote = roll.invalidFormula ? ` (requested formula "${roll.invalidFormula}" was invalid, defaulted to ${formula})` : '';
+
+                    const dc = Number(args?.dc) || 0;
+                    let result = (args.who
+                        ? `${args.who} rolls a ${formula} against DC ${dc}. The result is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`
+                        : `The result of a ${formula} roll against DC ${dc} is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`) + invalidNote;
+
+                    if (dc > 0) {
+                        const success = (total <= dc);
+                        result += ` (Result: ${total} ≤ ${dc}% → ${success ? 'HIT' : 'MISS'})`;
+                    }
+                    return result;
+                },
+                formatMessage: () => '',
+            });
+        }
     } catch (error) {
-        console.error('[RPG Tracker] Error registering dice function tool', error);
+        console.error('[RPG Tracker] Error registering dice function tools', error);
+    }
+}
+
+/**
+ * Keeps function-tool visibility aligned with managed hybrid RNG context.
+ * During combat the queue is the only mechanic, so remove the dice schemas;
+ * outside combat restore the user's configured dice tools.
+ */
+export function syncDiceFunctionToolForRngContext(memo, manageHybrid = false) {
+    if (!manageHybrid || !isCombatActive(memo)) {
+        registerDiceFunctionTool();
+        return;
+    }
+
+    try {
+        const { unregisterFunctionTool } = SillyTavern.getContext();
+        if (!unregisterFunctionTool) return;
+        unregisterFunctionTool('RollTheDice');
+        unregisterFunctionTool('RollTheDiceD100');
+        unregisterFunctionTool('FatbodyRollTheDice');
+        unregisterFunctionTool('MultihogRollTheDice');
+    } catch (e) {
+        console.warn('[RPG Tracker] Failed to unregister combat-disabled dice tools:', e);
     }
 }
 
@@ -246,7 +526,9 @@ export function registerDiceSlashCommand() {
         aliases: getDiceCommandAliases(),
         callback: async (args, value) => {
             const quiet = String(args.quiet) === 'true';
-            const result = await doDiceRoll(String(value || (getSettings().legacyDiceNaming ? '1d6' : '1d20')), quiet);
+            const s = getSettings();
+            const defaultFormula = s.diceD100Mode ? '1d100' : (s.legacyDiceNaming ? '1d6' : '1d20');
+            const result = await doDiceRoll(String(value || defaultFormula), quiet);
             return result.total;
         },
         helpString: 'Roll the dice.',
@@ -270,29 +552,202 @@ export function registerDiceSlashCommand() {
     }));
 
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
-        name: 'router',
+        name: 'lorebookagent',
+        aliases: ['lbagent', 'la', 'router'],
         callback: async (args, value) => {
-            const val = String(value || '').trim().toLowerCase();
-            if (val.startsWith('save')) {
-                const hint = val.substring(4).trim();
+            const settings = getSettings();
+            const quiet = String(args.quiet) === 'true';
+            const raw = String(value || '').trim();
+            const lower = raw.toLowerCase();
+
+            if (lower.startsWith('save')) {
+                const hint = raw.slice(4).trim();
                 await saveSceneToLorebook(hint);
                 return 'Scene save requested.';
             }
-            if (val === 'run' || val === 'research') {
-                const { chat } = SillyTavern.getContext();
-                const s = getSettings();
-                const combinedNarrative = getNarrativeBlocks(chat, -1, !!s.routerIncludeHidden);
-                await runRouterPass(combinedNarrative, null, null, true);
-                return 'Research pass started.';
+
+            if (!settings.routerEnabled) {
+                return 'Lorebook Agent is disabled.';
             }
-            return 'Usage: /router run | /router save [hint]';
+            if (isRouterRunning()) {
+                return 'Lorebook Agent is already running.';
+            }
+
+            /** @type {string|null} */
+            let manualPrompt = null;
+            /** @type {number|null} */
+            let lookback = null;
+
+            const lookbackRaw = args.lookback;
+            if (lookbackRaw !== undefined && lookbackRaw !== null && String(lookbackRaw).trim() !== '') {
+                const parsed = parseInt(String(lookbackRaw), 10);
+                if (Number.isFinite(parsed) && parsed >= 1) lookback = parsed;
+            }
+
+            if (lower === '' || lower === 'run' || lower === 'research') {
+                // null lookback → configured since-last-run / since-last-user / fixed lookback
+                manualPrompt = null;
+            } else {
+                // Any other unnamed text is a Direct Command prompt
+                manualPrompt = raw;
+                if (lookback === null) lookback = settings.routerDirectLookback || 10;
+            }
+
+            const { chat } = SillyTavern.getContext();
+            const combinedNarrative = getNarrativeBlocks(chat, -1, !!settings.routerIncludeHidden);
+            if (!quiet && typeof toastr !== 'undefined') {
+                toastr.info(
+                    manualPrompt ? 'Running Lorebook Agent with specific command...' : 'Starting Lorebook Agent pass...',
+                    'Lorebook Agent',
+                );
+            }
+            await runRouterPass(combinedNarrative, manualPrompt, lookback, true);
+            return manualPrompt ? 'Lorebook Agent command started.' : 'Lorebook Agent pass started.';
         },
-        helpString: 'Interact with the Router Agent (e.g. /router save)',
+        helpString: 'Run the Lorebook Agent (useful after /sendas, which does not auto-trigger it). '
+            + 'Aliases: /la, /lbagent, /router. '
+            + 'Usage: /lorebookagent | /lorebookagent run | /lorebookagent save [hint] | /lorebookagent &lt;direct command&gt;',
+        returns: 'status message',
+        namedArgumentList: [
+            SlashCommandNamedArgument.fromProps({
+                name: 'quiet',
+                description: 'Suppress the toast notification',
+                isRequired: false,
+                typeList: [ARGUMENT_TYPE.BOOLEAN],
+                defaultValue: 'false',
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'lookback',
+                description: 'Override lookback to N user turns (omit to use Lorebook Agent lookback settings)',
+                isRequired: false,
+                typeList: [ARGUMENT_TYPE.NUMBER],
+            }),
+        ],
         unnamedArgumentList: [
             SlashCommandArgument.fromProps({
-                description: 'command (e.g. save)',
-                isRequired: true,
+                description: 'run | research | save [hint] | direct command text (omit to run a normal pass)',
+                isRequired: false,
                 typeList: [ARGUMENT_TYPE.STRING],
+            }),
+        ],
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'statetracker',
+        aliases: ['st'],
+        callback: async (args, value) => {
+            const settings = getSettings();
+            const quiet = String(args.quiet) === 'true';
+            const raw = String(value || '').trim();
+            const lower = raw.toLowerCase();
+
+            if (!settings.enabled) {
+                return 'State Tracker is disabled.';
+            }
+            if (typeof globalThis._rpgStateModelRunning === 'function' && globalThis._rpgStateModelRunning()) {
+                return 'State Tracker is already running.';
+            }
+            if (typeof globalThis._rpgRunStateModelPass !== 'function') {
+                return 'State Tracker is not ready yet.';
+            }
+
+            /** @type {boolean} */
+            let isFullAudit = false;
+            /** @type {number|null} */
+            let customLookbackN = null;
+
+            const lookbackRaw = args.lookback;
+            if (lookbackRaw !== undefined && lookbackRaw !== null && String(lookbackRaw).trim() !== '') {
+                const parsed = parseInt(String(lookbackRaw), 10);
+                if (Number.isFinite(parsed) && parsed >= 1) customLookbackN = parsed;
+            }
+
+            if (lower === 'full' || lower === 'audit') {
+                isFullAudit = true;
+            } else if (lower === '' || lower === 'run' || lower === 'regular' || lower === 'update') {
+                // regular: since last user message (customLookbackN stays null unless lookback= was set)
+            } else if (/^\d+$/.test(lower)) {
+                customLookbackN = parseInt(lower, 10);
+            } else if (lower.startsWith('lookback')) {
+                const n = parseInt(lower.replace(/^lookback\s*/i, ''), 10);
+                if (!Number.isFinite(n) || n < 1) {
+                    return 'Usage: /statetracker lookback=N  or  /statetracker lookback N';
+                }
+                customLookbackN = n;
+            } else {
+                return 'Usage: /statetracker | /statetracker run | /statetracker full | /statetracker lookback=N';
+            }
+
+            const { chat } = SillyTavern.getContext();
+            let narrative = '';
+            if (isFullAudit) {
+                narrative = '';
+            } else if (customLookbackN !== null) {
+                narrative = getNarrativeBlocks(chat, customLookbackN);
+            } else {
+                narrative = getNarrativeBlocks(chat, -1);
+            }
+
+            if (!isFullAudit && !narrative) {
+                return 'No assistant message to parse.';
+            }
+
+            if (!quiet && typeof toastr !== 'undefined') {
+                toastr.info(
+                    isFullAudit ? 'Triggering Full Context Audit...' : 'Triggering manual State Update...',
+                    'RPG Tracker',
+                );
+            }
+            await globalThis._rpgRunStateModelPass(narrative, isFullAudit, customLookbackN);
+            return isFullAudit ? 'State Tracker full audit started.' : 'State Tracker update started.';
+        },
+        helpString: 'Run the State Tracker update (useful after /sendas, which does not auto-trigger it). '
+            + 'Alias: /st. '
+            + 'Usage: /statetracker | /statetracker run | /statetracker full | /statetracker lookback=N',
+        returns: 'status message',
+        namedArgumentList: [
+            SlashCommandNamedArgument.fromProps({
+                name: 'quiet',
+                description: 'Suppress the toast notification',
+                isRequired: false,
+                typeList: [ARGUMENT_TYPE.BOOLEAN],
+                defaultValue: 'false',
+            }),
+            SlashCommandNamedArgument.fromProps({
+                name: 'lookback',
+                description: 'Parse the last N assistant narrative blocks instead of since the last user message',
+                isRequired: false,
+                typeList: [ARGUMENT_TYPE.NUMBER],
+            }),
+        ],
+        unnamedArgumentList: [
+            SlashCommandArgument.fromProps({
+                description: 'run | regular | full | audit | lookback N | N (omit for a regular update)',
+                isRequired: false,
+                typeList: [ARGUMENT_TYPE.STRING],
+            }),
+        ],
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'multihogresetui',
+        aliases: ['rpgresetui', 'rtresetui'],
+        callback: async (args) => {
+            const quiet = String(args.quiet) === 'true';
+            if (typeof globalThis._rpgResetTrackerUi !== 'function') {
+                return 'UI reset is not ready yet.';
+            }
+            return globalThis._rpgResetTrackerUi({ quiet });
+        },
+        helpString: 'Emergency Multihog UI reset — rebuilds the State Tracker / Lorebook Agent panels and clears stuck layout (detached agent off-screen, missing tabs, hidden panel). Aliases: /rpgresetui, /rtresetui.',
+        returns: 'status message',
+        namedArgumentList: [
+            SlashCommandNamedArgument.fromProps({
+                name: 'quiet',
+                description: 'Suppress the toast notification',
+                isRequired: false,
+                typeList: [ARGUMENT_TYPE.BOOLEAN],
+                defaultValue: 'false',
             }),
         ],
     }));
@@ -323,16 +778,115 @@ function extractTextContent(msg) {
     return String(raw);
 }
 
+/**
+ * Formats a lorebook entry block for injection into the GM/narrator prompt.
+ * Automatically prepends any active NPC relationship status values if relationship bars are enabled.
+ */
+function buildInjectedEntryText(id, entry, settings) {
+    let content = substituteLoreMacros(entry.content || '');
+    const rel = settings.npcRelationshipValues?.[id];
+    if (rel && settings.npcRelationshipBars) {
+        const relMax = getNpcRelationshipMax(settings);
+        const friendship = rel.friendship ?? 0;
+        const affection = rel.affection ?? 0;
+        content = substituteLoreMacros(`Relationship with {{user}}: Friendship: ${friendship}/${relMax}, Affection: ${affection}/${relMax}\n${content}`);
+    }
+const label = entry.key?.[0] || entry.comment || id.split('::')[1];
+    return `### [${label}]\n${content}\n\n`;
+}
+
+/**
+ * Builds the [NPC_RELATIONS] context block summarising current relationship standings
+ * for all active NPC lorebook entries. Injected at the top of each turn's context so
+ * the narrator knows where it stands with present characters before writing.
+ *
+ * Only includes NPCs whose lorebook book name ends with _npcs / _npc (case-insensitive).
+ * Returns an empty string if no relevant active entries exist.
+ *
+ * @param {ReturnType<typeof import('./state-manager.js').getSettings>} settings
+ * @returns {Promise<string>}
+ */
+async function buildNpcRelationsBlock(settings) {
+    if (!settings.npcRelationshipBars) {
+        return '';
+    }
+
+    const relVals = settings.npcRelationshipValues || {};
+    const activeKeys = [...(settings.activeRouterKeys || []), ...(settings.activeWorldKeys || [])];
+    
+    // Always return the placeholder if no keys are active to ensure the AI knows the feature is ON.
+    if (!activeKeys.length) {
+        return `[NPC_RELATIONS]\nNo established relationships yet.\n[/NPC_RELATIONS]\n\n`;
+    }
+
+    const ctx = SillyTavern.getContext();
+    const lines = [];
+    const bookCache = {};
+
+    for (const id of activeKeys) {
+        const [bookName, uid] = id.split('::');
+        if (!bookName || !uid) continue;
+
+        if (!bookCache[bookName]) {
+            try { bookCache[bookName] = await ctx.loadWorldInfo(bookName); } catch (_) { bookCache[bookName] = null; }
+        }
+        const entry = bookCache[bookName]?.entries?.[uid];
+        if (!entry) continue;
+
+        // Strip any bracketed prefixes from the comment to get a clean display name
+        const rawComment = entry.comment || '';
+        const displayName = rawComment.replace(/^\[.*?\]\s*/i, '').trim();
+        if (!displayName) continue;
+
+        // Only include if they have a relationship tracked (prevents flooding context with non-NPC entries)
+        if (!relVals[id]) continue;
+
+        const rel = relVals[id];
+        const relMax = getNpcRelationshipMax(settings);
+        const f = rel.friendship ?? 0;
+        const a = rel.affection ?? 0;
+        const fStr = `Friendship ${f >= 0 ? '+' : ''}${f}`;
+        const aStr = `Affection ${a >= 0 ? '+' : ''}${a}`;
+        const fTier = getFriendshipTier(f, relMax);
+        const aTier = getAffectionTier(a, relMax);
+        lines.push(`${displayName}: ${fStr}, ${aStr}\n  Friendship tier: ${fTier.label} — ${fTier.hint}\n  Affection tier: ${aTier.label} — ${aTier.hint}`);
+    }
+
+    if (!lines.length) {
+        return `[NPC_RELATIONS]\nNo established relationships yet.\n[/NPC_RELATIONS]\n\n`;
+    }
+    
+    const relMax = getNpcRelationshipMax(settings);
+    const header = substituteLoreMacros(`Current relationship standings between the protagonist and present NPCs. Both axes range from -${relMax} to +${relMax}. Let the tier descriptions below each NPC guide how they behave toward {{user}} this turn.`);
+
+    return `[NPC_RELATIONS]\n${header}\n\n${lines.join('\n\n')}\n[/NPC_RELATIONS]\n\n`;
+}
+
 export function installInterceptor() {
+    // The former Prompt Manager injection path was removed. Clear any flag left
+    // behind by a hot-reloaded older build so this interceptor remains the one
+    // authoritative source of tracker and player-character prompt injection.
+    delete globalThis._rpgPromptManagerInterceptorActive;
     globalThis.rpgTrackerInterceptor = async function (chat, contextSize, abort, type) {
         const settings = getSettings();
 
-        // When addPromptManagerInterceptor (Path 1) is active, we do NOT inject anything
-        // into the user message — that would break prefix-cache protection.
-        // However, we MUST still run the keyword pre-scan so that newly triggered entries
-        // are added to activeRouterKeys before Path 1 reads it to build the API payload.
-        // Path 1 fires after this interceptor in the ST pipeline, so a scan here = same-turn lore.
-        const skipInjection = !!globalThis._rpgPromptManagerInterceptorActive;
+        // The manifest interceptor is the sole injection path.
+        const skipInjection = false;
+
+        // ── Swipe rollback: memo, then relationships, then lorebook agent ─────────────
+        const _rbCtx = SillyTavern.getContext();
+        const _rbChat = _rbCtx?.chat;
+        const _rbLastAi = _rbChat ? [..._rbChat].reverse().find(m => !m.is_user && !m.is_system) : null;
+        if (_rbLastAi) {
+            applyMemoSwipeRollback(_rbLastAi, settings);
+            if (settings.npcRelationshipBars) {
+                const _relRb = applyRelationshipSwipeRollback(_rbLastAi, settings);
+                if (_relRb.anyChanged) refreshRelationshipBarsDOM(settings);
+            }
+            if (settings.routerEnabled) {
+                await maybeRollbackRouterPassForSwipe(_rbLastAi);
+            }
+        }
 
         if (settings.debugMode) {
             console.group("[RPG Tracker] Interceptor Triggered");
@@ -342,7 +896,8 @@ export function installInterceptor() {
             console.log("Chat Length:", Array.isArray(chat) ? chat.length : 'N/A');
         }
 
-        if (!settings.enabled) {
+        const routerActive = !!settings.routerEnabled;
+        if (!settings.enabled && !routerActive) {
             if (settings.debugMode) console.groupEnd();
             return;
         }
@@ -419,28 +974,53 @@ export function installInterceptor() {
         if (settings.debugMode) {
             console.log(`Found user message at index ${idx}.`);
             console.log(`Extracted Text Content Length: ${content.length}`);
-            console.log(`Content includes RNG tag? ${content.includes("[RNG_QUEUE v6.0_PROPER]")}`);
+            console.log(`Content includes RNG tag? ${content.includes(RNG_QUEUE_TAG_D20) || content.includes(RNG_QUEUE_TAG_D100)}`);
             if (skipInjection) console.log("[RPG Tracker] Path 1 active: skipping user-message injection; keyword scan will still run.");
         }
 
         // RNG, State Memo, and Quests are only injected into the user message in Path 2.
         // In Path 1 (addPromptManagerInterceptor), these are built and injected by that interceptor
         // into a dedicated system message at the configured depth, protecting the prefix cache.
-        if (!skipInjection) {
-            if (settings.rngEnabled && !content.includes("[RNG_QUEUE v6.0_PROPER]")) {
-                const queue = makeRngQueue(RNG_QUEUE_LEN);
-                injections += buildRngBlock(queue);
-                if (settings.debugMode) console.log("RNG Queue generated for injection.");
+        if (!skipInjection && settings.enabled) {
+            // [PLAYER_CHARACTER] — always injected at the top of the core block
+            const curChatId = SillyTavern.getContext().chatId || globalThis._rpgCurrentChatId?.();
+            if (curChatId && settings.chatStates?.[curChatId]?.playerCharacter) {
+                const pc = settings.chatStates[curChatId].playerCharacter;
+                if (!content.includes("[PLAYER_CHARACTER]")) {
+                    injections += `[PLAYER_CHARACTER]\nName: ${pc.name}\n${pc.bio}\n[/PLAYER_CHARACTER]\n\n`;
+                    if (settings.debugMode) console.log("Player Character injected.");
+                }
+            }
+
+        // [NPC_RELATIONS] — injected first, before RNG queue, same mechanism as RNG.
+            const relBlock = await buildNpcRelationsBlock(settings);
+            if (relBlock) injections += relBlock;
+
+            // Hybrid mode uses live tool calls outside combat and the queue only
+            // while [COMBAT] is active. Queue-only mode continues to inject it for
+            // every response, preserving its existing behavior.
+            const injectRngQueue = settings.rngEnabled
+                && (!settings.diceFunctionTool || isCombatActive(settings.currentMemo));
+            if (injectRngQueue) {
+                if (settings.rngQueueD20 && !content.includes(RNG_QUEUE_TAG_D20)) {
+                    const queue = makeRngQueue(RNG_QUEUE_LEN, false);
+                    injections += buildRngBlock(queue, false);
+                    if (settings.debugMode) console.log("RNG Queue (d20) generated for injection.");
+                }
+                if (settings.rngQueueD100 && !content.includes(RNG_QUEUE_TAG_D100)) {
+                    const queue = makeRngQueue(30, true);
+                    injections += buildRngBlock(queue, true);
+                    if (settings.debugMode) console.log("RNG Queue (d100) generated for injection.");
+                }
             }
 
             if (settings.currentMemo && !content.includes("### STATE MEMO (DO NOT REPEAT)")) {
-                // Strip the JSON [QUESTS] block from the narrative context to save tokens and avoid redundancy
-                const memoText = stripMemoHtml(settings.currentMemo).replace(/\[QUESTS\][\s\S]*?\[\/QUESTS\]/gi, '').trim();
+                const memoText = stripMemoHtml(memoForGmContext(settings.currentMemo)).trim();
                 injections += `### STATE MEMO (DO NOT REPEAT)\n${memoText}\n\n`;
             }
 
             // Quest deadline check — fires before state model pass, deterministically
-            if (settings.modules?.quests) {
+            if (settings.syspromptModules?.quests !== false) {
                 const memoQuests = parseQuestsFromMemo(settings.currentMemo);
                 if (memoQuests.length) {
                     const { checkQuestDeadlines, renderQuestsAsPlainText } = await import('./quests.js');
@@ -453,6 +1033,19 @@ export function installInterceptor() {
                     const freshQuests = parseQuestsFromMemo(settings.currentMemo);
                     const questText = renderQuestsAsPlainText(freshQuests, currentTime);
                     if (questText) injections += questText;
+                }
+            }
+
+            // Once per chat: reinforce the status footer on the first user turn only
+            // (near the bottom of early context — system prompt alone is often ignored).
+            // Honors Control Room: disabled <end_of_output_footer> → no reminder.
+            if (shouldInjectEndOfOutputFooterReminder(chat, content)) {
+                const footerReminder = buildEndOfOutputFooterReminder(settings);
+                if (footerReminder) {
+                    injections += footerReminder;
+                    if (settings.debugMode) console.log('[RPG Tracker] End-of-output footer reminder injected (first user turn).');
+                } else if (settings.debugMode) {
+                    console.log('[RPG Tracker] End-of-output footer reminder skipped (disabled or empty format).');
                 }
             }
         }
@@ -481,7 +1074,7 @@ export function installInterceptor() {
                 const triggered = await scanAssistantOutputForKeywords(content, { sweepEnabled: false }).catch(() => []);
                 console.log('activeRouterKeys AFTER scan:', JSON.stringify(settings.activeRouterKeys || []));
                 console.log('newly triggered this scan:', triggered);
-                console.log(`scan finished @ ${performance.now().toFixed(1)}ms`);
+                console.log(`scan finished @ ${performance.now().toFixed(1) }ms`);
 
                 // Trigger UI refresh so the Agent Panel updates immediately with yellow pills
                 if (triggered.length > 0 && typeof globalThis._rpgRenderRouterUI === 'function') {
@@ -504,7 +1097,7 @@ export function installInterceptor() {
                                 if (!bookCache[bookName]) bookCache[bookName] = await ctx.loadWorldInfo(bookName);
                                 const entry = bookCache[bookName]?.entries?.[uid];
                                 if (entry?.content) {
-                                    loreBlock += `### [${entry.key?.[0] || entry.comment || uid}]\n${entry.content}\n\n`;
+                                    loreBlock += buildInjectedEntryText(id, entry, settings);
                                 }
                             }
                             if (loreBlock) {
@@ -529,7 +1122,7 @@ export function installInterceptor() {
                                 if (!bookCache[bookName]) bookCache[bookName] = await ctx.loadWorldInfo(bookName);
                                 const entry = bookCache[bookName]?.entries?.[uid];
                                 if (entry?.content) {
-                                    persistBlock += `### [${entry.key?.[0] || entry.comment || uid}]\n${entry.content}\n\n`;
+                                    persistBlock += buildInjectedEntryText(id, entry, settings);
                                 }
                             }
                             if (persistBlock) {
@@ -559,7 +1152,7 @@ export function installInterceptor() {
                                 if (!bookCache[bookName]) bookCache[bookName] = await ctx.loadWorldInfo(bookName);
                                 const entry = bookCache[bookName]?.entries?.[uid];
                                 if (entry?.content) {
-                                    agentBlock += `### [${entry.key?.[0] || entry.comment || uid}]\n${entry.content}\n\n`;
+                                    agentBlock += buildInjectedEntryText(id, entry, settings);
                                 }
                             }
                             if (agentBlock) {
@@ -586,7 +1179,7 @@ export function installInterceptor() {
                             if (!bookCache[bookName]) bookCache[bookName] = await ctx.loadWorldInfo(bookName);
                             const entry = bookCache[bookName]?.entries?.[uid];
                             if (entry?.content) {
-                                worldBlock += `### [${entry.key?.[0] || entry.comment || 'World Report'}]\n${entry.content}\n\n`;
+                                worldBlock += `### [${entry.key?.[0] || entry.comment || 'World Report'}]\n${substituteLoreMacros(entry.content)}\n\n`;
                             }
                         }
                         if (worldBlock) {
@@ -712,6 +1305,728 @@ export function installInterceptor() {
     };
 }
 
+/**
+ * Fuzzy-resolves an NPC name from narrative text to a Book::UID.
+ * Handles partial matches (e.g. "Holdyn" matches "Ser Holdyn"),
+ * bracket-prefix stripping (e.g. "[Active] Elena" → "Elena"),
+ * and picks the shortest label that contains the query for precision.
+ * @param {string} name - The NPC name from the narrative annotation.
+ * @returns {Promise<string|null>} The resolved Book::UID or null.
+ */
+async function fuzzyResolveNpcName(name) {
+    const query = name.toLowerCase().trim();
+    if (!query) return null;
+
+    const settings = getSettings();
+    const manifest = await getLorebookManifest(true); // skipUpdate=true to prevent massive hard drive scan
+    if (!manifest || !manifest.length) return null;
+
+    // Only consider NPC entries (books ending in _npcs or _npc)
+    const npcEntries = manifest.filter(e => {
+        const bookName = (e.id || '').split('::')[0] || '';
+        return /_npcs?$/i.test(bookName);
+    });
+
+    let bestMatch = null;
+    let bestDiff = Infinity;
+
+    for (const entry of npcEntries) {
+        // Strip bracketed prefixes like [Active], [NPC], etc.
+        const rawLabel = (entry.comment || entry.label || '').replace(/^\[.*?\]\s*/i, '').trim();
+        const labelLower = rawLabel.toLowerCase();
+
+        if (!labelLower) continue;
+
+        // Exact match — return immediately
+        if (labelLower === query) return entry.id;
+
+        // Fuzzy: check if query is a substring of the label or vice-versa
+        // e.g. "Holdyn" matches "Ser Holdyn", "Elena" matches "Elena Brightforge"
+        // Must be at least 3 characters to prevent single-letter or empty strings matching everything
+        if (labelLower.length >= 3 && (labelLower.includes(query) || query.includes(labelLower))) {
+            // Prefer the match with the smallest length difference to the query
+            const diff = Math.abs(labelLower.length - query.length);
+            if (diff < bestDiff) {
+                bestDiff = diff;
+                bestMatch = entry.id;
+            }
+        }
+
+        // Also check keywords for fuzzy match
+        const keys = entry.keys || entry.key || [];
+        for (const k of (Array.isArray(keys) ? keys : [keys])) {
+            const kLower = String(k).toLowerCase().trim();
+            if (!kLower) continue;
+            
+            if (kLower === query) {
+                bestMatch = entry.id;
+                break;
+            }
+            if (kLower.length >= 3 && (kLower.includes(query) || query.includes(kLower))) {
+                const diff = Math.abs(kLower.length - query.length);
+                if (diff < bestDiff) {
+                    bestDiff = diff;
+                    bestMatch = entry.id;
+                }
+                break;
+            }
+        }
+    }
+
+    return bestMatch;
+}
+
+/**
+ * Restore the State Tracker memo when the user swipes to a different generation on the
+ * last AI message. Uses rpgMemoActiveSwipe (not rpgActiveSwipe) so memo rollback stays
+ * independent of the relationship swipe tracker.
+ * @returns {{ anyChanged: boolean }}
+ */
+function applyMemoSwipeRollback(lastAiMsg, settings) {
+    let anyChanged = false;
+    if (settings.stateTrackerSwipeRollback === false || !lastAiMsg) {
+        return { anyChanged };
+    }
+
+    lastAiMsg.extra = lastAiMsg.extra || {};
+    const swipeId = lastAiMsg.swipe_id ?? 0;
+    const prevSwipeId = lastAiMsg.extra.rpgMemoActiveSwipe ?? lastAiMsg.extra.rpgActiveSwipe;
+
+    if (prevSwipeId !== undefined && prevSwipeId !== swipeId) {
+        let targetMemo = lastAiMsg.extra.rpgMemoResult?.[swipeId];
+        if (typeof targetMemo !== 'string') {
+            targetMemo = lastAiMsg.extra.rpgMemoRollback?.[prevSwipeId] || lastAiMsg.extra.rpgMemoRollback?.[swipeId];
+        }
+
+        if (typeof targetMemo === 'string') {
+            console.log(`[RPG Tracker] State swipe detected (${prevSwipeId}→${swipeId}): restoring memo snapshot.`);
+            recordSchedulerEvent('memo_swipe_rollback', { prevSwipeId, swipeId, targetMemoLen: targetMemo.length });
+            settings.currentMemo = targetMemo;
+
+            if (Array.isArray(settings.memoHistory)) {
+                const baseMemo = lastAiMsg.extra.rpgMemoRollback?.[prevSwipeId] || lastAiMsg.extra.rpgMemoRollback?.[swipeId];
+                if (targetMemo === baseMemo) {
+                    if (settings.memoHistory[0] !== baseMemo) {
+                        settings.memoHistory.shift();
+                        if (settings.historyIndex !== undefined && settings.historyIndex > 0) settings.historyIndex--;
+                    }
+                } else {
+                    settings.memoHistory[0] = targetMemo;
+                }
+            }
+
+            if (lastAiMsg.extra.rpgMemoRollback) delete lastAiMsg.extra.rpgMemoRollback[swipeId];
+
+            if (typeof globalThis._rpgUpdateUIMemo === 'function') {
+                globalThis._rpgUpdateUIMemo(targetMemo);
+            }
+            anyChanged = true;
+        }
+    }
+
+    lastAiMsg.extra.rpgMemoActiveSwipe = swipeId;
+    return { anyChanged };
+}
+
+/**
+ * Undo/re-apply friendship/affection deltas when the user swipes between generations
+ * on the last AI message. Shared by MESSAGE_SWIPED and the pre-generation interceptor.
+ * @returns {{ anyChanged: boolean, bailEarly: boolean }}
+ */
+function applyRelationshipSwipeRollback(lastAiMsg, settings) {
+    let anyChanged = false;
+    if (!settings.npcRelationshipBars || !lastAiMsg) return { anyChanged, bailEarly: false };
+
+    lastAiMsg.extra = lastAiMsg.extra || {};
+    const swipeId = lastAiMsg.swipe_id ?? 0;
+    const relMax = getNpcRelationshipMax(settings);
+
+    if (Array.isArray(lastAiMsg.extra.rpgProcessedTags)) {
+        lastAiMsg.extra.rpgProcessedTags = { [swipeId]: lastAiMsg.extra.rpgProcessedTags };
+    } else if (!lastAiMsg.extra.rpgProcessedTags) {
+        lastAiMsg.extra.rpgProcessedTags = {};
+    }
+    lastAiMsg.extra.rpgRollbackData = lastAiMsg.extra.rpgRollbackData || {};
+
+    const alreadyScanned = lastAiMsg.extra.rpgProcessedTags[swipeId] !== undefined;
+
+    if (lastAiMsg.extra.rpgActiveSwipe !== undefined && lastAiMsg.extra.rpgActiveSwipe !== swipeId) {
+        const prevSwipeId = lastAiMsg.extra.rpgActiveSwipe;
+        console.log(`[RPG Tracker] Relationship swipe change: prev=${prevSwipeId}, current=${swipeId}`);
+        recordSchedulerEvent('relationship_swipe_change', { prevSwipeId, swipeId });
+
+        if (lastAiMsg.extra.rpgRollbackData[prevSwipeId]) {
+            console.log(`[RPG Tracker] Rolling back previous swipe ${prevSwipeId} relationship allocations.`);
+            for (const rb of lastAiMsg.extra.rpgRollbackData[prevSwipeId]) {
+                if (settings.npcRelationshipValues && settings.npcRelationshipValues[rb.npcId]) {
+                    const current = settings.npcRelationshipValues[rb.npcId][rb.field] ?? 0;
+                    if (rb.expectedValue !== undefined && current !== rb.expectedValue) {
+                        console.log(`[RPG Tracker] Aborting rollback for ${rb.npcId}: User manually edited slider.`);
+                        continue;
+                    }
+                    settings.npcRelationshipValues[rb.npcId][rb.field] = clampRelationshipValue(current - rb.actualAppliedDelta, relMax);
+                }
+                if (settings.npcRelationshipLog && Array.isArray(settings.npcRelationshipLog[rb.npcId])) {
+                    settings.npcRelationshipLog[rb.npcId] = settings.npcRelationshipLog[rb.npcId].filter(l => l.timestamp !== rb.logTimestamp);
+                }
+            }
+            anyChanged = true;
+        }
+
+        if (alreadyScanned) {
+            if (lastAiMsg.extra.rpgRollbackData[swipeId]?.length > 0) {
+                console.log(`[RPG Tracker] Re-applying saved allocations for swipe ${swipeId}`);
+                for (const rb of lastAiMsg.extra.rpgRollbackData[swipeId]) {
+                    if (settings.npcRelationshipValues && settings.npcRelationshipValues[rb.npcId]) {
+                        const current = settings.npcRelationshipValues[rb.npcId][rb.field] ?? 0;
+                        const newValue = clampRelationshipValue(current + rb.actualAppliedDelta, relMax);
+                        settings.npcRelationshipValues[rb.npcId][rb.field] = newValue;
+                        rb.expectedValue = newValue;
+                        rb.newValue = newValue;
+                    }
+                    if (settings.npcRelationshipLog) {
+                        settings.npcRelationshipLog[rb.npcId] = settings.npcRelationshipLog[rb.npcId] || [];
+                        const hasLog = settings.npcRelationshipLog[rb.npcId].some(l => l.timestamp === rb.logTimestamp);
+                        if (!hasLog) {
+                            settings.npcRelationshipLog[rb.npcId].push({
+                                timestamp: rb.logTimestamp,
+                                field: rb.field,
+                                delta: rb.delta,
+                                newValue: settings.npcRelationshipValues[rb.npcId][rb.field],
+                                source: 'Swipe restore'
+                            });
+                            if (settings.npcRelationshipLog[rb.npcId].length > 50) {
+                                settings.npcRelationshipLog[rb.npcId].shift();
+                            }
+                        }
+                    }
+                }
+                anyChanged = true;
+            }
+            lastAiMsg.extra.rpgActiveSwipe = swipeId;
+            return { anyChanged, bailEarly: true };
+        }
+
+        lastAiMsg.extra.rpgProcessedTags[swipeId] = [];
+        lastAiMsg.extra.rpgRollbackData[swipeId] = [];
+    }
+
+    lastAiMsg.extra.rpgActiveSwipe = swipeId;
+    lastAiMsg.extra.rpgProcessedTags[swipeId] = lastAiMsg.extra.rpgProcessedTags[swipeId] || [];
+    lastAiMsg.extra.rpgRollbackData[swipeId] = lastAiMsg.extra.rpgRollbackData[swipeId] || [];
+
+    return { anyChanged, bailEarly: false };
+}
+
+/**
+ * If the Lorebook Agent's most recent pass ran while `msg` was showing a swipe that is
+ * no longer active (i.e. the user swiped away from it), undo that pass and prime the
+ * run-every throttle so the agent fires again on the very next generation. This keeps
+ * "Run every N msgs" swipe-safe: without it, a discarded swipe's content would still
+ * count toward (and advance past) the "since last run" watermark, permanently skipping
+ * that segment of the conversation from the agent's view.
+ * @param {any} msg - The last AI message, as resolved by the caller.
+ */
+async function maybeRollbackRouterPassForSwipe(msg) {
+    if (!msg?.extra || msg.extra.rpgRouterRanForSwipe === undefined) return;
+
+    const currentSwipeId = msg.swipe_id ?? 0;
+    if (msg.extra.rpgRouterRanForSwipe === currentSwipeId) return;
+
+    if (isRouterRunning()) return;
+
+    const settings = getSettings();
+    if (settings.routerSwipeRollback === false) {
+        recordSchedulerEvent('la_swipe_rollback_skipped', {
+            reason: 'setting_disabled',
+            fromSwipe: msg.extra.rpgRouterRanForSwipe,
+            toSwipe: currentSwipeId,
+        });
+        clearRouterSwipeMarkers(msg);
+        return;
+    }
+
+    const runId = msg.extra.rpgRouterRunId;
+    const postWm = msg.extra.rpgRouterPostPassWatermark;
+    const latest = settings.routerHistory?.[0];
+
+    // Only auto-rollback if this pass is still the most recent one in history.
+    let historyIndex = -1;
+    if (runId && latest?.runId === runId) {
+        historyIndex = 0;
+    } else if (!runId && postWm !== undefined && settings.routerLastRunChatLength === postWm) {
+        historyIndex = 0; // legacy passes stamped before runId existed
+    }
+
+    if (historyIndex < 0) {
+        console.log('[RPG Tracker] Lorebook Agent swipe rollback skipped: pass superseded or no matching history entry.');
+        recordSchedulerEvent('la_swipe_rollback_skipped', { reason: 'no_history_match', runId, postWm, currentSwipeId });
+        clearRouterSwipeMarkers(msg);
+        return;
+    }
+
+    console.log(`[RPG Tracker] Lorebook Agent pass was based on abandoned swipe ${msg.extra.rpgRouterRanForSwipe}→${currentSwipeId}; rolling back and re-priming run-every.`);
+    recordSchedulerEvent('la_swipe_rollback_attempt', { historyIndex, runId, fromSwipe: msg.extra.rpgRouterRanForSwipe, toSwipe: currentSwipeId });
+    const ok = await rollbackRouterPass(historyIndex);
+    if (ok) {
+        clearRouterSwipeMarkers(msg);
+        const primeTo = Math.max(0, (settings.routerRunEvery || 1) - 1);
+        setRouterAutoTick(primeTo, 'swipe_la_rollback_prime', { runEvery: settings.routerRunEvery || 1 });
+        recordSchedulerEvent('la_swipe_rollback_ok', { primedTick: primeTo });
+    } else {
+        console.warn('[RPG Tracker] Auto-rollback of Lorebook Agent pass failed; markers kept for retry.');
+        recordSchedulerEvent('la_swipe_rollback_failed', { historyIndex, runId });
+    }
+}
+
+function clearRouterSwipeMarkers(msg) {
+    if (!msg?.extra) return;
+    delete msg.extra.rpgRouterRanForSwipe;
+    delete msg.extra.rpgRouterRunId;
+    delete msg.extra.rpgRouterPrePassWatermark;
+    delete msg.extra.rpgRouterPostPassWatermark;
+}
+
+/**
+ * Handles memo, relationship, and Lorebook Agent rollback when a message is edited or swiped.
+ */
+export async function handleRelationshipSwipeChange() {
+    if (_rpgIsGenerating) {
+        recordSchedulerEvent('rel_tags_skipped', { reason: 'is_generating' });
+        return;
+    }
+    
+    const settings = getSettings();
+    const ctx = SillyTavern.getContext();
+    const chat = ctx.chat;
+    if (!chat || !chat.length) {
+        console.log('[RPG Tracker] Relationship swipe handler: ABORT - No chat found.');
+        return;
+    }
+
+    // Find the last AI message
+    let lastAiMsg = null;
+    for (let i = chat.length - 1; i >= 0; i--) {
+        if (!chat[i].is_user && !chat[i].is_system) {
+            lastAiMsg = chat[i];
+            break;
+        }
+    }
+    if (!lastAiMsg) {
+        console.log('[RPG Tracker] Relationship swipe handler: ABORT - No last AI message found.');
+        return;
+    }
+
+    if (getRelationshipUpdateMode(settings) === RELATIONSHIP_UPDATE_MODES.REGEX) {
+        await applyNarrativeRelationshipRegex(lastAiMsg, settings, ctx);
+        await maybeRollbackRouterPassForSwipe(lastAiMsg);
+        return;
+    }
+    
+    // Relationship commands have their own swipe data.  Do not involve the
+    // State Tracker memo rollback here.
+    const relSwipeResult = settings.npcRelationshipBars
+        ? applyRelationshipSwipeRollback(lastAiMsg, settings)
+        : { anyChanged: false };
+    await maybeRollbackRouterPassForSwipe(lastAiMsg);
+    if (relSwipeResult.anyChanged) persistRelationshipCommandChanges(ctx, settings);
+    return;
+
+    /*
+
+    const triggerUIUpdate = () => {
+        if (typeof ctx.saveChatDebounced === 'function') ctx.saveChatDebounced();
+        void saveSettings();
+        refreshRelationshipBarsDOM(settings);
+        // Force a synchronous chat-state snapshot so relationship deltas and memo
+        // changes are not lost if the user closes the page before the debounce fires.
+        // Use getActiveChatId() (which defers to _rpgCurrentChatId) — never ctx.chatId
+        // directly, which can be stale during MESSAGE_SWIPED/EDITED events and would
+        // snapshot the wrong chat's state (the original cross-chat leakage bug).
+        if (settings.chatLinkEnabled) {
+            const chatId = getActiveChatId();
+            if (chatId) saveChatState(chatId);
+        }
+    };
+
+    const triggerStateOnlyUIUpdate = () => {
+        if (typeof ctx.saveChatDebounced === 'function') ctx.saveChatDebounced();
+        void saveSettings();
+        if (settings.chatLinkEnabled) {
+            const chatId = getActiveChatId();
+            if (chatId) saveChatState(chatId);
+        }
+    };
+
+    // If Relationship Bars are disabled, we only handle State Tracker swipe updates
+    console.log('[RPG Tracker] Relationship swipe handler: bars enabled:', !!settings.npcRelationshipBars);
+    if (!settings.npcRelationshipBars) {
+        await maybeRollbackRouterPassForSwipe(lastAiMsg);
+        if (anyStateChanged) {
+            triggerStateOnlyUIUpdate();
+        }
+        // Save the active swipe marker (relationship uses rpgActiveSwipe; memo uses rpgMemoActiveSwipe)
+        lastAiMsg.extra = lastAiMsg.extra || {};
+        lastAiMsg.extra.rpgActiveSwipe = lastAiMsg.swipe_id ?? 0;
+        lastAiMsg.extra.rpgMemoActiveSwipe = lastAiMsg.swipe_id ?? 0;
+        return;
+    }
+
+    console.log('[RPG Tracker] parseAndApplyNarrativeRelTags: Found AI message (index ' + chat.indexOf(lastAiMsg) + ') with text length:', lastAiMsg.mes?.length);
+
+    // --- 2. RELATIONSHIP SWIPE ROLLBACK & RESTORE ---
+    const relSwipeResult = applyRelationshipSwipeRollback(lastAiMsg, settings);
+    anyChanged = relSwipeResult.anyChanged;
+    if (relSwipeResult.bailEarly) {
+        await maybeRollbackRouterPassForSwipe(lastAiMsg);
+        if (anyChanged || anyStateChanged) triggerUIUpdate();
+        return;
+    }
+
+    // --- 2b. LOREBOOK AGENT "RUN EVERY" SWIPE ROLLBACK ---
+    await maybeRollbackRouterPassForSwipe(lastAiMsg);
+
+    // Relationship deltas are now received from the State Tracker as structured
+    // commands. Never inspect narrator prose here.
+    if (anyChanged || anyStateChanged) triggerUIUpdate();
+    return;
+
+    const swipeId = lastAiMsg.swipe_id ?? 0;
+    const relMax = getNpcRelationshipMax(settings);
+    const text = cleanMessageContent(lastAiMsg);
+    console.log('[RPG Tracker] parseAndApplyNarrativeRelTags: Cleaned text length:', text?.length);
+    if (!text) {
+        if (anyChanged) triggerUIUpdate();
+        return;
+    }
+
+    // The narrator regex parser was removed. The State Tracker now emits
+    // [RELATIONS] lines, which are parsed by relationship-commands.js.
+    let match;
+    const matches = [];
+
+    while (false) {
+        const rawStr = match[0];
+        const field = match[1].toLowerCase();
+        const name = match[2].trim();
+        const delta = parseInt(match[3], 10);
+        console.log(`[RPG Tracker] parseAndApplyNarrativeRelTags: regex matched raw: "${rawStr}" -> field:${field}, name:"${name}", delta:${delta}`);
+        if (name && !isNaN(delta) && delta !== 0) {
+            matches.push({ rawStr, field, name, delta });
+        }
+    }
+
+    if (!matches.length) {
+        console.log('[RPG Tracker] parseAndApplyNarrativeRelTags: No valid relationship tags found in text.');
+        if (anyChanged) triggerUIUpdate();
+        return;
+    }
+
+    console.log(`[RPG Tracker] Scanning text for relationships... Found ${matches.length} valid matches in swipe ${swipeId}.`);
+
+    // --- 3. DEDUPLICATION AND APPLICATION ---
+    for (const m of matches) {
+        if (lastAiMsg.extra.rpgProcessedTags[swipeId].includes(m.rawStr)) {
+            console.log(`[RPG Tracker] Skipping already processed tag in this swipe: ${m.rawStr}`);
+            continue;
+        }
+
+        const resolvedId = await fuzzyResolveNpcName(m.name);
+        if (!resolvedId) {
+            console.warn(`[RPG Tracker] Narrative rel: could not resolve NPC name "${m.name}"`);
+            continue;
+        }
+
+        if (!settings.npcRelationshipValues) settings.npcRelationshipValues = {};
+        if (!settings.npcRelationshipValues[resolvedId]) {
+            settings.npcRelationshipValues[resolvedId] = { friendship: 0, affection: 0 };
+        }
+
+        const prev = settings.npcRelationshipValues[resolvedId][m.field] ?? 0;
+        const newVal = clampRelationshipValue(prev + m.delta, relMax);
+        const actualAppliedDelta = newVal - prev;
+        settings.npcRelationshipValues[resolvedId][m.field] = newVal;
+
+        if (!settings.npcRelationshipLog) settings.npcRelationshipLog = {};
+        if (!Array.isArray(settings.npcRelationshipLog[resolvedId])) settings.npcRelationshipLog[resolvedId] = [];
+        
+        const logTimestamp = Date.now();
+        settings.npcRelationshipLog[resolvedId].unshift({ 
+            timestamp: logTimestamp, field: m.field, delta: m.delta, newValue: newVal, source: 'narrative' 
+        });
+        
+        if (settings.npcRelationshipLog[resolvedId].length > 50) {
+            settings.npcRelationshipLog[resolvedId].length = 50;
+        }
+
+        const sign = m.delta > 0 ? '+' : '';
+        const icon = m.field === 'friendship' ? '🤝' : '💗';
+        const label = m.field === 'friendship' ? 'Friendship' : 'Affection';
+        // @ts-ignore
+        if (typeof toastr !== 'undefined' && settings.npcRelationshipToast !== false) toastr.info(`${icon} ${m.name}: ${sign}${m.delta} ${label}`, 'Relationship', { timeOut: 3500, positionClass: 'toast-bottom-right' });
+        
+        console.log(`[RPG Tracker] Narrative rel applied: ${m.name} → ${resolvedId} | ${m.field} ${sign}${m.delta} → ${newVal} (Actual applied: ${actualAppliedDelta})`);
+
+        // Save rollback data for future swipes
+        lastAiMsg.extra.rpgRollbackData[swipeId].push({
+            npcId: resolvedId,
+            field: m.field,
+            actualAppliedDelta: actualAppliedDelta,
+            expectedValue: newVal,
+            logTimestamp: logTimestamp
+        });
+
+        // Mark this specific tag string as processed in the message metadata for THIS swipe
+        lastAiMsg.extra.rpgProcessedTags[swipeId].push(m.rawStr);
+        anyChanged = true;
+    }
+
+    if (anyChanged) {
+        triggerUIUpdate();
+        void saveSettings();
+    }
+    */
+}
+
+
+/**
+ * Original narrator annotation path: parse relationship deltas directly from
+ * the newest AI message and apply them to the code-owned NPC relationship data.
+ */
+async function applyNarrativeRelationshipRegex(lastAiMsg, settings, ctx) {
+    const swipeResult = applyRelationshipSwipeRollback(lastAiMsg, settings);
+    if (swipeResult.bailEarly) {
+        if (swipeResult.anyChanged) persistRelationshipCommandChanges(ctx, settings);
+        return;
+    }
+
+    const text = cleanMessageContent(lastAiMsg);
+    if (!text) return;
+
+    const swipeId = lastAiMsg.swipe_id ?? 0;
+    const relMax = getNpcRelationshipMax(settings);
+    const relRegex = /\*?\(\s*(friendship|affection)\s*:\s*(.+?)\s+([+-]?\d+)[^)]*\)\*?/gi;
+    let match;
+    let anyChanged = swipeResult.anyChanged;
+
+    while ((match = relRegex.exec(text)) !== null) {
+        const field = match[1].toLowerCase();
+        const npc = match[2].trim();
+        const delta = parseInt(match[3], 10);
+        const rawTag = match[0];
+        if (!npc || !Number.isFinite(delta) || delta === 0) continue;
+        if (lastAiMsg.extra.rpgProcessedTags[swipeId].includes(rawTag)) continue;
+
+        const resolvedId = await fuzzyResolveNpcName(npc);
+        if (!resolvedId) continue;
+        if (!settings.npcRelationshipValues) settings.npcRelationshipValues = {};
+        if (!settings.npcRelationshipValues[resolvedId]) settings.npcRelationshipValues[resolvedId] = { friendship: 0, affection: 0 };
+
+        const previousValue = settings.npcRelationshipValues[resolvedId][field] ?? 0;
+        const newValue = clampRelationshipValue(previousValue + delta, relMax);
+        const actualAppliedDelta = newValue - previousValue;
+        settings.npcRelationshipValues[resolvedId][field] = newValue;
+
+        if (!settings.npcRelationshipLog) settings.npcRelationshipLog = {};
+        if (!Array.isArray(settings.npcRelationshipLog[resolvedId])) settings.npcRelationshipLog[resolvedId] = [];
+        const logTimestamp = Date.now();
+        settings.npcRelationshipLog[resolvedId].unshift({ timestamp: logTimestamp, field, delta, newValue, source: 'narrative' });
+        if (settings.npcRelationshipLog[resolvedId].length > 50) settings.npcRelationshipLog[resolvedId].length = 50;
+
+        lastAiMsg.extra.rpgRollbackData[swipeId].push({ npcId: resolvedId, field, actualAppliedDelta, expectedValue: newValue, logTimestamp });
+        lastAiMsg.extra.rpgProcessedTags[swipeId].push(rawTag);
+
+        if (settings.npcRelationshipToast !== false) {
+            showRelationshipFloatFeedback({ npc, field, delta });
+        }
+        anyChanged = true;
+    }
+
+    if (anyChanged) persistRelationshipCommandChanges(ctx, settings);
+}
+
+/**
+ * Applies the temporary relationship commands emitted by the State Tracker.
+ * Commands are not stored; only the existing relationship value rollback record is.
+ * @param {Array<{type: string, npc: string, field: 'friendship'|'affection', delta: number}>} commands
+ */
+export async function applyStateTrackerRelationshipCommands(commands) {
+    if (!Array.isArray(commands) || !commands.length) return;
+
+    const settings = getSettings();
+    if (!settings.npcRelationshipBars) return;
+    const ctx = SillyTavern.getContext();
+    const lastAiMsg = [...(ctx.chat || [])].reverse().find(message => !message.is_user && !message.is_system);
+    if (!lastAiMsg) return;
+
+    const swipeResult = applyRelationshipSwipeRollback(lastAiMsg, settings);
+    if (swipeResult.bailEarly) {
+        if (swipeResult.anyChanged) persistRelationshipCommandChanges(ctx, settings);
+        return;
+    }
+
+    const swipeId = lastAiMsg.swipe_id ?? 0;
+    const relMax = getNpcRelationshipMax(settings);
+    let anyChanged = swipeResult.anyChanged;
+
+    for (const command of commands) {
+        const resolvedId = command.npc.includes('::') ? command.npc : await fuzzyResolveNpcName(command.npc);
+        if (!resolvedId) {
+            console.warn(`[RPG Tracker] State Tracker relationship command could not resolve NPC "${command.npc}".`);
+            continue;
+        }
+
+        if (!settings.npcRelationshipValues) settings.npcRelationshipValues = {};
+        if (!settings.npcRelationshipValues[resolvedId]) settings.npcRelationshipValues[resolvedId] = { friendship: 0, affection: 0 };
+
+        const previousValue = settings.npcRelationshipValues[resolvedId][command.field] ?? 0;
+        const newValue = clampRelationshipValue(previousValue + command.delta, relMax);
+        const actualAppliedDelta = newValue - previousValue;
+        settings.npcRelationshipValues[resolvedId][command.field] = newValue;
+
+        if (!settings.npcRelationshipLog) settings.npcRelationshipLog = {};
+        if (!Array.isArray(settings.npcRelationshipLog[resolvedId])) settings.npcRelationshipLog[resolvedId] = [];
+        const logTimestamp = Date.now();
+        settings.npcRelationshipLog[resolvedId].unshift({
+            timestamp: logTimestamp,
+            field: command.field,
+            delta: command.delta,
+            newValue,
+            source: 'state_tracker',
+        });
+        if (settings.npcRelationshipLog[resolvedId].length > 50) settings.npcRelationshipLog[resolvedId].length = 50;
+
+        lastAiMsg.extra.rpgRollbackData[swipeId].push({
+            npcId: resolvedId,
+            field: command.field,
+            actualAppliedDelta,
+            expectedValue: newValue,
+            logTimestamp,
+        });
+        if (settings.npcRelationshipToast !== false) {
+            showRelationshipFloatFeedback({ npc: command.npc, field: command.field, delta: command.delta });
+        }
+        anyChanged = true;
+    }
+
+    if (anyChanged) persistRelationshipCommandChanges(ctx, settings);
+}
+
+function persistRelationshipCommandChanges(ctx, settings) {
+    if (typeof ctx.saveChatDebounced === 'function') ctx.saveChatDebounced();
+    void saveSettings();
+    refreshRelationshipBarsDOM(settings);
+    if (settings.chatLinkEnabled) {
+        const chatId = getActiveChatId();
+        if (chatId) saveChatState(chatId);
+    }
+}
+
+
+/**
+ * Lightweight bar-only DOM refresh. Finds every `.rt-npc-card[data-entry-id]` in the
+ * Campaign Records panel and surgically re-renders its relationship bar widths and
+ * value labels without triggering a full `getLorebookManifest()` reload.
+ * Falls back to the heavy `_rpgRefreshAgentManifest` if no cards exist yet.
+ */
+function refreshRelationshipBarsDOM(settings) {
+    if (!settings.npcRelationshipBars) return;
+
+    const relMax = getNpcRelationshipMax(settings);
+    const relVals = settings.npcRelationshipValues || {};
+    const logData = settings.npcRelationshipLog || {};
+
+    const updateCompactRelColor = (value, type) => {
+        const clamped = clampRelationshipValue(value, relMax);
+        if (type === 'friendship') {
+            return clamped > 0 ? '#4ade80' : clamped < 0 ? '#ef4444' : 'rgba(255,255,255,0.45)';
+        }
+        return clamped > 0 ? '#f472b6' : clamped < 0 ? '#a855f7' : 'rgba(255,255,255,0.45)';
+    };
+
+    // Compact NPC list rows (portraits-off view)
+    for (const container of document.querySelectorAll('.rt-agent-entry-rel-stats[data-entry-id]')) {
+        const entryId = container.dataset.entryId;
+        if (!entryId) continue;
+        const rel = relVals[entryId] || { friendship: 0, affection: 0 };
+        for (const type of ['friendship', 'affection']) {
+            const span = container.querySelector(`.rt-agent-entry-rel-${type}`);
+            if (!span) continue;
+            const value = clampRelationshipValue(rel[type] ?? 0, relMax);
+            span.style.color = updateCompactRelColor(value, type);
+            span.textContent = `${type === 'friendship' ? '🤝' : '💗'}${value > 0 ? '+' : ''}${value}`;
+        }
+    }
+
+    const cards = document.querySelectorAll('.rt-npc-card[data-entry-id]');
+    if (!cards.length) {
+        if (!document.querySelector('.rt-agent-entry-rel-stats[data-entry-id]') && typeof globalThis._rpgRefreshAgentManifest === 'function') {
+            globalThis._rpgRefreshAgentManifest();
+        }
+        return;
+    }
+
+    for (const card of cards) {
+        const entryId = card.dataset.entryId;
+        if (!entryId) continue;
+        
+        const rel = relVals[entryId];
+        if (!rel) continue;
+
+        const barsContainer = card.querySelector('.rt-npc-bars');
+        if (!barsContainer) continue;
+
+        const barRows = barsContainer.querySelectorAll('.rt-npc-bar-row');
+        const types = ['friendship', 'affection'];
+
+        for (let i = 0; i < barRows.length && i < types.length; i++) {
+            const type = types[i];
+            const value = clampRelationshipValue(rel[type] ?? 0, relMax);
+            const pct = relationshipBarPct(value, relMax);
+            const isPositive = value >= 0;
+
+            // Update fill bar width + classes + inline style overrides
+            const fill = barRows[i].querySelector('.rt-npc-bar-fill');
+            if (fill) {
+                const bgBarColor = isPositive 
+                    ? (type === 'friendship' ? '#4ade80' : '#f472b6')
+                    : (type === 'friendship' ? '#ef4444' : '#a855f7');
+
+                fill.style.width = `${pct}%`;
+                fill.style.left = isPositive ? '50%' : 'auto';
+                fill.style.right = isPositive ? 'auto' : '50%';
+                fill.style.background = bgBarColor;
+                fill.className = `rt-npc-bar-fill ${type}-${isPositive ? 'pos' : 'neg'} ${isPositive ? 'positive' : 'negative'}`;
+            }
+
+            // Update value label
+            const valSpan = barRows[i].querySelector('.rt-npc-bar-value');
+            if (valSpan) {
+                const valClass = type === 'friendship'
+                    ? (value > 0 ? 'val-positive' : value < 0 ? 'val-negative' : 'val-zero')
+                    : (value > 0 ? 'val-affection-positive' : value < 0 ? 'val-affection-negative' : 'val-zero');
+                
+                // Rebuild badge from log
+                const log = (logData[entryId] || []).find(e => e.field === type);
+                // (User requested hiding the visual badge, so we comment this out while keeping log logic intact)
+                let badgeHtml = ''; /*
+                if (log) {
+                    const badgeColor = log.source === 'manual' ? 'rgba(180,180,180,0.7)' : (log.delta > 0 ? '#4ade80' : '#ef4444');
+                    const sign = log.delta > 0 ? '+' : '';
+                    const label = log.source === 'manual' ? '✋' : '🤖';
+                    badgeHtml = `<span style="font-size:9px;font-weight:bold;color:${badgeColor};margin-left:4px;opacity:0.85;" title="${label} last change: ${sign}${log.delta}">${sign}${log.delta}</span>`;
+                } */
+
+                valSpan.className = `rt-npc-bar-value ${valClass}`;
+                valSpan.innerHTML = `${value > 0 ? '+' : ''}${value}${badgeHtml}`;
+            }
+
+            // Update tier badge (compact, intensity-scaled color) if present
+            const tierBadge = card.querySelector(`.rt-npc-tier-badge.${type}`);
+            if (tierBadge) applyRelTierBadgeElement(tierBadge, type, value, relMax);
+        }
+    }
+}
 
 // ── Narrative collector ────────────────────────────────────────────────────────
 
@@ -748,16 +2063,103 @@ export function getNarrativeBlocks(chat, limit = -1, includeHidden = false) {
 /** Tracks the type of the last started generation. */
 let _lastGenerationType = null;
 
+export let _rpgIsGenerating = false;
+
+/**
+ * Latest non-user chat message that could count as an assistant turn.
+ * @param {any[]} chat
+ * @returns {any|null}
+ */
+function getLatestAssistantCandidate(chat) {
+    if (!Array.isArray(chat)) return null;
+    for (let i = chat.length - 1; i >= 0; i--) {
+        const m = chat[i];
+        if (!m || m.is_user) continue;
+        if (!String(m.mes || '').trim()) continue;
+        return m;
+    }
+    return null;
+}
+
+/**
+ * True when the latest assistant-side message is from the active {{char}}.
+ * Used to skip auto State Tracker / Lorebook Agent runs for other speakers
+ * (e.g. /sendas "System Notifications" announcements that somehow end a generation).
+ * Manual /lorebookagent and /statetracker are unaffected.
+ * @param {any[]} chat
+ * @param {any} ctx SillyTavern.getContext()
+ * @returns {boolean}
+ */
+export function isLatestAssistantFromActiveChar(chat, ctx) {
+    const charId = ctx?.characterId ?? ctx?.this_chid;
+    const charData = (charId != null && Array.isArray(ctx?.characters))
+        ? ctx.characters[charId]
+        : null;
+    const activeName = String(ctx?.name2 || charData?.name || '').trim();
+    const activeAvatar = charData?.avatar ? String(charData.avatar) : '';
+
+    // No resolvable {{char}} — do not block (fail open).
+    if (!activeName && !activeAvatar) return true;
+
+    const msg = getLatestAssistantCandidate(chat);
+    if (!msg) return false;
+
+    const extraType = String(msg.extra?.type || '').toLowerCase();
+    if (msg.is_system || extraType === 'narrator') return false;
+
+    const msgName = String(msg.name || '').trim();
+    if (activeName && msgName) {
+        // Explicit speaker name wins: a renamed /sendas announcement must not
+        // ride through just because it reused {{char}}'s avatar.
+        return msgName.toLowerCase() === activeName.toLowerCase();
+    }
+
+    const msgAvatar = msg.original_avatar ? String(msg.original_avatar) : '';
+    if (activeAvatar && msgAvatar && msgAvatar === activeAvatar) return true;
+
+    return false;
+}
+
 /**
  * Fires on GENERATION_STARTED. Stores the type of generation.
  * @param {string} type
  */
 export function onGenerationStarted(type) {
     _lastGenerationType = type;
+    _rpgIsGenerating = true;
+    recordSchedulerEvent('generation_started', { generationType: type ?? null });
 }
+
+/** Last run-every tick decision (for scheduler debug snapshot). */
+let _lastTickDecision = null;
 
 /** In-memory counter: how many generations have fired since the agent last ran. Resets on chat change. */
 let _routerAutoTick = 0;
+
+/** @returns {object} Live scheduler internals for debug snapshot. */
+export function getRouterSchedulerInternals() {
+    return {
+        routerAutoTick: _routerAutoTick,
+        stateTrackerAutoTick: _stateTrackerAutoTick,
+        lastGenerationType: _lastGenerationType,
+        isGenerating: _rpgIsGenerating,
+        pendingKeywordCount: _pendingKeywordTriggered.length,
+        lastTickDecision: _lastTickDecision,
+    };
+}
+
+function setRouterAutoTick(value, reason, meta = {}) {
+    const tickBefore = _routerAutoTick;
+    _routerAutoTick = value;
+    recordSchedulerEvent('router_tick_set', { tickBefore, tickAfter: value, reason, ...meta });
+}
+
+function incrementRouterAutoTick(reason, meta = {}) {
+    const tickBefore = _routerAutoTick;
+    _routerAutoTick++;
+    recordSchedulerEvent('router_tick_inc', { tickBefore, tickAfter: _routerAutoTick, reason, ...meta });
+    document.dispatchEvent(new CustomEvent('rt_generation_tick'));
+}
 
 /** In-memory counter: how many generations have fired since the state tracker last ran. */
 let _stateTrackerAutoTick = 0;
@@ -773,9 +2175,17 @@ let _pendingKeywordTriggered = [];
  * @param {boolean} [clearKeywordPool] - Pass true only when actually switching to a different chat.
  */
 export function resetRouterTick(clearKeywordPool = false) {
+    const prevTick = _routerAutoTick;
     _routerAutoTick = 0;
     _stateTrackerAutoTick = 0;
     _pendingKeywordTriggered = [];
+    _lastTickDecision = null;
+    recordSchedulerEvent('router_tick_reset', {
+        tickBefore: prevTick,
+        tickAfter: 0,
+        reason: 'chat_change',
+        clearKeywordPool,
+    });
     // Keyword-activated entries are transient (they expire when the keyword leaves the scan window).
     // Only clear on a real chat change, not on same-chat reloads (swipe, regenerate).
     if (clearKeywordPool) {
@@ -789,19 +2199,50 @@ export function resetRouterTick(clearKeywordPool = false) {
     }
 }
 
+/** Returns how many auto-generations have fired since the Lorebook Agent last ran. */
+export function getRouterTick() { return _routerAutoTick; }
+
+/** Reset the auto-run throttle counter (e.g. after a manual agent pass). */
+export function resetRouterAutoTick(reason = 'manual') {
+    const prev = _routerAutoTick;
+    _routerAutoTick = 0;
+    recordSchedulerEvent('router_tick_reset', { tickBefore: prev, tickAfter: 0, reason });
+}
+
 /**
  * Fires on GENERATION_ENDED. Triggers the state model pass.
  * runStateModelPass is resolved via the module import below to avoid
  * a hard circular dep — it will be a direct import once memo-processor.js exists.
  */
 export async function onGenerationEnded() {
+    _rpgIsGenerating = false;
+    // CYOA decoration is independent of tracker state. Finalize it before this
+    // handler awaits scanning or a State Tracker model pass.
+    try {
+        globalThis._rpgFinalizeCyoaNarratorRender?.();
+    } catch (error) {
+        console.warn('[RPG Tracker] CYOA render finalization failed:', error);
+    }
     const settings = getSettings();
+
     const isStateRunning = typeof globalThis._rpgStateModelRunning === 'function' && globalThis._rpgStateModelRunning();
-    if (!settings.enabled || settings.paused || isStateRunning) return;
+    const routerActive = !!settings.routerEnabled;
+    if ((!settings.enabled && !routerActive) || isStateRunning) {
+        recordSchedulerEvent('generation_ended_aborted', {
+            reason: (!settings.enabled && !routerActive) ? 'disabled' : 'state_running',
+            generationType: _lastGenerationType ?? null,
+        });
+        return;
+    }
 
     // Check if the generation was for Impersonation or Quiet tasks.
     // In these cases, the chat history did not actually change.
     const currentType = _lastGenerationType;
+    recordSchedulerEvent('generation_ended_enter', {
+        generationType: currentType ?? null,
+        chatLength: SillyTavern.getContext()?.chat?.length ?? 0,
+        tickBefore: _routerAutoTick,
+    });
     // Reset the tracker after a timeout (next tick) to handle synchronous multi-event triggers (e.g. ENDED + STOPPED)
     setTimeout(() => {
         _lastGenerationType = null;
@@ -811,12 +2252,58 @@ export async function onGenerationEnded() {
         if (settings.debugMode) {
             console.log(`[RPG Tracker] Skipping State Tracker and Researcher passes for generation type: ${currentType}`);
         }
+        recordSchedulerEvent('generation_ended_aborted', { reason: 'generation_type', generationType: currentType });
         return;
     }
 
-    const { chat } = SillyTavern.getContext();
+    const ctx = SillyTavern.getContext();
+    const { chat } = ctx;
+
+    // Only auto-run State Tracker / Lorebook Agent when the latest assistant speaker is {{char}}.
+    // Fake announcement speakers (e.g. "System Notifications") must not tick run-every or fire passes.
+    if (!isLatestAssistantFromActiveChar(chat, ctx)) {
+        if (settings.debugMode) {
+            const last = getLatestAssistantCandidate(chat);
+            console.log('[RPG Tracker] Skipping auto ST/LA — latest speaker is not {{char}}:', last?.name || '(none)');
+        }
+        recordSchedulerEvent('generation_ended_aborted', {
+            reason: 'non_char_speaker',
+            generationType: currentType ?? null,
+            speaker: getLatestAssistantCandidate(chat)?.name || null,
+            activeChar: ctx?.name2 || null,
+        });
+        return;
+    }
+
     const combinedNarrative = getNarrativeBlocks(chat, -1, !!settings.routerIncludeHidden);
-    if (!combinedNarrative) return;
+    if (!combinedNarrative) {
+        recordSchedulerEvent('generation_ended_aborted', { reason: 'no_narrative', generationType: currentType ?? null });
+        return;
+    }
+
+    // Narrator-regex relationship awards are read directly from chat and do not
+    // require either agent to run. Apply them before the shared pause boundary.
+    if (shouldProcessRegexRelationshipUpdates(settings)) {
+        await handleRelationshipSwipeChange();
+    }
+
+    // Pausing still suppresses State Tracker, Lorebook Agent, keyword scanning,
+    // world progression, and their tracker-based relationship command path.
+    if (settings.paused) {
+        recordSchedulerEvent('generation_ended_aborted', {
+            reason: 'paused',
+            generationType: currentType ?? null,
+        });
+        return;
+    }
+
+    // Real-Time Visualization: scene art every-N / location-change (independent of router throttle).
+    // Defer one tick so the new assistant message is in chat before we count outputs.
+    setTimeout(() => {
+        if (typeof globalThis._rpgCheckRealtimeSceneArt === 'function') {
+            void globalThis._rpgCheckRealtimeSceneArt();
+        }
+    }, 0);
 
     if (settings.debugMode) console.log("[RPG Tracker] Assistant generation ended. Running keyword scanner...");
 
@@ -841,34 +2328,115 @@ export async function onGenerationEnded() {
         }
     }
 
-    // Step 2: State Tracker pass — throttled by stateTrackerRunEvery.
-    const stateRunEvery = settings.stateTrackerRunEvery || 1;
-    _stateTrackerAutoTick++;
-    if (_stateTrackerAutoTick >= stateRunEvery) {
-        _stateTrackerAutoTick = 0;
-        if (settings.debugMode) console.log("[RPG Tracker] Triggering State Model pass...", combinedNarrative);
-        if (typeof globalThis._rpgRunStateModelPass === 'function') {
-            await globalThis._rpgRunStateModelPass(combinedNarrative);
+    if (settings.enabled) {
+        // State Tracker pass — throttled by stateTrackerRunEvery.
+        const stateRunEvery = settings.stateTrackerRunEvery || 1;
+        _stateTrackerAutoTick++;
+        if (_stateTrackerAutoTick >= stateRunEvery) {
+            _stateTrackerAutoTick = 0;
+            if (settings.debugMode) console.log("[RPG Tracker] Triggering State Model pass...", combinedNarrative);
+            if (typeof globalThis._rpgRunStateModelPass === 'function') {
+                await globalThis._rpgRunStateModelPass(combinedNarrative);
+            }
+        } else {
+            if (settings.debugMode) console.log(`[RPG Tracker] State Tracker skipped (tick ${_stateTrackerAutoTick}/${stateRunEvery}).`);
         }
-    } else {
-        if (settings.debugMode) console.log(`[RPG Tracker] State Tracker skipped (tick ${_stateTrackerAutoTick}/${stateRunEvery}).`);
+
+        // Step 2b: Combat main-profile auto-switch — check raw memo after State Tracker (or on existing memo if throttled).
+        try {
+            await syncCombatProfile(getSettings().currentMemo, settings);
+        } catch (e) {
+            console.warn('[RPG Tracker] Combat profile sync failed:', e);
+        }
+
+        try {
+            await globalThis._rpgSyncDynamicRngPrompt?.(getSettings().currentMemo, settings);
+        } catch (e) {
+            console.warn('[RPG Tracker] Dynamic RNG prompt sync failed:', e);
+        }
+
+        // Re-check scene art after State Tracker may have updated location in memo.
+        if (typeof globalThis._rpgCheckRealtimeSceneArt === 'function') {
+            void globalThis._rpgCheckRealtimeSceneArt();
+        }
     }
 
     // Step 3: World Progression deterministic check — runs AFTER the State Tracker has updated
     // currentMemo, so the [TIME] block reflects the current in-world clock.
     await maybeRunWorldProgression();
 
-    // Step 4: Run-every throttle — only fire the Lorebook Agent every N auto-generations.
-    _routerAutoTick++;
+    // Step 4: Run-every throttle — only fire the Lorebook Agent every N new turns.
+    // Swipe/regenerate generations reuse an existing message slot and must not advance the
+    // counter (otherwise swiping through alternatives walks the cycle forward normally).
+    // Use a denylist rather than an allowlist: a fresh send may report its type as 'normal',
+    // '', or undefined depending on the entry path, but swipes/regens are always explicit.
+    // (impersonate/quiet already returned earlier and never reach here.)
+    const countsTowardRunEvery = currentType !== 'swipe' && currentType !== 'regenerate';
     const runEvery = settings.routerRunEvery || 1;
-    if (_routerAutoTick < runEvery) return;
-    _routerAutoTick = 0;
+    const tickBefore = _routerAutoTick;
+
+    _lastTickDecision = {
+        at: Date.now(),
+        generationType: currentType ?? null,
+        countsTowardRunEvery,
+        tickBefore,
+        runEvery,
+    };
+
+    recordSchedulerEvent('run_every_eval', {
+        generationType: currentType ?? null,
+        countsTowardRunEvery,
+        tickBefore,
+        runEvery,
+        nextInIfInc: countsTowardRunEvery ? Math.max(0, runEvery - (tickBefore + 1)) : Math.max(0, runEvery - tickBefore),
+    });
+
+    if (countsTowardRunEvery) {
+        incrementRouterAutoTick('generation_ended', { generationType: currentType ?? null });
+    } else {
+        recordSchedulerEvent('router_tick_skipped', {
+            generationType: currentType ?? null,
+            reason: 'denylist_swipe_or_regenerate',
+            tick: _routerAutoTick,
+        });
+    }
+
+    if (!countsTowardRunEvery || _routerAutoTick < runEvery) {
+        _lastTickDecision = { ..._lastTickDecision, action: 'hold', tickAfter: _routerAutoTick };
+        recordSchedulerEvent('lore_agent_hold', {
+            reason: !countsTowardRunEvery ? 'generation_type_excluded' : 'below_threshold',
+            tick: _routerAutoTick,
+            runEvery,
+        });
+        return;
+    }
+
+    setRouterAutoTick(0, 'lore_agent_fire_threshold', { generationType: currentType ?? null, runEvery });
+    _lastTickDecision = { ..._lastTickDecision, action: 'fire', tickAfter: 0 };
 
     // Step 5: Lorebook Agent pass — passes the full accumulated set of keyword-triggered IDs
     // from all throttled turns since the last agent run (not just the current generation).
+    if (settings.routerWatermarkBaselinePending) {
+        settings.routerWatermarkBaselinePending = false;
+        persistRouterLastRunWatermark(chat.length);
+        recordSchedulerEvent('lore_agent_watermark_baseline', { chatLength: chat.length });
+        if (settings.debugMode) {
+            console.log('[RPG Tracker] Lorebook Agent watermark baselined at chat.length', chat.length);
+        }
+        return;
+    }
+    recordSchedulerEvent('lore_agent_fire', {
+        generationType: currentType ?? null,
+        chatLength: chat.length,
+        pendingKeywords: _pendingKeywordTriggered.length,
+    });
     const triggeredForAgent = [..._pendingKeywordTriggered];
     _pendingKeywordTriggered = []; // reset accumulator now that the agent is about to process them
     await runRouterPass(combinedNarrative, null, null, false, triggeredForAgent);
+
+    // Step 6: Re-check World Progression after the Lorebook Agent — an overlapping agent
+    // run from a prior generation may have blocked the pre-agent check.
+    await maybeRunWorldProgression();
 }
 
 // ── World Progression deterministic trigger ─────────────────────────────────────────
@@ -889,18 +2457,23 @@ async function maybeRunWorldProgression() {
     const currentMinutes = parseInWorldMinutes(timeStr);
     if (currentMinutes < 0) return; // can't parse time → skip
 
-    const lastFired = settings.worldProgressionLastFiredAtMinutes ?? -1;
+    hydrateWorldProgressionFromChatState();
+    const lastFiredLabel = settings.worldProgressionLastFiredPeriodLabel || '';
+    const lastFired = lastFiredLabel ? parseInWorldMinutes(lastFiredLabel) : null;
     const intervalMinutes = (settings.worldProgressionIntervalHours || 24) * 60;
 
-    // On first-ever firing: don't fire unless we've actually passed at least one full interval.
-    // This prevents a spurious Day 0 report on the very first turn of a brand-new campaign.
-    if (lastFired < 0 && currentMinutes < intervalMinutes) return;
+    if (lastFired === null) {
+        // Never fired — record current time as start of the first interval, don't fire yet.
+        settings.worldProgressionLastFiredPeriodLabel = formatInWorldTime(currentMinutes);
+        persistWorldProgressionTimer();
+        if (typeof globalThis._rpgRenderRouterUI === 'function') globalThis._rpgRenderRouterUI();
+        return;
+    }
 
-    const elapsed = lastFired < 0 ? intervalMinutes : currentMinutes - lastFired;
+    const elapsed = currentMinutes - lastFired;
     if (elapsed < intervalMinutes) return;
 
     // Guard: don't start a World Progression pass while the Lorebook Agent is already running
-    const { isRouterRunning } = await import('./router.js');
     if (isRouterRunning()) return;
 
     await runWorldProgressionPass(timeStr, currentMinutes);

@@ -2,6 +2,1458 @@
 
 All notable changes to the **Multihog D&D Framework** will be documented in this file.
 
+## [6.5.35] - 2026-07-30
+
+### Fixed
+- **Paused relationship regex updates**: chat-regex Friendship/Affection awards continue to process while the State Tracker or Lorebook Agent is paused, while tracker/LLM relationship commands remain pause-gated.
+- **Regression coverage**: automated tests now protect the pause-boundary behavior.
+
+## [6.5.30] - 2026-07-30
+
+### Changed
+- **CYOA settings scope**: choice composition and behavior remain per-chat, while visual theme settings are shared globally.
+
+### Fixed
+- **CYOA migration**: legacy per-chat snapshots retain their choice setup while no longer overriding the global visual theme.
+
+## [6.5.10] - 2026-07-30
+
+### Added
+- **Temporary combat allies**: `[COMBAT]` now supports optional `ENEMIES:` and `ALLIES:` sections with red and blue UI headers.
+- **RNG multi-die guidance**: queue prompts now specify how additional matching damage dice consume successive queue lines, including a `2d8` example.
+
+### Fixed
+- **Combat section parsing**: `ALLIES:` boundaries no longer get absorbed into the preceding enemy entry, while headerless combat remains backward-compatible.
+
+## [6.5.0] - 2026-07-30
+
+### Added
+- **Adventure Companion connections and settings**: Adventure Companion now has its own connection configuration and a mirrored settings drawer, including Tutorial Mode.
+- **XP gain animation**: gained XP now visibly trickles from a glowing blue award into the XP bar.
+- **Combat defeat presentation**: explicitly defeated combatants remain visually marked until combat ends, with negative HP values supported by combat and party renderers.
+- **Onboarding releases link**: the startup screen now links to the GitHub Releases page as the project development blog.
+- **SPELLS example**: the stock SPELLS module prompt now demonstrates multi-level spell-slot formatting.
+
+### Changed
+- **Adventure Companion mobile behavior**: its header now keeps the standard collapse control available on mobile for quick minimize/maximize access.
+- **Relationship award feedback**: Friendship and Affection floaters are larger, last four seconds, and may extend beyond the tracker edge so long NPC names remain visible.
+- **Narrator and combat prompts**: refined realistic time-passage, XP, spell, and defeated-combatant instructions.
+
+### Fixed
+- **Adventure Companion collapse**: collapsing the Companion no longer flips the tracker view while leaving the Companion header behind.
+- **Combat parsing**: negative current HP such as `-4/15 HP` now renders as a structured combatant instead of unformatted text.
+
+## [6.4.3] - 2026-07-29
+
+### Fixed
+- **Older mobile WebView initialization**: missing `ResizeObserver` support no longer aborts State Tracker panel setup and leaves a visible but non-interactive panel.
+
+## [6.4.0] - 2026-07-29
+
+### Added
+- **Genre-aware character names**: Instant Action and Other Ways to Begin now use genre-specific first-name / surname pools, with reroll controls and editable name fields. The Character Creator random-name button includes the combined library.
+- **Discord onboarding help**: the onboarding help card now links directly to the SillyTavern Discord Extensions subforum.
+
+### Changed
+- **Character-generation prompts**: Quick Start, Character Creator, Other Ways to Begin, and PC Import now receive active tracker-module instructions without the full State Extractor prompt. Character creation also excludes the COMBAT block.
+- **Name selection flow**: users can roll, reroll, type, or edit a name before accepting Instant Action or the Custom onboarding path. Persona and Import Card paths continue to use their source names.
+- **Narrator constraints**: added the cheese-and-abuse safeguard to the default and legacy narrator configurations.
+
+### Fixed
+- **Instant Action name propagation**: the accepted name is now passed through to character generation instead of being independently re-invented by the model.
+- **Wizard module scope guidance**: clicking GLOBAL / CHAT-BOUND on a Wizard-created tracker module now explains that bundle scope is controlled from Manage Game Systems.
+
+## [6.3.60] - 2026-07-29
+
+### Added
+- **Shorter Outputs pacing**: Narrator Configuration now includes a dedicated modest-output-length mode, alongside the renamed Normal (no length instructions) option.
+
+## [6.3.53] - 2026-07-29
+
+### Fixed
+- **Adventure Companion story lookback**: “All” / lookback count are global prefs again and no longer get overwritten by per-chat or Chat Link companion snapshots on reload.
+
+### Changed
+- **Adventure Companion story lookback**: fresh installs default to lookback 5 with “All” off.
+
+### Added
+- **Character Creator custom modules**: enabled custom tracker modules now inject their full tracking instructions and templates into character-generation prompts, not just the tag name.
+
+## [6.3.52] - 2026-07-29
+
+### Changed
+- **Adventure Companion story lookback**: restored the previous default — new sessions use full chat history (“All” on).
+
+## [6.3.51] - 2026-07-29
+
+### Changed
+- **Adventure Companion actions**: hard-limits the Companion to State Tracker commands, Lorebook Agent commands, and acting for the player (chat / CYOA); it must not invent Multihog UI workflows.
+
+## [6.3.50] - 2026-07-28
+
+### Added
+- **Global / Chat-bound item scopes**: standalone tracker modules and system-prompt snippets can now share one enabled state across every chat or retain activation separately per chat. Wizard-created modules and snippets inherit one atomic scope from their Game System bundle.
+- **Scope bypass mode**: turning off the per-chat Control Room/module lock temporarily carries the current setup between chats without changing saved item scopes.
+
+### Fixed
+- **First scope change on new modules**: newly created module rows now persist the first Global / Chat-bound selection immediately, even when catalog synchronization has just replaced the in-memory definition.
+
+## [6.3.0] - 2026-07-28
+
+### Added
+- **Per-chat Control Room & Module setups**: an optional setup lock now saves and restores System Prompt Control Room sections, Game Systems, custom/stock State Tracker modules, prompts, ordering, and related toggles per chat. Unseen chats start from stock; temporarily disabling Chat-Linked Mode carries the current setup between chats.
+- **Global module & snippet catalogs**: created tracker modules, Game Systems, and system-prompt snippets now remain available across chats. Each chat stores only membership/activation and ordering; definitions from other chats appear in dedicated inactive pools instead of disappearing.
+- **Separate Player Card / ST Persona controls**: Character Creator and Other Ways to Begin now independently control the rich Lorebook Agent Player Card and the name-only SillyTavern persona used for the outgoing message header.
+
+### Fixed
+- **Instant Action persona duplication**: the matching SillyTavern persona now has an empty description, keeping the rich PC biography exclusively in the Lorebook Agent Player Card.
+- **System Prompt section editor wrappers**: editing or appending text to a custom/unlocked section no longer nests another copy of its outer XML tag on every save. The editor now exposes only the section body, and saving repairs previously duplicated matching wrappers without losing their instructions.
+- **Custom `[PARTY]` templates**: member headers with inline rendering markers (e.g. `Name: ((BAR)) 100/100 HP`) are recognized again, so merge/hydrate no longer empties the party roster.
+- **Benched portrait overlay**: removed the mojibake’d camping badge on individual chips; tent emoji stays on the Benched header only.
+
+### Changed
+- **Benched Party icon**: uses ⛺ across State Tracker UI, settings, and badges.
+
+## [6.2.52] - 2026-07-27
+
+### Fixed
+- **Settings drawer hierarchy**: restored the Framework drawer’s complete nesting so General & Visuals and all other primary sections share the same layout and toggle behavior.
+- **Mobile settings rendering**: removed the collapsed-content optimization that could hide the first nested drawer until interaction.
+- **CHAT persistence**: Adventure Companion now restores its open/closed state after a page reload.
+
+## [6.2.50] - 2026-07-27
+
+### Added
+- **Adventure Companion actions**: the Companion can now delegate clear player requests to State Tracker or Lorebook Agent, and can submit a player action through chat or CYOA controls.
+- **Tutorial Mode**: the Companion can optionally include the learning guide in its context, with a concise explanation available from the new help control.
+
+### Changed
+- **Unified Companion**: Tutorial Bot and Adventure Companion are now one Companion experience, with tutorial guidance controlled by the Tutorial Mode setting.
+- **Responsive Companion layout**: CHAT can be detached on desktop; mobile always uses the clean floating presentation without dock/undock controls.
+- **Natural player-action reactions**: after acting for the player, Companion responds with table-side commentary instead of a mechanical receipt.
+
+## [6.2.34] - 2026-07-27
+
+### Changed
+- **Mobile Adventure Companion**: CHAT now always opens in its full-height floating presentation on mobile, with dock/undock controls hidden. Resizing back to desktop restores the normal docked view unless the player had explicitly detached it there.
+
+## [6.2.33] - 2026-07-27
+
+### Changed
+- **Organic player-action reactions**: after acting for the player, Adventure Companion now gives a brief entertaining or funny table-side comment instead of echoing a dry `Player Turn: Submitted...` receipt.
+- **Single-turn commentary**: the reaction is generated alongside the action itself, avoiding a second Companion request that could compete with the main narrator.
+
+## [6.2.32] - 2026-07-27
+
+### Added
+- **Detachable Adventure Companion**: CHAT can be moved into its own draggable, resizable floating panel and reattached without losing its live conversation or request state.
+- **Detached CHAT geometry**: desktop position and size are remembered and clamped to the viewport; mobile uses a full-height layout.
+
+## [6.2.31] - 2026-07-27
+
+### Changed
+- **Adventure Companion header**: CHAT now displays its name as a styled, non-interactive header rather than a redundant top button.
+
+## [6.2.30] - 2026-07-27
+
+### Changed
+- **Free-form actions in CYOA**: Adventure Companion can now type and submit a normal player action even while CYOA mode is active, instead of being limited to pressing a listed choice.
+
+## [6.2.29] - 2026-07-27
+
+### Changed
+- **One Adventure Companion**: CHAT no longer separates framework help and story conversation into different bots or histories.
+- **Tutorial Mode**: a new toggle injects `docs/multihogDnDdoc.md` into every Adventure Companion request. Its `?` popup explains the extra context and token cost.
+- **Unified capabilities**: framework questions, story discussion, State Tracker and Lorebook Agent commands, and acting for the player are all available in the same conversation.
+
+## [6.2.28] - 2026-07-27
+
+### Added
+- **Adventure Companion player actions**: when clearly asked to choose or act for the player, the Companion can submit the player's next turn through SillyTavern.
+- **CYOA-aware acting**: with CYOA mode active, the Companion receives the currently actionable choices and must select one of their buttons. With CYOA inactive, it composes and submits a normal player chat message.
+
+### Changed
+- **Terminal player submissions**: successfully submitting a player turn ends the Companion action loop immediately, avoiding a competing follow-up request while narrator generation begins.
+
+## [6.2.27] - 2026-07-27
+
+### Fixed
+- **Connection Manager action feedback**: post-action results now use a profile-compatible conversation role, avoiding `Bad Request` failures caused by inserting a system message after the Companion's action response.
+- **Successful action misreported as failure**: if the State Tracker or Lorebook Agent command completes but the optional conversational summary request fails, CHAT now displays the authoritative completed-action receipt instead of claiming the entire operation failed.
+
+## [6.2.26] - 2026-07-27
+
+### Changed
+- **Natural Companion action intent**: Adventure Companion no longer expects command-like wording or exact strings. Polite questions, indirect requests, and requests to demonstrate or test an action now count when the user's intent to make a change is clear.
+- **Underspecified demos**: the Companion may choose and execute one small, harmless, clearly labeled demo addition instead of explaining how the player should ask again.
+
+## [6.2.25] - 2026-07-27
+
+### Fixed
+- **CHAT with detached Lorebook Agent**: Adventure Companion navigation remains visible while the Lorebook Agent is detached.
+- **CHAT during Lorebook Agent reattachment**: reattaching no longer switches the main panel underneath CHAT to Lorebook Agent or leaves the CHAT tabs unresponsive.
+
+## [6.2.24] - 2026-07-27
+
+### Added
+- **Adventure Companion actions**: explicit player requests can now be forwarded as direct commands to the State Tracker and Lorebook Agent. Native tool calls are used when supported, with a validated tagged fallback for other connection types.
+- **Action result reporting**: Companion commands report completed, unchanged, unavailable, busy, cancelled, and failed outcomes instead of assuming an update succeeded.
+
+### Changed
+- **Adventure Companion capability instructions**: the embedded persona and framework documentation now explain the two available actions and prohibit turning brainstorming or theories into campaign state.
+
+## [6.2.23] - 2026-07-27
+
+### Fixed
+- **Detached Lorebook Agent**: clamp floating panel into the viewport; closing while detached reattaches so State Tracker / Lorebook Agent tabs return.
+
+### Added
+- **`/multihogresetui`**: emergency UI rebuild that clears stuck layout state (detached agent, geometry, visibility) and recreates the panels. Aliases: `/rpgresetui`, `/rtresetui`.
+
+## [6.2.21] - 2026-07-26
+
+### Fixed
+- **CYOA on ST welcome screen**: no longer wraps or binds SillyTavern’s API Connections / Character Management / Extensions drawer buttons as CYOA choices.
+
+## [6.2.20] - 2026-07-25
+
+### Changed
+- **Character creation prompts**: do not invent quests or emit a `[QUESTS]` block unless the player explicitly asks (Character Creator, Other Ways to Begin, Quick Start, and PC Import). `QUESTS` is excluded from onboarding active blocks the same way `PARTY` already was.
+
+## [6.2.12] - 2026-07-25
+
+### Changed
+- **CHAT mobile layout**: Adventure Companion chat uses the primary panel area while CHAT is open; Back, options, and Clear share one compact row.
+- **CHAT context controls**: moved Story lookback into the options menu and defaulted new CHAT sessions to the full chat history.
+
+## [6.2.11] - 2026-07-24
+
+### Fixed
+- **CHAT composer focus**: after sending a message, the input is re-focused when the reply finishes so you don’t have to click it again.
+
+## [6.2.10] - 2026-07-24
+
+### Added
+- **Startup “How It Works”**: noticeable tip to open **CHAT** in the State Tracker header and ask the Adventure Companion (knows most of the framework).
+
+### Changed
+- **Tutorial docs**: updates to `docs/multihogDnDdoc.md` (Adventure Companion knowledge base).
+- **System Prompt Control Room**: section/content editors wrap long lines instead of forcing horizontal scroll.
+
+## [6.2.1] - 2026-07-24
+
+### Changed
+- **Abilities module prompt**: use-limited abilities must include remaining/max uses inside the parentheses (e.g. `Silver-Tongued Pivot (…, 1/1 per rest)`).
+
+## [6.2.0] - 2026-07-24
+
+### Changed
+- **Lorebook Agent / State Tracker auto-runs**: only fire when the latest assistant speaker is the active `{{char}}`. Other speakers (e.g. `/sendas` announcement names like “System Notifications”) no longer tick run-every or start auto passes. Manual `/lorebookagent` and `/statetracker` are unchanged. When a message has an explicit speaker name, that name wins over avatar matching.
+
+## [6.1.50] - 2026-07-24
+
+### Fixed
+- **Adventure Companion Chat Link isolation**: entering an unseen SillyTavern chat no longer copies the previous chat's Companion conversation. New ChatIDs now begin with the default Companion message, while existing per-chat sessions remain intact.
+
+## [6.1.1] - 2026-07-24
+
+### Added
+- **Adventure Companion story lookback**: adjustable header control (**Story lookback**) injects the last N SillyTavern chat messages so players can discuss their adventure with the Companion.
+
+### Changed
+- **Adventure Companion lookback UI**: moved from the composer to the header, with a clear label.
+
+## [6.1.0] - 2026-07-24
+
+### Added
+- **Adventure Companion**: in-panel HELP chat that morphs the State Tracker into a multi-turn instructor. Answers from `docs/multihogDnDdoc.md` via the State Tracker LLM connection. Open from the tracker **HELP** button or **General & Visuals → Adventure Companion (HELP)**. Chat persists across reloads until Clear; replies render Markdown (showdown).
+- **Framework documentation**: `docs/multihogDnDdoc.md` (tutorial knowledge base) covering setup, turn flow, RNG, modules, Lorebook Agent, World Progression, and more.
+
+### Changed
+- **Chat Link**: removed header/footer icons from the State Tracker panel; toggle and conflict handling live in **General & Visuals** only.
+- **Mobile Raw View**: larger tap target for the Raw/Rendered view toggle.
+
+### Fixed
+- **Mobile HELP button**: no longer stays green after closing Adventure Companion (sticky touch hover/focus).
+
+## [6.0.85] - 2026-07-24
+
+### Added
+- **`/lorebookagent` slash command**: manually invoke a Lorebook Agent pass from STscript (aliases: `/lbagent`, `/la`, `/router`). Useful after `/sendas`, which does not auto-trigger the agent. Supports `quiet=true`, `lookback=N`, `save [hint]`, and Direct Command text.
+- **`/statetracker` slash command**: manually invoke a State Tracker update from STscript (alias: `/st`). Supports regular update, `full` audit, `lookback=N`, and `quiet=true`.
+
+### Changed
+- **QUEST DIFFICULTY**: clarifies that quests should not be made harder than the narrative/context reasonably supports.
+- **Attacks per round**: notes that the STATE MEMO APR lines (`Melee/Ranged X attacks`) are authoritative.
+
+## [6.0.83] - 2026-07-24
+
+### Fixed
+- **System Prompt Control Room on mobile**: section scrolling no longer competes with reordering. Swipe anywhere in a row to scroll; long-press and drag the enlarged grip to reorder. The contained list also works on Android browsers that do not support the CSS selector previously used to identify this popup.
+
+## [6.0.82] - 2026-07-24
+
+### Fixed
+- **Relationship command leakage**: `[RELATIONS]` blocks are now removed before State Memo merging, including malformed or unclosed blocks.
+
+## [6.0.81] - 2026-07-24
+
+### Fixed
+- **CYOA choice rendering**: bracketed mechanics such as DCs and modifiers now decorate immediately after narration ends, without waiting for the State Tracker pass.
+
+## [6.0.80] - 2026-07-24
+
+### Fixed
+- **World Skeleton entries**: preserves model-supplied titles when descriptions contain hyphens or metadata such as “Parties involved,” and the default prompt now requires a strict title/content layout.
+
+## [6.0.78] - 2026-07-24
+
+### Fixed
+- **Relationship prompt reset**: keeps the Reset to built-in control compact and horizontal.
+
+## [6.0.77] - 2026-07-24
+
+### Changed
+- **Relationship-delta recognition**: State Tracker now accepts clear narrator point awards with minor wording, punctuation, capitalization, spacing, or formatting variations.
+
+## [6.0.76] - 2026-07-24
+
+### Added
+- **Relationship prompt reset**: the State Tracker relationship-instruction editor now has a Reset to built-in button.
+
+## [6.0.75] - 2026-07-24
+
+### Changed
+- **State Tracker relationship instruction**: removes memo-storage implementation details; the tracker is now instructed only on relationship-delta criteria and command syntax.
+
+## [6.0.74] - 2026-07-23
+
+### Added
+- **Editable State Tracker relationship instruction**: the Relationship System settings cog now lets users customize the prompt used for State Tracker relationship updates.
+
+## [6.0.73] - 2026-07-23
+
+### Added
+- **Portrait popup controls**: adaptive full-size portrait viewing with cursor-anchored zoom, pan clamping, and a wrapper that expands with the image.
+
+## [6.0.72] - 2026-07-23
+
+### Changed
+- **Legacy browser recovery**: retained in the source code but disabled. The tracker no longer creates, compares, prompts for, or restores browser-local recovery copies.
+
+## [6.0.71] - 2026-07-23
+
+### Added
+- **Relationship update methods**: choose between narrator annotations and State Tracker relationship commands, with dedicated settings and live relationship feedback.
+
+### Fixed
+- **Persistence rollback**: removes the unavailable server disk-state endpoint and restores the established SillyTavern save and recovery behavior.
+
+## [6.0.70] - 2026-07-23
+
+### Fixed
+- **Emergency rollback release**: restores the proven 6.0.23 persistence behavior so installs affected by the unavailable disk-state endpoint can update normally and retain their existing tracker data.
+
+## [6.0.23] - 2026-07-23
+
+### Changed
+- **Rendering Tags Library button**: refreshed the library trigger with an arcane gradient, swatchbook emblem, live-preview subtitle, shimmer hover, and reduced-motion support.
+
+## [6.0.22] - 2026-07-23
+
+### Changed
+- **BARREL value color**: the numeric value beside a signed bar now mirrors its active positive or negative bar color, including live recoloring and gradients.
+
+## [6.0.21] - 2026-07-23
+
+### Changed
+- **Universal tag colors**: use a named-color suffix with any tag (such as `((PILLPINK))`, `((BARRED))`, or `((PROGRESSGOLDENROD))`) instead of maintaining individual color variants. Exact named or hexadecimal colors remain available through `((TAG - COLOR))`.
+
+## [6.0.20] - 2026-07-23
+
+### Added
+- **Freeform NPC tracker cards**: `((NPC)) Name:` now starts a PARTY-style card inside any tracker block, with unrestricted follow-up fields and rendering tags. A matching Lorebook Agent portrait is used automatically, including case-only name differences.
+- **Signed rendering bar**: `((BARREL))` renders generic positive/negative values around a centre-zero marker. It accepts both `value/max` and explicit signed ranges such as `value/-max..+max`, without requiring any specific field name.
+- **BARREL customization**: click either half of a `((BARREL))` to recolor that direction independently, or set its positive and negative colors inline with `((BARREL - #RRGGBB #RRGGBB))`.
+- **Marker tab stops**: place `|x` immediately before a marker to start it at `x%` of the row (including at the beginning of a line), e.g. `((PILLGREEN)) Friendly |50 ((PILLS)) In Love`. The legacy `||` shorthand still creates equal columns.
+
+## [6.0.17] - 2026-07-22
+
+### Changed
+- **Settings / memo recovery dialogs**: backdrop stays unblurred so you can judge the live UI; disk buttons clarify they keep what's visible right now.
+
+## [6.0.16] - 2026-07-22
+
+### Fixed
+- **Chat Link**: new chats with no saved tracker state now begin cleanly instead of inheriting another chat's memo, quests, or portraits.
+- **Prompt injection**: clears a stale legacy Prompt Manager flag so tracker and player-character context continue to reach the model.
+- **Settings recovery**: browser and disk mismatches now always ask which copy to keep; CYOA settings and presets are included in the recoverable browser snapshot.
+
+## [6.0.15] - 2026-07-21
+
+### Added
+- **CYOA Game Cartridge support**: cartridges can now save and selectively load the complete CYOA setup, including its prompt, appearance, slots, and saved presets.
+- **Individual CYOA preset sharing**: export and import one selected preset at a time. Imported presets immediately load into the editor with their type settings and text intact.
+- **User-defined CYOA choices**: a choice slot can now specify its complete freeform line.
+
+### Changed
+- **CYOA presets**: split Save into Save (update selected preset) and Save As… (create or deliberately overwrite a named preset).
+
+### Fixed
+- **Startup CYOA settings cog**: now opens the CYOA settings popup from the dynamically rendered Narrator Configuration drawer.
+
+## [6.0.1] - 2026-07-21
+
+### Added
+- **Dynamic hybrid RNG**: Pre-Seeded + Tool Calls now exposes only RollTheDice outside active `[COMBAT]`, then switches to only the RNG Queue in combat. The prompt, queue injection, and function-tool schema switch together.
+
+### Changed
+- **Hybrid RNG combat format**: restored the readable strict attack/AC, save/DC, and damage roll presentation.
+- **Hybrid loot**: batches the main loot and quality rolls, discarding the quality roll when no loot is found.
+
+## [6.0.05] - 2026-07-21
+
+### Changed
+- **Lorebook Agent QUEST prompt**: now records quests only when the player unambiguously begins pursuing them; mentions, offers, and deliberation alone do not qualify. Delivered through Prompt Defaults Updated so customized prompts remain intact.
+
+## [6.0.0] - 2026-07-21
+
+### Changed
+- **Narrator Configuration defaults**: new installs enable all optional components, use Normal pacing, and select Pre-Seeded Only RNG by default.
+- **Instant Action**: now honors the active Narrator Configuration instead of overriding component and RNG choices.
+- **Relationship System**: removed the beta label and clarified that it tracks each NPC's friendship and affection toward the player.
+- **Startup header**: replaced the scroll icon with a mirrored fencer-and-shield crest.
+
+## [5.9.99] - 2026-07-21
+
+### Fixed
+- **Startup Narrator Configuration**: controls now persist changes, synchronize with the sidebar, and trigger the normal system-prompt update path.
+
+## [5.9.98] - 2026-07-21
+
+### Changed
+- **Startup narrator controls**: Narrator Configuration is now a top-level drawer directly beneath **Other Ways to Begin**, with the same pacing selector and explanation available from the main settings.
+- **Startup drawers**: refreshed the visual treatment for **Other Ways to Begin** and Narrator Configuration for clearer hierarchy and better visibility.
+- **RNG recommendations**: clarified the recommended RNG mode for CYOA and non-CYOA play in both Narrator Configuration views.
+
+## [5.9.97] - 2026-07-21
+
+### Added
+- **Narrative pacing**: Narrator Configuration now offers exclusive Normal, High-Agency, and Downtime/Slice of Life modes, each generating its corresponding `<narrative>` instruction block. Includes an in-app explanation dialog.
+
+### Fixed
+- **Memo recovery**: recovery timestamps are now stored per chat, preventing a newer save for one chat from suppressing recovery for another. The recovery dialog now displays the same chat-specific timestamp it uses for its decision.
+
+## [5.9.95] - 2026-07-21
+
+### Changed
+- **First-turn status footer reminder**: now respects System Prompt Control Room — if `<end_of_output_footer>` is disabled, nothing is injected. When enabled, injects only the live section's format (the part after "with"), including unlocked overrides and Main-prompt transforms.
+
+## [5.9.32] - 2026-07-21
+
+### Fixed
+- **Native ST portrait gen (Comfy)**: `/imagine` now passes `extend=false` so Multihog's curated portrait prompt goes straight to the image backend instead of being re-written by a second main-API LLM pass when "Extend free mode prompts" is enabled.
+- **CYOA settings popup**: scrollbar for high-zoom compatibility (#26).
+
+## [5.9.3] - 2026-07-20
+
+### Added
+- **Instant Action / Quick Start**: one-click genre start on the empty tracker — enables Loot, Events, Resting, Benched Party, CYOA, Relationships + Pre-Seeded Only RNG, RNG-picks an archetype, generates the character sheet, creates a Lorebook Agent Player Card and matching SillyTavern persona (so the chat username matches `[CHARACTER]`), then sends "Begin the adventure". Orchestrated in `quickstart.js` with a strict sequential pipeline.
+
+## [5.9.2] - 2026-07-20 — LEEEROOOOOOY JEEENKIIIINS
+
+### Changed
+- **CYOA defaults**: 5 Narrative-Decided choice slots (was 4); dropdown/prompt wording is now **Narrative-Decided**.
+- **CYOA prompt**: removed the always-on freeform "Something else?" choice — players can type freely without a dedicated button bloating the list.
+- **CYOA settings**: recommends Pre-Seeded RNG (RNG Queue) from Narrator Configuration; RollTheDice mostly adds cost/latency in CYOA because DCs are pre-committed in the choices.
+
+### Added
+- **CYOA button appearance**: text colour (or theme default), border, choice stripe, plus bracket highlight colours (mechanics / DC / modifiers / prefix tags / roll accent) with live preview and reset.
+- **CYOA mechanical highlights**: `[Persuasion … DC 13]`-style brackets render with distinct colours for DC, modifiers, and tags.
+
+### Fixed
+- **CYOA streaming**: empty tiny boxes while choices stream in — button font size no longer collapses inside gap-killing wrappers; incomplete empty buttons stay hidden until they have text; flatten/bind waits until generation ends.
+- **CYOA Chromium layout**: multi-button choice blocks no longer leave huge vertical gaps.
+- **CYOA custom prompt sticky**: builder is source of truth unless `useCustomPrompt` is explicitly set (older saves always wrote `customPromptText` and blocked shipped refreshes).
+- **Prompt defaults**: "Update Changed Prompts" stays visually emphasized; Debug panel button when updates are pending.
+
+## [5.9.0] - 2026-07-20
+
+### Added
+- **Choose Your Own Adventure (CYOA) Engine**: A robust interactive choice system, inspired by Disco Elysium was added to the narrator framework. Click the cog icon next the CYOA component to see the new additions!
+  - **Clickable Choices**: Choices are generated as interactive buttons at the end of the AI's response. Clicking a choice instantly sends it as your next chat message.
+  - **Dynamic Choice Slots**: Define exactly how many choices the AI should generate and assign specific roles to each (e.g., Narrative-Decided, Normal dialogue, Trait/Ability checks, or Custom Prefixes like `[Attack]`).
+  - **Customizable Styling**: Fully adjust button colors, opacity, emojis, and XML tag wrapping directly from the settings to match your preferred theme.
+  - **CYOA Presets**: Save your favorite choice slot configurations as named presets. Swap between different structural layouts (e.g., a 3-choice narrative setup vs. a 6-choice combat choices menu) with a single click via the auto-loading dropdown menu.
+
+## [5.8.1] - 2026-07-18
+
+### Fixed
+- **Memo recovery net**: no longer lets early boot `saveSettings()` overwrite a good `localStorage` backup with a wiped disk memo (which made the restore popup silently skip). Gate snapshots until recovery runs; refuse to shrink richer backups; run recovery earlier and again on first `CHAT_CHANGED`; log skip reasons to the console.
+
+## [5.8.0] - 2026-07-18
+
+### Added
+- **Realistic firearms damage (creation-time)**: when writing new PC/NPC/loot/enemy gear stats, scale firearm damage ~2–3× typical D&D/PF tables by common sense (pistol < carbine/rifle < shotgun/LMG); attack bonuses stay normal. Explicitly not a mid-scene conversion rule. In `<homebrew_and_custom_classes>` (main + legacy) and all character-creation paths.
+
+## [5.7.102] - 2026-07-18
+
+### Added
+- **Memo recovery net**: mirrors live STATE MEMO / quests / delta into `localStorage` on every save and unload flush. On boot, if disk memo differs from the newer local copy, offers a Restore / Keep disk popup. Mitigates silent memo loss when SillyTavern's non-keepalive settings save is aborted by F5/reload (does not fix core settings rollback for toggles/background/etc.).
+
+## [5.7.101] - 2026-07-18
+
+### Added
+- **Dual-wielding**: only path to a 3rd attack per round (offhand at −5, no ability mod on offhand damage unless a trait overrides). Hard cap of 3 APR everywhere; gear-dependent (sheathing offhand removes it).
+- Documented in `<attacks_per_round>`, CHARACTER/PARTY ATTACK TOTALS (N=1/2/3), and `[COMBAT]` APR/notation plus Elite Duelist 3-attack example.
+
+## [5.7.96] - 2026-07-18
+
+### Changed
+- **Sysprompt refresh**: Optimized main `sysprompt.txt` (hybrid RollTheDice + combat RNG queue); legacy prompt rebuilt from the same base with queue-only RNG (no RollTheDice).
+- **`[COMBAT]` stock prompt**: Soldier-tier martial/caster examples, Elite 2-attack demo, APR rule, and explicit Attack/Spell DC tier bands.
+- **Prompt transforms**: `random_events` / disabled-RNG fallback extractors updated for the new sysprompt wording.
+
+## [5.7.95] - 2026-07-18
+
+### Added
+- **Create Persona** option on Other ways to begin (Custom / quick generate), with tappable mobile help.
+- **First-turn footer reminder**: stealth-injects `<end_of_output_footer>` once on each chat's first user message.
+
+### Fixed
+- Create Persona overlay after Custom generate (settings survive panel refresh).
+## [5.7.94] - 2026-07-18
+
+### Changed
+- **APR threshold**: Second attack at BAB +8 (−5), was +10.
+- **Model guidance**: Onboarding + README note Combat API Override for slow-thinking GM models (Gemini 3.5 Flash, Medium thinking).
+
+## [5.7.93] - 2026-07-18
+
+### Changed
+- **`[COMBAT]` caster spells**: Party-style `Cantrips` / `Level N (avail/max)` lines; Att/def before Saves in the template order.
+- **`<combat_start>`**: Caster enemies must be introduced with spells by level and available slots.
+
+## [5.7.92] - 2026-07-18
+
+### Changed
+- **`[COMBAT]` martial vs caster**: Separate Att/def patterns — casters use `Spell Atk` + `Spell DC` + weak backup weapon; martials stay weapon-only.
+- **Caster NPC guidance**: Pre-calculated Spell Atk/DC (no improvising); casters should not hoard spell slots in a fight.
+
+## [5.7.91] - 2026-07-18
+
+### Changed
+- **`<combat_flow>`**: Pre-calculated attack totals guidance now includes `[COMBAT]` Att/def bonuses, not only `[CHARACTER]`/`[PARTY]`.
+
+## [5.7.90] - 2026-07-18
+
+### Added
+- **Combat caster support**: `[COMBAT]` `Spells:` line with remaining uses; flat lists render as blue magic pills. `<combat_start>` asks for spells/slots on caster enemies.
+
+### Fixed
+- **Chat Link clobbering global UI**: Auto-image-gen, immersion, connection, and appearance prefs are no longer saved/restored via `chatStates` (stops F5/code-reload resets).
+
+### Changed
+- **BASE NPC TIERS**: Label uses Attack (not BAB); spellcaster scaling note added under the tier table.
+
+## [5.7.85] - 2026-07-18
+
+### Added
+- **Attacks per round (APR)**: Second attack at BAB +10 (−5), max 2; Combat line uses `Ranged (N attacks)` / `Melee (N attacks)` with optional slash totals.
+- **`<attacks_per_round>`**: Dedicated sysprompt block; weapon-proficiencies trimmed to formulas + finesse only.
+
+### Changed
+- **NPC `[COMBAT]` format**: Compact `Att/def: Weapon (N attacks, +X / damage)` — no BAB/attribute/finesse rules on enemy blocks.
+- **BASE NPC TIERS**: Stretched BAB bands (Boss +11–15, Legendary +16–20+) so labels match martial progression and APR.
+- **DC SCALE**: Easy 14 → Near-impossible/expert 33+.
+
+## [5.7.75] - 2026-07-17
+
+### Added
+- **Finesse melee guidance**: Documented DEX-based melee attack totals for finesse weapons in `[CHARACTER]`, `[PARTY]`, `[COMBAT]`, and sysprompt `<weapon_proficiencies>`.
+
+### Changed
+- **Stock prompt migration**: Existing profiles auto-update character/party/combat prompts when the pre-finesse attack-totals text is still in use.
+
+## [5.7.7] - 2026-07-17
+
+### Added
+- **Starting Gear Tier dropdown**: New control in Other Ways to Begin and Character Creator (Auto, Mundane, Low, Standard, Well-equipped, Heroic). Both UIs stay synced via `onboardingGearTier`.
+- **Thematic named gear**: Character-creation prompts now encourage evocative proper-name gear (not only generic +N items), with tier-appropriate guidance across all genres.
+
+### Changed
+- **`buildStartingGearHint()`**: Replaces level-only magic gear hints; tier selection shapes starting kit quality on every creation path (including Fit into Story import).
+
+## [5.7.6] - 2026-07-17
+
+### Added
+- **Combat & skill scaling guide**: Shared `buildCombatAndSkillScalingHint()` now injects BAB progression tiers and conservative skill-bonus rules into every character-creation path (Character Creator, Persona, Custom, archetype presets, and PC Import).
+
+### Changed
+- **Combat sysprompt block**: Restructured `<combat>` into tagged sub-sections (`<ruleset_note>`, `<combat_start>`, `<combat_flow>`, `<damage_logic>`, `<positioning_and_movement>`, `<npc_stat_scaling>`, `<npc_profile_persistence>`, `<critical_hits_and_dying>`) in both sysprompts and embedded fallbacks.
+- **Ruleset note**: Clarifies the system is a 5e-flavor hybrid with BAB from Pathfinder/D&D 3.5 plus Fort/Ref/Will saves — not full 5e proficiency-bonus math.
+
+## [5.7.5] - 2026-07-17
+
+### Added
+- **Hide Image Generation Toasts**: Optional setting under portrait options suppresses progress/success notifications from portrait and location AI auto-generation (errors and warnings still show).
+
+### Fixed
+- **Stray "Brief" on NPC cards**: Section parser no longer splits `Brief Background` at `Background`, which had left a lone "Brief" line under Personality.
+- **Portraits lost on rename**: Lorebook entry renames (manual Title edit or agent `rename`) now migrate `customPortraits` keys to the new name.
+- **Full NPC / PC card Close saves**: Closing the detail popup while **Edit Text** is open now persists changes (Cancel still discards).
+- **State Tracker Raw View rename**: Changing a party/enemy/character name in the memo (e.g. one-letter fix) no longer clears the portrait or triggers auto-generation — portrait keys follow the rename.
+
+
+### Fixed
+- **NEW_FIELD still resurrecting after delete**: Deleting a custom module now writes a sync tombstone in localStorage. Boot strips tombstoned tags from live settings and every `chatStates` partition (before and after `loadChatState`). Also fixed `saveSettings` dropping a second save while one was in flight (so deletes no longer lost the WAL write).
+
+## [5.6.86] - 2026-07-17
+
+### Fixed
+- **Tracker snaps to Lorebook Agent after resize**: Detached agent BL/BR resizers were saving into the State Tracker geometry key (`rpg_tracker_geometry`). They now write `rpg_tracker_geometry_lorebook_agent` only.
+
+## [5.6.81] - 2026-07-17
+
+### Fixed
+- **NEW_FIELD / custom modules resurrect on code-edit F5**: Module schema (`customFields`, `blockOrder`, `modules`) is mirrored to a sync localStorage write-ahead log before the async settings save. Boot reapplies that backup before `loadChatState`, so a cancelled `/api/settings/save` during a quick reload can no longer resurrect deleted custom modules from a stale `settings.js`.
+
+### Changed
+- **Custom module add/delete**: Forces an immediate disk save (`saveSettings(true)`) so structural module edits are less likely to be lost on refresh.
+
+## [5.6.76] - 2026-07-17
+
+### Fixed
+- **Tracker wipe after ST-Copilot chat edits**: Bare `CHAT_CHANGED` emits (no chat id) are no longer treated as switching to an empty chat. That path had cleared `currentMemo`, memo snapshots, and World Progression timers, then a later save persisted the empty state. Same-chat refreshes now keep live tracker state.
+- **F5 hang / syncQuestsFromMemo loop**: Raw-memo flush no longer calls `saveSettings`/`saveChatState` (those callers already persist). Fixes an infinite `saveSettings → saveChatState → flush → saveSettings` recursion introduced when save delays were removed.
+
+### Changed
+- **Immediate tracker saves**: Removed the 2s raw-memo and 5s recolor save delays. Edits persist right away (SillyTavern still coalesces disk writes via `saveSettingsDebounced`).
+
+## [5.6.70] - 2026-07-17
+
+### Fixed
+- **Present Now false positives**: Agent-created NPCs no longer appear in Visualization Mode from loose first/last-name token matches; newly recorded entries require a full-name hit in the latest narrator message. Scanner uses that single reply only (not the whole turn block).
+
+## [5.6.65] - 2026-07-17
+
+### Added
+- **Real-Time Visualization triggers**: Choose scene art on location change or every N outputs (set N to 1 for every narrator reply). Runs on generation end, not only when Visualization Mode is open.
+
+### Changed
+- **Location Images settings**: Moved out of the ALPHA drawer into the main Portraits section; Real-Time Visualization Mode is a featured settings card.
+- **Portrait and location image resolution**: Uploads and generation no longer force 512×512 downscale or Pollinations size caps.
+- **Present Now name scanner**: Case-sensitive matching so tokens like "Big" do not match unrelated words like "big".
+
+## [5.6.60] - 2026-07-17
+
+### Changed
+- **Visualization Present Now**: Separate keyword scanner on the latest narrator output only (not Lorebook Agent active keys). Present Now tiles and location scene prompts use it; scan runs immediately before image generation.
+
+## [5.6.55] - 2026-07-17
+
+### Fixed
+- **Settings revert on reload**: Flush chat-linked snapshots before disk write on tab hide/unload so code reloads no longer resurrect stale `chatStates` over live custom fields, modules, and memo.
+
+## [5.6.45] - 2026-07-17
+
+### Fixed
+- **Character Creator startup memo**: Restores custom fields and all enabled stock modules in generated blocks (regression from Jul 12 module-gating fix). PARTY remains excluded.
+
+## [5.6.35] - 2026-07-17
+
+### Added
+- **Detached Lorebook Agent background**: Separate day/night panel images and overlay strength for the detached agent window (Settings → Appearance).
+
+### Changed
+- **Night panel backgrounds**: Night image swaps from `[TIME]` during night / late night even when Day/Night Cycle is off; night-only uploads are supported.
+
+## [5.6.3] - 2026-07-17
+
+### Added
+- **Panel background image**: Upload scenario art (optional night variant) with overlay strength; day/night cycle tints the scrim over the image.
+
+### Fixed
+- **Portrait matching**: Names with quotes (e.g. `Jax "Neon" Vane (Cyber-Drifter)`) now resolve portraits correctly after HTML rendering.
+
+## [5.6.2] - 2026-07-17
+
+### Changed
+- **Character Creator**: Level-appropriate magic gear guidance (+1/+2/+3 by tier) for fantasy characters when inventory is enabled.
+- **Inventory naming**: Magical weapons use D&D suffix format (`Shadow Longsword +1`, not `+1 Shadow Longsword`).
+- **Combat totals**: Melee/Ranged formulas documented in tracker prompts — `BAB + STR/DEX modifier + weapon enhancement bonus` — for [CHARACTER], [PARTY], [COMBAT], and sysprompt weapon-proficiency sections.
+
+## [5.6.1] - 2026-07-17
+
+### Changed
+- **`<quests>` narrator sysprompt**: Reorganized into GENERAL and EMERGENT QUESTS sections; added obtainable-objectives guidance; MOOD and FRUSTRATION_COEFF lines only inject when Frustration is enabled.
+
+### Fixed
+- **Mobile footer nav**: `Live` / `[ LIVE ]` snapshot nav centered (chevron balanced with spacer).
+
+### Docs
+- **Onboarding help**: Lorebook Agent instructions refer to the panel tab instead of the removed robot button.
+
+## [5.6.0] - 2026-07-17
+
+### Added
+- **Card-flip panel mode**: State Tracker and Lorebook Agent share one docked panel with a top mode switch; headers swap per mode. Detached Lorebook Agent unchanged.
+- **Night footer starfield**: Distinct twinkling stars in State Tracker and Lorebook Agent footers during night phases.
+
+### Changed
+- **Footer layout**: Direct prompt (💬) bottom-right in both modes; Lorebook Agent footer mirrors State Tracker (`[ LIVE ]` left, last-run right).
+- **Footer location**: Larger glowing location text in both footers, tint follows day/night cycle.
+- **Panel mode switch**: Lorebook Agent tab matches State Tracker (plain grey toggle).
+- **Mobile Lorebook Agent header**: Detach hidden on mobile; collapse chevron matches State Tracker.
+- **QUESTS prompt**: Stricter format rules; deadline only when needed; active quests only in output.
+
+### Fixed
+- **Character Creator Generate**: Event delegation + toasts for silent failures; panel reopens after re-render.
+- **Player portrait auto-generation**: Targets `[CHARACTER]` block, not duplicate Lorebook PC bio generation.
+- **Panel init crash**: `syncAgentImmersionUi` scope fix restores extension settings on load.
+- **Lorebook Agent minimize**: Integrated collapse minimizes main panel (header-only), not a blank body.
+- **Detached Lorebook Agent header**: Restored thin pre-card-flip header bar.
+- **Sun badge glow**: No longer clipped above/below the day/night sun disc.
+
+## [5.5.65] - 2026-07-16
+
+### Fixed
+- **Game System Wizard {{user}} macro**: Wizard LLM calls now shield `{{user}}` from SillyTavern `substituteParams()` (which was resolving it to the active persona name before the model saw the prompt). Generated GM/tracker instructions keep the literal `{{user}}` token so they remain valid after persona switches; leaked persona names in output are rewritten on save.
+
+## [5.5.6] - 2026-07-16
+
+### Changed
+- **Startup screen**: Character Creator is now a prominent hero button at the top; Persona, Custom, Import Card, and campaign settings live in a collapsible **Other ways to begin** drawer below.
+- **Time & Date**: Calendar/clock format controls moved into Character Creator; the same controls also appear in the onboarding drawer so Persona/Custom/Import paths can set them without opening Character Creator. Removed duplicate Time & Date block from Narrator Configuration.
+- **Character Creator UX**: **Create Persona (Recommended)** checkbox label and **Add as Player into Lorebook Agent (Recommended)** on the persona preview screen.
+
+## [5.5.5b] - 2026-07-16
+
+### Changed
+- **Initial Setup**: Step 5 now instructs users to enable Chat Completion API + **Enable function calling** (for RollTheDice), or pick a non–tool-call RNG mode in Narrator Configuration.
+
+## [5.5.5a] - 2026-07-16
+
+### Fixed
+- **Help popups on mobile**: RNG Systems Explained, Quest/Components help, settings `?` help, and Lorebook Agent docs now use scrollable SillyTavern popups (`allowVerticalScrolling`) so long content is readable on small screens.
+
+## [5.5.5] - 2026-07-16
+
+### Changed
+- **Party mechanics sysprompt**: Renamed `<party_join_leave>` to `<[PARTY]_mechanics>`; split bench ETA rules into `<bench_ETA_system>` (RollTheDice pre-return task roll in normal mode; RNG Queue d20 pop in legacy).
+- **Settings help icons**: `?` tooltips in settings now open on tap/click (mobile-friendly popup) in addition to desktop hover; taps inside checkbox labels no longer toggle the checkbox.
+
+### Fixed
+- **Sysprompt section parser**: Top-level tags with bracket prefixes (e.g. `[PARTY]_mechanics`) are parsed correctly; saved `party_join_leave` section-order keys migrate automatically.
+
+## [5.5.4] - 2026-07-16
+
+### Changed
+- **BENCHED PARTY prompt**: Bench ETA guidance on `[BENCH]` lines; `[UNBENCH]` only on physical reunion, not when an ETA date passes.
+- **Party join/leave sysprompts**: `leaving_vs_benching` task/ETA narrative guidance in normal and legacy prompts; legacy `party_join_leave` aligned with the standard JOINS wording and full leaving-vs-benching block.
+
+### Fixed
+- **Real-Time Visualization Mode**: Suppress location image generation toasts; show an in-panel loading spinner on the Visualization Mode hero while scene art generates.
+- **World Progression cross-chat leakage**: **Purge World History for this Chat** clears `{prefix}_World` reports and `{prefix}_Skeleton` seed data, resets per-chat timer/active world keys, and clears atmosphere summary; new chats no longer inherit atmosphere or active world keys from prior scenarios.
+
+## [5.5.31] - 2026-07-16
+
+### Changed
+- **Lorebook Agent Documentation**: Expanded help popup with Visualization Mode, Location Images ALPHA gating, and Real-Time Visualization Mode. Shared via `showLorebookAgentDocumentation()` from the agent panel **?** button and a new **Lorebook Agent Documentation** button at the top of Lorebook Agent settings.
+
+### Fixed
+- **Day/Night Cycle + theme changes**: Switching tracker themes no longer clears day/night phase classes; cycle tint and header badge re-apply immediately without toggling the setting off and on.
+
+## [5.5.20] - 2026-07-16
+
+### Changed
+- **Location Images & Visualization ALPHA layout**: Real-Time Visualization Mode has its own separated section in the drawer; standard auto-generation options hide while it is active.
+- **Include Present NPCs in Location Scene Prompts**: Moved back to the standard location group (not Real-Time-specific); label capitalization fixed.
+- **Real-Time Visualization Mode**: Removed the separate regenerate-on-revisit toggle — revisits always refresh while Real-Time mode is on.
+
+## [5.5.19] - 2026-07-16
+
+### Changed
+- **Auto-Generate Locations**: Renamed the Lorebook Locations auto-gen checkbox under Location Images & Visualization ALPHA.
+
+## [5.5.18] - 2026-07-16
+
+### Changed
+- **Settings drawer label**: Renamed **Lorebook Locations ALPHA** to **Location Images & Visualization ALPHA**.
+
+## [5.5.17] - 2026-07-16
+
+### Changed
+- **Location Images & Visualization ALPHA drawer**: Location image settings (Show Location Images, Lorebook Locations auto-gen, Real-Time Visualization Mode, and related options) are grouped in a collapsible drawer instead of scattered across the portraits section.
+- **Lorebook Locations auto-gen**: Enabling Lorebook Locations auto-generation now also turns on Show Location Images and no longer requires the master toggle first.
+
+### Fixed
+- **Lorebook Agent panel scroll**: One unified scrollbar for the whole agent body — expanding upper drawers no longer stops scroll at the Campaign Records header.
+- **Visualization Mode gating**: Campaign Records / Visualization Mode switch is hidden entirely when Show Location Images is off; the agent panel shows a plain CAMPAIGN RECORDS header like pre-5.5.0.
+
+## [5.5.15] - 2026-07-16
+
+### Fixed
+- **Lorebook Agent panel scroll**: Expanding Quick Settings, Console, World Progression, and other drawers no longer clips content with no scrollbar; the agent body scrolls, and Campaign Records keeps a usable minimum height.
+
+## [5.5.1] - 2026-07-16
+
+### Fixed
+- **Benched party commands**: `[BENCH]`/`[UNBENCH]` parsing now tolerates leading list bullets (e.g. `- [BENCH] Name — reason`) so bench commands are applied instead of overwriting the roster with literal command text.
+
+## [5.5.0] - 2026-07-16
+
+### Added
+- **Location images (Lorebook Agent)**: Hierarchical location tree with per-entry wide 16:9 scene art, drag-and-drop upload, AI generation, and detail popups with breadcrumb paths. Dedicated Location Scene prompt template.
+- **Lorebook Agent Visualization Mode**: Scene layout with location hero image and present NPC tiles; segmented **Campaign Records / Visualization Mode** switcher in the agent panel. Click tiles to open full character/location cards.
+- **Real-Time Visualization Mode**: Location images generated only on Scene View arrival (current context and characters present). Mutually exclusive with Lorebook Locations auto-generation. Enables regenerate-on-visit, Show Location Images, and Include present NPCs as a locked bundle.
+- **Include present NPCs in location scene prompts** (optional): Injects active Lorebook Agent NPC keys into location image prompts; uses last two narrator outputs for scene context.
+- **Regenerate visited locations**: Optional fresh hero image on each arrival when Real-Time Visualization Mode is on.
+
+### Changed
+- **Location images (alpha)**: Show Location Images is **off by default** — opt in via settings or Real-Time Visualization Mode.
+- **Location image inheritance**: Child entries no longer inherit parent art; parent lore guides distinct child generation.
+- **Portrait LLM connection**: Portraits LLM Connection is global; NPC and location prompt generation use it instead of the Lorebook Agent connection.
+- **Settings layout**: Location Portraits section reorganized; Real-Time Visualization Mode is the primary control.
+
+### Fixed
+- **Scene View character clicks**: Open full NPC/PC cards instead of portrait image-gen menu.
+- **Real-Time Visualization Mode page refresh**: Reload no longer counts as a new location arrival; last visited path persisted per chat.
+- **Lorebook auto-gen vs Real-Time**: Lorebook location background generation is hard-blocked while Real-Time Visualization Mode is on.
+
+## [5.4.95] - 2026-07-15
+
+### Changed
+- **`<resting>` prompt**: Clarifies Long Rest 9-hour gate, danger-based interruption rolls for Long/Short Rest, and that a failed roll (< DC) interrupts the rest.
+
+## [5.4.9] - 2026-07-15
+
+### Changed
+- **RNG queue v7.0**: Combat pre-roll block now uses numbered lines with labeled dice (`1: d20=17 d4=3 ...`) instead of the v6.0 `queue=[...]` array format. Non-legacy `<rng_system>` now nests queue rules in `<rng_queue_instructions>`. Sysprompt and legacy prompt text updated to match. Removed erroneous space-padding before single-digit d20 values.
+
+## [5.4.7] - 2026-07-15
+
+### Changed
+- **Game System Wizard recovery split**: Magnitude guidance for eating/drinking (and similar restorative actions) is GM-only as a rough common-sense ballpark. Tracker recovery applies the stated change, or common sense if no number is given — no duplicated Minor/Moderate/Major lookup table.
+
+## [5.4.6] - 2026-07-15
+
+### Changed
+- **Game System Wizard effect-owner examples**: Sustenance reference output is injected at generation time — tracker-owned vs GM-owned threshold effects — matching the current Effect owner selection on Regenerate / Iterate.
+
+## [5.4.5] - 2026-07-15
+
+### Added
+- **Game System Wizard prompt editor**: View, edit, copy, and reset the architect system prompt on the initial description screen and the review/iteration screen. Edits apply to in-app Generate, Regenerate, and Iterate; copy the prompt to run the wizard externally (e.g. Gemini).
+
+### Changed
+- **Game System Wizard architect prompt**: Appends a full Sustenance (hunger/thirst) output example, clearly marked as illustrative reference only — not a default answer to copy verbatim.
+- **Game System Wizard examples**: Sustenance example is no longer baked into the base prompt; it is injected at generation time and switches between `effect_owner="tracker"` and `effect_owner="gm"` variants to match the current Effect owner selection.
+
+## [5.4.4] - 2026-07-15
+
+### Changed
+- **Random events + RollTheDice**: `<random_events>` instructs parallel batch rolls (occurrence + type). Tool schema now encourages multiple parallel invocations per turn instead of forbidding them.
+
+## [5.4.3a] - 2026-07-15
+
+### Changed
+- **`<quests>` sysprompt**: Formal acceptance uses `*(Quest Accepted—Quest Name Here)*`; emergent goals use `*(Emergent Quest Active—Quest Name Here)*` with the same detail block. Frustration guidance covers formal and emergent quests.
+
+## [5.4.3] - 2026-07-15
+
+### Changed
+- **Quest prompts**: Removed emergent-quest auto-tracking from `<quests>`; acceptance now requires {{user}} to clearly take on a task. GM sysprompt assigns `FRUSTRATION_COEFF` and uses engine `MOOD` for questgiver behavior; tracker sets coeff on creation and never outputs `MOOD`.
+
+### Fixed
+- **Frustration without deadlines**: MOOD/frustration math no longer runs on quests without a valid deadline; bogus or AI-written `MOOD` lines are stripped when the tracker rewrites `[QUESTS]`.
+
+## [5.4.1] - 2026-07-15
+
+### Changed
+- **BENCHED PARTY prompt**: Clarify that permanent [PARTY] removal requires the exact *(Left the party: Name — reason)* string; temporary separations (including {{user}} leaving the scene) use [BENCH], not roster deletion.
+
+## [5.4.0] - 2026-07-15
+
+### Fixed
+- **Mobile Lorebook Agent layout**: Detached agent panel fills the viewport; campaign records scroll internally instead of leaving unused space at the bottom. Panel resize is desktop-only.
+- **Add NPC to Story dialog (mobile)**: Full-screen modal positioning; prevents off-screen spawn and duplicate overlays while the character list is loading.
+- **System Prompt Control Room (mobile)**: Two-line section rows so long tag names and controls no longer overlap; desktop layout unchanged.
+- **Mobile settings performance**: Inline drawers use instant show/hide instead of slide animations; collapsed sections skip paint via `content-visibility`.
+
+## [5.3.9] - 2026-07-15
+
+### Fixed
+- **Portrait regeneration showed stale image**: Replacing an existing portrait now saves to a new timestamped file so the browser URL changes and the new image displays. Orphaned old files are deleted when no other chat link references them.
+
+## [5.3.8] - 2026-07-15
+
+### Fixed
+- **Persona character generation**: Persona button now reads the active avatar's description instead of a stale global cache, so new chats no longer resurrect the first persona ever used when you don't re-click the persona.
+- **Chat-Linked Mode**: Settings checkbox now correctly shows on by default on fresh install.
+
+## [5.3.7] - 2026-07-15
+
+### Added
+- **Main Prompt Backup**: Automatically snapshots Quick Prompt Main before the framework overwrites it; restored when you click ⏻ on the tracker panel (or uncheck Enable State Tracker). Manual save/restore controls in General & Visuals settings.
+
+## [5.3.2] - 2026-07-14
+
+### Fixed
+- **System Prompt Control Room**: Removed nested double scrollbars; only the section list scrolls while the header and toolbar stay pinned.
+
+## [5.3.1] - 2026-07-14
+
+### Changed
+- **Tab Mode tab strip**: All module tabs are shown in a wrapping grid that fills each row; overflow "⋯" menu removed.
+
+## [5.3.0] - 2026-07-13
+
+### Changed
+- **General & Visuals settings**: Reorganized into Core, Appearance, Module Display, Advanced & Data, and Developer & Reset sections; portrait advanced options collapsed by default.
+- **Legacy Dice Logic (Vanilla)**: Moved to Game Systems & Customization → Narrator Configuration → Advanced RNG Settings.
+- **System Prompt Control Room**: Custom Sysprompt Mode tucked into a collapsed advanced section at the top of the popup.
+
+### Fixed
+- **Custom Sysprompt Mode**: Saving in the Control Room no longer overwrites Quick Prompt Main when the mode is enabled.
+- **Edit with AI (stock modules)**: "Apply to Editor" now correctly applies the revised prompt instead of writing `undefined`.
+
+## [5.2.2] - 2026-07-13
+
+### Fixed
+- **Character creation XP**: New characters now start at the beginning of the selected level (`XP: 0/max`) instead of maxed-out cumulative XP.
+- **Character creation Last Rest**: Initial `[TIME]` block uses `Last Rest: N/A` for brand-new characters who have not taken a Long Rest yet.
+- **Last Rest display**: `N/A` and other unset rest values no longer show a bogus relative time (e.g. "8 hours ago").
+
+## [5.2.1] - 2026-07-13
+
+### Changed
+- **Day/Night header layout**: Status indicator moved to the left of the title; sun/moon badge is slightly larger and centered between the title area and header icons.
+- **Night header starfield**: Night and late-night phases now scatter twinkling stars across the full header bar instead of only around the moon badge.
+
+## [5.2.0] - 2026-07-13
+
+### Added
+- **Swipe-safe Lorebook Agent scheduling**: Auto-run on "every N msgs" no longer advances when swiping or regenerating; swiping away from a generation that triggered the agent rolls back lorebook state, rewinds the watermark, and primes the counter to fire on the next real message.
+- **Swipe rollback for agent-driven relationships**: `[[REL:]]` deltas from the Lorebook Agent are now recorded per swipe so friendship/affection rollback matches narrative-tag rollback.
+- **Scheduler debug instrumentation**: `globalThis._rpgSwipeSchedulerDebug` (`.dump()`, `.snapshot()`, `.log()`, `.togglePanel()`) plus `[RPG Scheduler]` console events when debug mode is on.
+
+### Fixed
+- **State Tracker memo swipe rollback**: Memo and relationship swipe trackers no longer share a single marker; memo rollback runs before relationship rollback in the interceptor so both restore correctly.
+- **Relationship swipe rollback**: Interceptor no longer wipes `rpgRollbackData` without undoing deltas.
+
+## [5.1.10] - 2026-07-13
+
+### Changed
+- **Portrait storage folder**: Renamed from `user/images/rpg_tracker_portraits/` to `user/images/multihogframework_portraits/`. Legacy paths are still recognized for display and purge.
+
+## [5.1.9] - 2026-07-13
+
+Release tag for portrait file-storage work (5.1.6–5.1.8).
+
+## [5.1.8] - 2026-07-13
+
+### Fixed
+- **Portrait migration race**: Block `loadChatState` / `saveChatState` while bulk migration runs so async uploads are not overwritten by chat-switch handlers mid-flight. Migrate chat partitions before live state, then re-sync live portraits from the active chat.
+
+## [5.1.7] - 2026-07-13
+
+### Fixed
+- **Portrait migration loop on refresh**: Migration now runs after chat state bootstrap, flushes settings synchronously to disk (instead of a debounced save that could be lost on F5), and only shows the success toast once all embedded portraits are actually gone from settings.
+
+## [5.1.6] - 2026-07-13
+
+### Fixed
+- **Portrait File Storage**: Custom portraits are no longer stored as base64 inside `settings.json`. New and migrated portraits are saved under `user/images/multihogframework_portraits/` with lightweight path references in settings — preventing settings bloat across many chats and auto-generated portraits.
+- **Automatic Portrait Migration**: On load, any legacy embedded base64 portraits (live state and all chat links) are migrated to disk in the background with content deduplication, then settings are re-saved without the image payloads.
+
+### Added
+- **Emergency: Purge All Portraits**: Settings button (and improved Remove All Portraits action) deletes managed portrait files on disk and clears portrait maps from the live state and every saved chat link — without touching memos or lorebooks.
+
+## [5.1.5] - 2026-07-13
+
+### Added
+- **Day/Night Cycle**: Optional setting that shifts the entire tracker panel's color palette and header sky badge to match the current in-world time parsed from `[TIME]`. Seven phases (late night, dawn, morning, midday, afternoon, sunset, night) override theme CSS variables with smooth crossfades. The header badge is a pure-CSS sun or moon (with twinkling stars at night) — no image assets. Updates live when the user edits time in Raw view or toggles back to Rendered view.
+
+## [5.1.4] - 2026-07-13
+
+### Added
+- **Inline Rendering Tag Colors**: Any rendering tag now optionally supports a custom color override directly in the marker, e.g. `((PLS - #E5FFCC))` or `((BADGE - #ff6699))`. Bar-type tags (`((BAR))`, `((XPBAR))`, `((PROGRESS))`) additionally support a two-color gradient: `((BAR - #E5FFCC #003300))`. Colors are strictly validated as 6-digit `#RRGGBB` hex to prevent malformed/unsafe CSS.
+- **GM State Memo Formatting Tag Stripper**: Strips all `((...))` rendering markers from the outgoing memo block passed to the GM, leaving clean mechanical data while preserving full visual marker rendering in the player-facing State Tracker panel.
+- **Game Cartridges Selective Load Checkbox UI**: Added a checklist dialog when loading a cartridge, allowing users to import only specific groups of settings: State Tracker, Game Systems & Custom Fields, Character Sheets, Portrait Generator, and Lorebook Agent.
+- **Lorebook Agent Cartridges Integration**: Added Lorebook Agent prompts (`routerSystemPromptTemplate`, `routerModularPromptTemplate`), modules (`routerModules`), and custom tags (`routerCustomTags`) to the cartridge payload keys, so they are saved and loaded alongside the rest of the configuration.
+- **World Progression Prompt Cartridges Integration**: Added the World Progression Report Generation Prompt (`worldProgressionSystemPrompt`) to the cartridge payload. It appears as a dedicated **World Progression** group in the selective load dialog.
+- **Lorebook Agent UI Auto-Refresh**: Exposed a re-rendering hook `_rpgRenderAgentCustomTags` to `globalThis`, and wired both custom tags and module lists to refresh in real-time when settings are synced (such as when importing/loading a Game Cartridge).
+
+### Removed
+- **Prompt Instruction Cleanup**: Removed the now redundant `- Ignore any formatting data such as ((PLS))` and `- Ignore any formatting data such as ((PILLS))` guidelines from the default system prompts (`constants.js`, `sysprompt.txt`, `sysprompt_legacy.txt`) since formatting markers are now cleanly stripped programmatically on the GM path before injection.
+
+### Changed
+- **Simplified GM Marker Stripper**: `memoForGmContext()` now unconditionally removes any `((...))` token in full — no per-tag parsing, no color-suffix special-casing — so new marker syntax (including inline colors) can never leak into GM context.
+- **Improved Contrast on Default "Stock" Badges**: Enhanced visual contrast for the `~ stock ~` label badge inside the load checklist dialog by inheriting theme-aware text colors and using adaptive background/borders.
+
+## [4.9.1] - 2026-07-11
+
+### Added
+- **Editable Portrait Prompt Templates**: The system prompts used to generate AI image-generation prompts for portraits are no longer hardcoded. Two new editable, resettable prompt templates are available under AI Character Portraits → Portrait Prompt Templates:
+  - **NPC / PC Portrait Prompt** — used when generating portraits for NPCs and Player Characters opened from the Lorebook Agent. This prompt already receives the NPC's full lorebook entry verbatim, so you can instruct the AI to prioritize a custom `[CORE]` field (e.g. an "Image Tags"/Danbooru-tags section added via the NPC Section Editor) by referencing it by name.
+  - **Character / Party / Combat Portrait Prompt** — used for the main character, party members, and combatants.
+  - **Saved Setups**: Save your current pair of prompts (plus the word target below) as a named, reloadable preset (library-style, like Saved Themes), so you can swap between different portrait-prompt styles (e.g. Danbooru-tag-focused vs. natural-language descriptions) without rewriting them each time. Saved setups and the prompt templates themselves now travel with Game Cartridge export/import.
+  - **Portrait Prompt Word Target**: The "Keep it under 200 words" instruction in both prompts is now a `{{wordtarget}}` token backed by a new, independent numeric setting (default 200), so the length limit is configurable instead of hardcoded. This is unrelated to the "Major/Minor NPC Section Word Target" fields used for lorebook `[CORE]` sections.
+- **NPC/PC Section Editor now included in Game Cartridges**: Your custom Core Identity section layouts (names, descriptions, colors, icons, and ordering for both NPC and PC cards) and their saved presets now travel with Game Cartridge export/import, so a shared cartridge can enforce a specific way of recording characters for that game/system instead of falling back to your locally configured layout.
+- **Portrait Generation on the Full NPC Card**: The large portrait shown in the Full NPC Card popup now supports the same click-to-generate/manage overlay as the small NPC card thumbnails in the Lorebook Agent list. Hovering reveals a 🎨/⚙️ icon; clicking opens the portrait settings menu (URL, upload, or AI Generate), and the popup's portrait updates in place immediately after applying, without needing to close and reopen the card.
+
+## [4.9.0] - 2026-07-10
+
+### Added
+- **Expanded Relationship Tiers**: Completely overhauled the Friendship and Affection systems, expanding them from 7 to a highly granular 13-tier system. The scale is now perfectly symmetrical, with the "Neutral" zone significantly tightened and multiple new intermediate tiers added (e.g., "Unreceptive/Withdrawn", "Amicable"). This eliminates all previous massive dead zones in early positive and negative relationship progression. All `{{user}}` macro strings have also been cleanly removed from behavioral hints to prevent token/interpolation bugs.
+- **NPC Section Editor & PC Section Editor**: Brand new, fully interactive editors for customizing how Character details are tracked! You are no longer stuck with the default sections. You can now easily **add new sections**, **edit existing ones**, **delete them**, and fully reorder them to fit your campaign's unique needs.
+  - **Preset Support**: Save your favorite section layouts as presets and load them anytime with a single click. No need to rebuild your sections from scratch for different types of campaigns!
+  - **Visual Customization**: Every section now supports choosing a custom color and assigning an emoji. These will be beautifully rendered inside the popup character cards and tracker UI, making your character details pop out perfectly.
+- **Character Creator Presets**: The Character Creator now features a persistent Presets system. You can save your currently entered fields (Species, Traits, Class, etc.) as a named preset, then instantly load them later via a dropdown menu to skip repetitive typing for common character archetypes.
+- **NPC Strengths & Flaws Sections**: Two new sections — `Strengths` and `Flaws` — are now part of every NPC `[CORE]` block. The AI is instructed to keep them concise (sharp phrases over prose) and use asymmetric counts to reflect character nature (e.g. a villain gets more flaws; a kindly mentor gets more strengths). Both sections are parsed and rendered in the full NPC card UI with distinct icons (⚡ and ⚠️) and colors (green / red).
+- **Dual-Mode "Add as is" NPC Import**: The "Add as is" button on character card import now supports two configurable modes, selectable in ⚙️ NPC Settings:
+  - **Literal** — Wraps the card's raw description verbatim in `[CORE][/CORE]` tags. No AI is involved. The card's existing writing is treated as canonical.
+  - **AI Review** — Sends the card to the AI for a *minimal* fix pass that resolves only hard logical impossibilities (e.g. a smartphone in a medieval setting, modern slang in a historical world). Original prose is preserved as faithfully as possible.
+- **📥 Import Card — PC Import Flow**: A new `📥 Import Card` button is now available alongside the existing archetype buttons on the State Tracker startup screen. Clicking it opens an inline character picker with search/filter and per-card action buttons:
+  - **📋 Add as is** — Performs a minimal AI review (era/world conflict fixes only) then generates a persona bio from the card.
+  - **🤖 Fit into Story** — Fully adapts the character to the current campaign setting before generating a state memo and persona bio.
+  - Both modes: (1) send a `sendDirectPrompt` to generate the tracker state memo blocks directly in the chat, then (2) generate a persona bio via the router AI and surface it in the existing Persona Confirm overlay for review and one-click lorebook registration.
+
+- **✨ Edit with AI — Full PC Card & Full NPC Card**: Both the Full PC Card and Full NPC Card popups now include an **"✨ Edit with AI"** button stacked below the existing "✏️ Edit Text" button. Clicking it opens an AI edit pane where you describe the changes you want (e.g. *"Make the background more tied to the ongoing war"*). The AI rewrites the entire character entry with those changes applied, then surfaces a preview textarea. From the preview you can **✅ Apply** the result (persisted to `pc.bio` for the PC, or saved to the lorebook entry for NPCs) or **🔄 Regenerate** for a fresh attempt — all without leaving the popup.
+
+### Changed
+- **NPC Import Default Fidelity**: The "Ignore Character Limits When Importing Character Cards" setting is now ON by default. This ensures the AI stays as faithful to the original character card as possible without attempting to truncate or heavily condense their background and personality to fit standard NPC lore budgets.
+- **`buildNpcInstruction` / `router.js` field lists**: All NPC-related field enumerations, tool schemas, update instructions, and legacy wrap patterns now include `Strengths` and `Flaws`.
+- **NPC section parser / renderer**: `parseNpcSections` and `renderSectionsHtml` now recognize and visually distinguish `Strengths` (green, ⚡) and `Flaws` (red, ⚠️) from the rest of the Core Identity sections.
+- **Literal add verbatim limit**: Raised the character card description slice from 1,500 to 3,000 characters for literal adds to avoid silently truncating long cards. Personality is only appended when it is not already embedded in the description.
+- **"Fit into Story" Background Adaptation**: The persona bio `Background` section generated when importing a character card via "🤖 Fit into Story" now explicitly adapts the character's backstory to the current campaign setting and world context, rather than grounding it solely in the source card. The overall rewrite instruction was also strengthened to actively integrate the character into the world's lore and ongoing story.
+
+### Fixed
+- **PC Import Portrait Sync**: Fixed a bug during "Fit into Story" PC imports where the AI deciding to rename the character (e.g. inventing a surname to a firstname only Card) would break the portrait binding in the State Tracker. The system now extracts the newly generated name from the state memo and maps it back to the original card's avatar.
+- **Custom Currency Rendering**: Fixed a bug where custom fantasy currencies containing additional words (e.g. "130 Gold Dragons", "50 Silver Staggs") would fail to render as inline coin badges. The inventory currency parser now correctly captures up to two trailing descriptor words.
+- **Abilities Block Rendering**: Fixed a bug where abilities containing multiple commas in their description or using a "Name: Description" format were incorrectly split into separate broken pills. The formatting parser is now less rigid, allowing complex abilities like "Rage (2/2 per day): Advantage on Strength checks/saves" to render perfectly as single, unbroken elements while maintaining backwards compatibility with old comma-separated lists.
+
+## [4.8.9] - 2026-07-10
+
+### Added
+- **Colored Progress Variants**: Added a full suite of color-coded variants for the `((PROGRESS))` marker (e.g. `((PROGRESSRED))`, `((PROGRESSBLUE))`, `((PROGRESSGREEN))`) to expand dynamic visual tracking options in the library.
+- **Dynamic AI Tag Engine**: The Game Wizard AI now automatically synchronizes with the core renderer library, meaning it instantly understands the visual formatting and contextual meaning of all existing and future progress tag variants when generating new custom tracking modules.
+- **Progress Bar Recoloring**: All `((PROGRESS))` markers in the state tracker are now natively clickable. They utilize the same intuitive color-wheel picker as standard bars, allowing players to dynamically override their fill colors on the fly.
+- **Nine New Visual Components**: Vastly expanded the rendering engine with 9 entirely new, fully dynamic visual markers:
+  - `((CLOCK))` - Blades in the Dark style rotating conic-gradient clocks.
+  - `((STARS))` - 5-star rating icons for reputation/quality.
+  - `((WEIGHT))` - Encumbrance bars that dynamically shift color at 75% and 100%.
+  - `((WEATHER))` - Dynamic weather badges that automatically match string keywords to thematic emoji (e.g. 🌧️, ☀️, ❄️).
+  - `((ORBS))` - Glowing resource action points (similar to Ki or spell slots).
+  - `((SLOTS))` - Hollow grid slots for tracking discrete inventory capacity.
+  - `((PHASE))` - Connected "subway map" style breadcrumb nodes for multi-stage events.
+  - `((GAUGE))` - Semi-circle speedometers with a rotating needle for tension/morale tracking.
+  - `((CHARGE))` - Segmented battery icons that flash red when depleted.
+  *Note: All progression-based tags natively support color-wheel recoloring by clicking them in the state tracker!*
+
+### Fixed
+- **Centralized Tag Examples**: Moved all rendering tag example strings directly into the core `MARKER_TYPE_MAP` definition instead of maintaining them in separate UI files. This architectural improvement ensures that whenever a new tag is added to the engine, its AI context and UI preview are automatically defined and synchronized in one place.
+
+## [4.8.7] - 2026-07-10
+
+### Fixed
+- **Dice Tool Forced-Failure on Malformed Formula**: Fixed `RollTheDice` silently returning a `0` result (an automatic FAILURE against any DC) when the LLM supplied a formula the parser couldn't understand — e.g. comma-joined duplicate formulas like `"1d20+1,1d20+1"` instead of a single `"1d20+1"`. The tool now recovers from comma-separated formulas by using the first valid segment, and falls back to rolling a plain `1d20` (flagged in the result) instead of ever returning an empty/zero roll. Also tightened the tool's `formula` parameter description to instruct the LLM to pass exactly one dice expression per call.
+
+## [4.8.6] - 2026-07-10
+
+### Fixed
+- **Critical: Fresh-Install Hang (Infinite Recursion)**: Fixed a bug where `getSettings()` and the NPC/LOC/FAC instruction builders (`buildNpcInstruction`, `buildLocInstruction`, `buildFacInstruction`) could recurse into each other during the settings-migration pipeline. Each migration block called a builder *before* bumping `settingsVersion`, and the builders called `getSettings()` back to read `useDdMmYyFormat`/`npcRelationshipBars` — so the nested call would see the still-old version, re-enter the same migration block, and call the builder again, looping until the stack overflowed. This only affected brand-new installs (no saved `settingsVersion`) and configs below `4.5.0`, silently freezing SillyTavern on load. Added a re-entrancy guard to `getSettings()` so nested calls return the in-progress settings object instead of restarting the migration pipeline.
+- **Version Comparison in Migrations**: Migration gates previously compared `settingsVersion` with plain string comparison (e.g. `'4.10.0' < '4.5.0'` incorrectly evaluates `true`), which would misfire once a double-digit minor/patch version is reached. Replaced with a proper numeric segment-by-segment version comparison.
+
+## [4.8.5] - 2026-07-09
+
+### Added
+- **Player NPC Safeguard**: Implemented detailed prompting rules to check chat log dialog and prevent creating duplicate NPC entries for the player's persona or in-character name/alias (e.g. "Dave Davidson").
+- **Faction [CORE] Tags**: Standardized Faction (FAC) entries to wrap permanent description text inside `[CORE] ... [/CORE]` tags, matching Location formats.
+
+### Fixed
+- **Settings UI Cartridge Sync**: Modified settings UI loading code to immediately re-sync toggles (including RNG settings) when loading a game cartridge or closing the cartridge menu, resolving the need for manual browser refreshes (F5).
+- **CORE Tag Auto-Stripping**: Corrected a regular expression filter in the content sanitization function that was accidentally stripping out `[CORE]` and `[/CORE]` tag lines from committed lorebook entries.
+
+## [4.8.0] - 2026-07-09
+
+### Added
+- **Full Module Context for Wizard**: The Game System Wizard now receives the complete prompting instructions, templates, and active states of all enabled stock modules, custom fields, and custom GM sections. This enables the AI generator to be fully influenced by existing formatting and rules in the workspace.
+- **Complete Tags Library Exposure**: Expanded the wizard's rendering library hints to expose all 30+ available tags, resolving a bug where the AI was unaware of advanced tags like `((PROGRESS))` due to a hardcoded 12-item slice limit.
+- **Pill Hygiene Instructions**: Added explicit guidelines to the Game System Wizard and AI Custom Field Creator prompts to prevent the AI from prefixing every item in a list with the `((PILLS))` tag, avoiding visual rendering issues.
+
+## [4.7.0] - 2026-07-09
+
+### Added
+- **Game System Wizard Upgrades**: Improved the prompt generation wizard to support compound meters, scaled magnitudes, and natural-language inline delta annotations (e.g., `*(Food eaten: Chocolate Bar. +75 Hunger)*`).
+- **UI Feedback for Wizard**: The Game System Wizard button now disables and displays a loading spinner (`Generating...`) while the LLM is generating drafts.
+- **Bar Percentage Mode**: Added a "Show as Percentage" option to HP/XP and custom status bars in the recolor popup. When enabled, it displays the value scaled out of 100 (e.g., `50/100`), keeping the backend math identical for AI parsing.
+- **Native Portrait Generator Default**: Swapped the default portrait generator from Pollinations.ai to the SillyTavern native Image Generation Extension to bypass the new Pollinations PAYG paywall, and added an informative configuration tooltip.
+- **Unlock Base Sections**: Added capability to fully override built-in system prompt sections (e.g. `<combat>`) directly from the settings panel.
+
+### Changed
+- **Modular Code Architecture**: Split the monolithic `index.js` into dedicated, domain-specific modules:
+  - `game-systems.js`: Core RPG game system logic, template building, and AI wizards.
+  - `character-creator.js`: Character creator panel, attributes, and onboarding flow.
+  - `theme-manager.js`: UI themes, CSS injection, and the custom bar recolor popup.
+  - `ui-editors.js`: Custom fields editor, prompt templates, and imports/exports.
+  - `ui-geometry.js`: Resizing math, dragging handlers, and viewport geometry adjustments.
+
+### Fixed
+- **State Save Performance**: Solved the UI lag/freeze during typing by debouncing live setting saves by 2000ms, and implemented smart flushing that instantly commits edits before switching views or switching chats.
+- **State Leakage**: Fixed cross-chat state leakage in `saveChatState` by using the authoritative `getActiveChatId()` rather than potentially stale event sources.
+- **Custom Field Editor Sandbox**:
+  - Restored correct synchronous `renderMemoAsCards` preview rendering in the custom fields editor.
+  - Fixed page navigation in the testing sandbox live preview.
+  - Forced live preview to default to a clean, non-paginated mode.
+
+## [4.6.2] - 2026-07-07
+
+### Fixed
+- **Full NPC Card**: Fixed the NPC detail popup failing to open due to missing `portraitSrc`, `hidePortrait`, and `ctx` bindings in `openNpcDetailPopup`.
+
+## [4.6.0] - 2026-07-07
+
+### Added
+- **Character Creator**: Introduced a brand new `🎲 Character Creator` button in the starting screen that streamlines character creation!
+  - Features intuitive inputs for Name, Gender, Age, Orientation, Species, Ethnicity, Genre, Level, and Class.
+  - Automatically seeds the initial framework state with rich, personalized stats and background tags.
+  - Remembers your last-used form values when you press **Generate Character**, with a **Reset** button to clear fields.
+  - Added a **Create Persona** checkbox that automatically generates a rich background, appearance, habits, and personality for your SillyTavern persona! Features customizable word count targets (ranging from 100 up to 1000+ words).
+- **Player in Lorebook Agent**: The Lorebook Agent and State Tracker have been upgraded to officially track and render the player entry.
+  - The framework now seamlessly integrates player profile cards directly into the UI, ensuring your character's active narrative state is always synced and accessible.
+
+### Fixed
+- **PC & State Persistence**: Fixed a critical bug where the newly created player entry (and the state memo) would disappear if SillyTavern was refreshed immediately after generation or after the framework automatically updated the memo via swipe/AI generation. The framework now forces a synchronous save when modifying chat state partitions, preventing SillyTavern's debounce timer from losing uncommitted data on page unload.
+- **Persona Injection**: Fixed **Inject as Current Persona** so it creates or updates a real SillyTavern persona (via native APIs) instead of only filling the transient description textarea.
+
+
+## [4.5.2] - 2026-07-06
+
+### Fixed
+- **System Prompt Injection Safeguards**: 
+  - Prevented the extension from automatically writing the D&D system prompt to SillyTavern's prompt editor when the extension is powered off via the panel's power button.
+  - Ensured that enabling **Custom Sysprompt Mode** prevents any automatic system prompt injection or overwriting on page refresh (F5) or settings updates, leaving manual buttons (Apply/Reset) as the only way to write the prompt.
+  - Toggling the extension back to ON now instantly writes the system prompt.
+
+## [4.5.0] - 2026-07-06
+
+### Added
+- **Optimized UI Toggles**: Moved all layout collapse/expand and view state flags (including panels, drawers, console, modular repertoire, world progression, active keys drawer, and Raw View toggle) to browser `localStorage` to completely bypass global settings serialization, resolving the 1-second lag post-click.
+- **Mobile UI Enhancements**:
+  - Added responsive headers that automatically abbreviate the text to "Multihog D&D" on mobile screens.
+  - Repositioned the **Direct Prompt** (💬) and **Raw View** (⊞) action buttons to the top header bar next to **Lorebook Agent** (🤖) for quick access.
+  - Enlarged the collapse chevron and added a safety spacing gap on mobile to prevent accidental triggers of the close button.
+
+## [4.4.2] - 2026-07-06
+
+### Changed
+- **Hybrid RNG sysprompt**: RollTheDice (out of combat) is now rule #1 with clearer default-state wording; RNG queue reserved for post-initiative combat rounds only.
+- **RNG constraints**: Reinforced default-to-tool-call behavior and added tie-breaker when combat vs. non-combat is ambiguous (e.g. initiative transition).
+
+## [4.4.1] - 2026-07-06
+
+### Added
+- **Relationship tier badges in UI**: NPC grid cards and detail popup show live Friendship/Affection tier labels (same logic as `[NPC_RELATIONS]`), with intensity-scaled pill colors that grow greener/pinker toward max.
+
+### Changed
+- **Tier thresholds rebalanced**: Wider neutral band (25% of max) so early positive values no longer jump to FRIENDLY too quickly.
+- **Affection neutral tier**: Renamed from NEUTRAL CURIOSITY to NEUTRAL/NO AFFECTION for clarity.
+
+## [4.4.0] - 2026-07-06
+
+### Added
+- **Adjustable NPC relationship scale**: Friendship/Affection max (±N) is configurable per chat when chat linking is enabled, with a separate global default for new chats (Extension Settings + Campaign Records ⚙️ NPC Settings).
+- **Dynamic relationship prompts**: Lorebook Agent NPC/`rel` guidelines, router cap hints, `[NPC_RELATIONS]` header, and narrator `<relationship_tracking>` sysprompt block all reflect the active chat's configured range.
+
+### Changed
+- **Relationship tiers**: FRIENDLY, HOSTILE, etc. thresholds are proportional to the configured max instead of hardcoded ±25/±60 values.
+- **Narrative deltas unchanged**: Tag awards (+5 stays +5); only clamp, bar fill, tiers, and starting-value guidance scale with the range.
+
+## [4.3.9] - 2026-07-06
+
+### Changed
+- **LOC [CORE] format**: Lorebook Agent now uses plain `[CORE]` with 1–2 sentences for locations — no NPC field headers (Appearance/Personality/Habits). FAC/QUEST/EVENT explicitly do not use `[CORE]`.
+- **Campaign Records rendering**: Non-NPC expanded entries show a styled Permanent block for `[CORE]` content, with timestamped chronicle lines below.
+
+## [4.3.8] - 2026-07-05
+
+### Fixed
+- **NPC card expand layout**: Expanded lore entries now stack below the portrait/header row instead of overlapping status badges and relationship bars when NPC portraits are enabled.
+- **NPC card synopsis width**: Appearance blurb now uses the full card width and shows up to four lines (was two), with a higher character cap.
+
+## [4.3.7] - 2026-07-05
+
+### Added
+- **Onboarding Initial Setup step 4**: Reminder to match SillyTavern Persona name to the State Tracker character after creation.
+
+### Fixed
+- **Scenario Profiles stock modules**: Profiles now save and restore stock module prompt edits (all TIME variants), module enable/order, and per-module pagination settings. Chat-linked state uses the same snapshot helpers.
+
+## [4.3.6] - 2026-07-05
+
+### Added
+- **Per-chat time/date settings**: 24h clock, Day vs DD/MM/YYYY calendar, and initial date anchor are saved per chat ID when chat linking is enabled.
+- **Onboarding layout**: Redesigned top config row with segmented Day/Date and 12h/24h toggles, Sci-Fi and Horror genre templates with matching archetype buttons, and section dividers (How It Works / Setup Guide).
+
+### Changed
+- **Time/date UI sync**: All time and date controls (onboarding, Modules & Order pills, Extension Settings) funnel through shared setters so they never show contradictory state.
+- **TIME module prompt editor**: Edit/Reset now picks the correct stock prompt variant (`time`, `time_24h`, `time_ddmmyy`, `time_ddmmyy_24h`) based on both clock and calendar toggles.
+- **Status footer placement**: `<end_of_output_footer>` moved immediately after `</combat>` in both sysprompt files for higher prompt attention.
+- **Onboarding copy**: Updated How It Works, Initial Setup (time/date step), and simplified model recommendations (MiMo 2.5 Pro GM, Gemini 3.1 Flash-Lite for tracker/agent).
+- **Lorebook Agent docs**: Removed obsolete Max Tokens control reference; Campaign Records now explains native Lorebook book creation instead of a separate Campaign Prefix control entry.
+
+## [4.3.5] - 2026-07-05
+
+### Added
+- **Quest archive UI**: Completed and failed quests move to separate COMPLETED / FAILED sections; archived entries can be dismissed manually. **Show archived quests** toggle in settings (default on).
+- **Edit with AI (Modules)**: **Edit with AI** button in both the stock prompt editor and Custom Module Editor — describe changes in plain language and the AI revises the module with preview/accept flow, same pattern as Add Custom (AI).
+
+### Changed
+- **Quest memo cleanup**: Archived quests (completed, failed, past deadline) are synced to settings then stripped from the stored `[QUESTS]` memo automatically; the model no longer needs to omit them.
+- **Quest prompt wording**: Restored instructions to keep completed/failed quest entries with updated STATUS so the tracker can archive them before memo strip. Auto-migrates saved prompts that used the over-aggressive “active only” wording.
+
+### Fixed
+- **Empty `[QUESTS]` on completion**: State Tracker no longer told to emit an empty quest block when the last active quest completes — preventing lost archive sync.
+- **Stock prompt editor pagination**: TIME (24h) module now uses the correct block tag for pagination threshold lookup.
+
+## [4.3.4] - 2026-07-05
+
+### Performance
+- **Faster page reload (F5)**: Startup no longer blocks on full lorebook registry scans, duplicate chat-bootstrap work, or Campaign Records rendering while the Lorebook Agent panel is closed.
+- **Faster Campaign Records**: Routine manifest refreshes skip disk/registry rescans; the manual ↻ refresh button still performs a full scan to discover newly cloned or external books. Lorebooks load in parallel; NPC inline editors build lazily on first expand.
+- **`disableManagedEntries` optimized**: Uses saved campaign book lists where possible, avoids redundant API probes, loads books in parallel, and runs deferred in the background.
+
+### Added
+- **Show NPC Portraits toggle**: When disabled, NPCs use the compact list view (like Events/Locations), NPC portrait auto-generation is turned off, and **Add NPC to Story** remains available.
+- **Compact NPC list enhancements**: CORE address-card button (left of name), relationship stats (🤝/💗) when Relationship System is enabled, live rel-stat DOM updates without a full manifest reload.
+- **Last Run / Next run status**: Lorebook Agent footer shows when the agent last ran (relative time) and a countdown to the next auto-run.
+- **Reset Timeline**: New button in the Lorebook Agent panel and Extension Settings to reset World Progression timer state for the current chat.
+- **Combat auto-switch**: When `[COMBAT]` is active in the State Tracker memo, switches the main narration Connection Manager profile via `/profile` and restores the baseline when combat ends.
+- **Combat completion preset override**: Combat auto-switch can restore a separate chat completion preset alongside the connection profile.
+
+### Changed
+- **Renamed setting**: “Enable RPG Tracker” → **Enable State Tracker** in settings and tooltips.
+- **Quest system simplified**: LogQuest / tool-based quest mode removed; plain-text `[QUESTS]` blocks are now the only quest path.
+- **World Progression timer model**: Label-based timer anchor, fixed epoch handling, conditional narrative injection; “last fired” state is per-chat.
+- **[CORE] prompt tightening**: Lorebook Agent instructions now discourage plot-tied scene recaps in permanent NPC identity blocks.
+- **World Skeleton isolation**: Skeleton books excluded from agent archive, tools, activation, and Campaign Records manifest.
+- **Activate Books**: Refreshes Campaign Records after activation so new books appear without F5.
+
+### Fixed
+- **Since-last-run watermark**: Persists per chat, handles swipes/stale indices, restores correctly on undo/redo; auto-run throttle resets after manual agent passes.
+- **World Progression persistence**: Timer state saves to chat-linked state, survives reloads, and no longer bleeds between chats; “Next fire” display derives from stored label with memo-time fallback.
+- **Character creator XP**: `[XP]` block always included with level-specific thresholds; onboarding level dropdown forwarded correctly for all archetypes (Custom, Persona, etc.).
+- **Quest state on rollback & chat switch**: Clears per-chat quest bleed; `settings.quests` resyncs from memo on restore; memo is authoritative over stale completed entries in the UI.
+- **NPC manifest refresh**: Fixed scoping bugs when toggling portrait mode; settings toggle now reloads Campaign Records immediately.
+- **Onboarding prompt hints**: Opening/closing tags enforced to reduce unclosed block output from the model.
+- **`saveSettings` reference** in `narrative-hooks.js`.
+- **NPC detail popup**: Removed “(Immutable)” from Core Identity section header.
+
+## [3.8.9] - 2026-07-01
+
+### Fixed
+- **NPC Portrait Generation Routing**: Fixed a bug where auto-generating portraits for NPCs incorrectly used the default Portrait AI connection settings instead of the dedicated Lorebook Agent AI connection settings, ensuring context-aware models handle the complex lorebook generation.
+- **NPC Word Count Cap**: Raised the internal hard cap for NPC major/minor section word targets from 100 to 1,000 words. Previously, typing a value like `400` in settings would silently clamp and save as `100`, forcing the AI to abbreviate lore. The quick-settings popup and main extension panel now correctly persist custom large limits.
+
+## [3.8.8] - 2026-06-30
+
+### Added
+- **Relationship Bars System Rework**: Overhauled the NPC relationship bar system from a cosmetic feature into a functional, AI-driven mechanic. The narrator AI now emits inline annotations (e.g. `*(Affection: Elena +2 — sincere compliment)*`) at the point of interaction and machine tags (`[REL: Name | field | delta]`) at the end of each response. Tags are automatically parsed, deltas applied to the relationship bars (clamped ±100), and the updated values written back to lorebook NPC entries as the persistent campaign database. Context injection (`[NPC_RELATIONS]`) provides the narrator with a live snapshot of current standings for active NPCs only, keeping token usage minimal. System prompt guidance added with calibrated delta examples for both Friendship and Affection.
+- **Always Auto-Generate NPCs (Lorebook)**: Introduced a new settings toggle to automatically generate portraits in the background for new or updated NPCs created by the Lorebook Agent, aligning the behavior with existing auto-generation options for Party and Enemies.
+
+## [3.8.6] - 2026-06-28
+
+### Fixed
+- **NPC [CORE] Format Reinforcement**: Explicitly instructed the LLM to start NPC description fields directly with `[CORE]` and prohibited any prepended timestamps (e.g. `[Day X, HH:MM] [CORE]`).
+- **Improved Lorebook Agent Example**: Refactored the NPC example inside the system prompt in `router.js` to correctly demonstrate starting the description with a `[CORE]` block.
+- **Settings Migration**: Added a migration block for settings version `3.16.16` in `state-manager.js` to automatically regenerate the NPC instruction field for upgrading users.
+
+## [3.8.5] - 2026-06-28
+
+### Added
+- **24-Hour End of Output Footer**: Configured the system prompt builder (`buildSysprompt`) in `index.js` to dynamically alter the `<end_of_output_footer>` template to direct the LLM to output times in 24-hour format (`HH:MM` instead of `HH:MM AM/PM`) when the 24-hour setting is enabled.
+- **LogQuest Tool Format Instructions**: Updated the `LogQuest` function tool description in `quests.js` to dynamically format its deadline time parameters and instructions to match 24-hour clock formats when 24h mode is active.
+- **24-Hour Time Format Toggle**: Added a user configuration checkbox ("Use 24-Hour Time Format") in the extension settings menu under the TIME module row.
+- **Dynamic Prompt Customization**: Automatically swaps the instruction examples for the `[TIME]` module to the clean 24-hour format prompt variant (`time_24h`) when 24h time is enabled.
+- **Time Parsing & Formatting**: Updated the in-world time parser to support optional AM/PM parsing and consolidated all display timing helpers to respect 24-hour format.
+- **NPC Creator with Tabbed Dialog**: Added "Add NPC to Story" creator with tabs for card import, freeform, and archetype selection.
+- **Custom Archetype Input**: Added a custom archetype input that shows only when the "Custom" chip is selected.
+- **Edit Text Button in Full NPC Card**: Added an "✏️ Edit Text" button directly inside the Full NPC Card popup with live refresh of the view pane after saving.
+- **Ignore Character Limits When Importing**: Added a setting to omit the `<CORE LENGTH TARGETS>` section from the NPC prompt when importing character cards.
+- **Appearance/Species Field**: Renamed Appearance field to Appearance/Species for clarity.
+- **Programmatic CORE Block Protection**: Cleanup/consolidate tools now programmatically protect `[CORE]` blocks from modification.
+- **Portrait Settings Menu Unconditional**: Portrait settings menu now shows unconditionally on NPC portrait click.
+
+### Fixed
+- **Prevent NPC Creator Duplicates**: NPC Creator no longer duplicates existing entries.
+- **Panel Position Drift**: Fixed panel position drift on F5 / code reload.
+
+
+## [3.16.13] - 2026-06-25
+
+### Changed
+- **Significant NPC Filtering**: Updated the core NPC instruction template to instruct the model to only record characters who are significant to the campaign (excluding minor nameless NPCs, generic random enemies, or nameless bartenders).
+- **Combat Granularity and Summarization Rules**: Reinforced prompts across NPC instructions, event modules, main Researcher Agent update rules, and the Lorebook Archivist cleanup/consolidation rules to forbid granular, turn-by-turn combat status logging (HP updates, condition tracking, minor actions). Instructed models to summarize combat history into macro-level outcomes while explicitly preserving the combat initiation (e.g. who/what attacked {{user}}), progress updates every ~5 rounds for long-running fights, and final resolution.
+
+## [3.16.10] - 2026-06-25
+
+### Added
+- **Restored NPC Relationship Bars**: Reverted the removal of the NPC Relationship Bars feature, bringing it back in FULL.
+
+
+## [3.16.9] - 2026-06-25
+
+### Fixed
+- **Character Card Converter Toggle**: Added missing tree render refresh triggers on toggle checkbox state change, ensuring that toggling the setting immediately hides or shows the "Add NPC from Character Card" action button.
+
+## [3.16.7] - 2026-06-25
+
+### Changed
+- **Plain Text Action Prompts**: Instructed text-mode agent prompts (both for main research agent and cleanup agent) not to wrap `Action:` or `Thought:` labels in markdown bold/italic tags, reinforcing clean formatting from the model side as well.
+
+## [3.16.6] - 2026-06-25
+
+### Changed
+- **Robust Text Action Parsing**: Updated the `parseTextAction` regex to tolerate markdown formatting (bold, italic, list hyphens, or headers, e.g. `**Action:**` or `### Action:`) in the model's text-mode response. This prevents unnecessary nudging retry loops and saves context/API tokens.
+
+## [3.16.0] - 2026-06-24
+
+### Changed
+- **{{user}} Macro Reinforcement**: Added explicit rules to `buildNpcInstruction` and the general system prompt (`systemPromptTemplate`'s `updating_entities` block) telling the AI model to always use the exact macro string `{{user}}` when referring to the player character/user, instead of writing "user" or "player" in plain text.
+
+## [3.15.0] - 2026-06-24
+
+### Added
+- **Interactive NPC Relationship Editor**: Added sliders to the NPC detail popup (View NPC card) enabling direct, manual adjustments to the Friendship and Affection levels from -100 to +100.
+- **Visual Separation of Core Identity and Dynamic History**: Split the parsed NPC description inside the details popup into distinct "Core Identity (Immutable)" and "Campaign History & Dynamic Lore" sections.
+- **Styled Timestamps**: Formatted timestamped entries inside the Campaign History section with high-contrast, inline badges.
+
+### Changed
+- **Strict CORE Block Guidelines**: Instructed the NPC AI model to start its output directly with the `[CORE]` block and avoid prepending timestamps or dates before the tag.
+
+## [3.14.0] - 2026-06-24
+
+### Changed
+- **NPC Lore Identity Prompts**:
+  - Rebuilt the NPC generation prompt limits: moved from hard token budgets to section-specific word budget targets.
+  - Wrapped `CORE_FORMAT` contract details and `CORE LENGTH TARGETS` settings inside XML tags within the built-in system prompt to guide the LLM's adherence to template layouts and length limits.
+
+## [3.11.4] - 2026-06-24
+
+### Added
+- **Apply Sysprompt Button**:
+  - Restored the **Apply Sysprompt** button under the Narrator Configuration block in the General & Visuals menu.
+
+## [3.11.3] - 2026-06-24
+
+### Changed
+- **Sync with Main (3.8.10)**:
+  - Integrated settings drawer restructuring, library reset button, automated prompt application on toggle, and experimental features removal.
+
+## [3.11.2] - 2026-06-24
+
+### Fixed
+- **System Prompts Constraints**:
+  - Removed `[RNG_QUEUE v6.0_PROPER] is ONLY used in active combat` constraint from `sysprompt_legacy.txt` and its fallback copy in `constants.js` under `<RNG_constraints>`.
+
+## [3.11.1] - 2026-06-24
+
+### Fixed
+- **System Prompts Footer**:
+  - Restructured `<end_of_output_footer>` to explicitly instruct the narrator to output ONLY {{user}}'s current HP, XP, level, and location, preventing the display of other party members' stats.
+
+## [3.11.0] - 2026-06-24
+
+### Added
+- **Protect Persistent NPC Lore Sections**: Implemented wrapping of persistent NPC lore sections (Appearance, Personality, Brief Background, Habits/Behaviors, Relationship) inside `[LORE] ... [/LORE]` tags to protect them from cleanup passes.
+- **UI Tag Hiding**: Programmed the UI manifest synopses and structured sections rendering to automatically strip `[LORE]` tags, keeping the presentation clean.
+- **Cleanup Tool Lore Protection**: Updated the cleanup agent instructions to strictly preserve `[LORE] ... [/LORE]` blocks unchanged and automatically wrap legacy untagged NPC entries.
+- **NPC Inline Quick-View**: Enabled NPC card expansion inline on single-click (matching Location behavior) to easily read full campaign logs and history, adding a new dedicated `View NPC card` button to the card actions overlay for rich details popup access.
+- **Relationship Key Normalization**: Resolved a pre-existing layout bug by normalizing the `Relationship with {{user}}` section name to `Relationship`, restoring correct icon and coloring rendering in the UI.
+
+## [3.10.0] - 2026-06-23
+
+NPCs V2.
+
+**Revamped NPC AI Prompts**: The underlying instructions driving NPC generation have been rebuilt from the ground up to ensure the AI adheres strictly to your new token budgets and concisely captures the character's essence without purple prose.
+
+**Revamped NPC Pop Up menu**: The underlying instructions driving NPC generation have been rebuilt from the ground up to ensure the AI adheres strictly to your new token budgets and concisely captures the character's essence without purple prose.
+
+**Add NPC from Character Card (Experimental feature, disabled by default)**: A simple converter that allows inserting any character card you have on your SillyTavern folder into an on-going campaign, with an option to use AI to better fit it into the story. It's disabled by default because letting the Lorebook Agent create genuine NPCs is recommended over this, but is there in case you *really* want to see a card you like in the Multihog framework.
+
+**AI Portrait Generation**: High-quality AI portrait generation is now seamlessly integrated! Instantly generate visual representations of your NPCs and characters to bring your campaign to life.
+
+## [3.8.11] - 2026-06-24
+
+### Added
+- **Apply Sysprompt Button**:
+  - Restored the **Apply Sysprompt** button under the Narrator Configuration block in the General & Visuals menu.
+
+## [3.8.10] - 2026-06-24
+
+### Removed
+- **Outdated Description**:
+  - Removed outdated description text in the **Sysprompt Editor** drawer.
+
+## [3.8.9] - 2026-06-24
+
+### Added
+- **Library Reset Button**:
+  - Added a red reset button (`#rpg_tracker_btn_reset_sysprompt_library`) inside the **Sysprompt Editor** drawer, placed side-by-side with the Custom Sysprompt Library button. This button disables all custom sections in the library and immediately auto-applies the default system prompt template based on active settings.
+
+## [3.8.8] - 2026-06-24
+
+### Removed
+- **Apply Sysprompt Button**:
+  - Removed the **Apply Sysprompt** button from the main settings (General & Visuals) as well, completely removing manual sysprompt application buttons from the extension UI.
+
+### Changed
+- **Auto-Apply on Custom Sysprompt Toggle**:
+  - Configured the **Custom Sysprompt Mode** checkbox to immediately re-apply the correct system prompt according to active settings when it is unchecked.
+
+## [3.8.7] - 2026-06-24
+
+### Removed
+- **Sysprompt Editor Button**:
+  - Removed the duplicate **Apply Sysprompt** button from the **Sysprompt Editor** (SUB-DRAWER 5) completely, leaving it solely under the **Narrator Configuration** block in **General & Visuals**.
+  - Renamed the drawer from **Sysprompt Editor & Reset** to **Sysprompt Editor** to reflect the button removals.
+
+## [3.8.6] - 2026-06-24
+
+### Changed
+- **Sysprompt Reset Button Relocation**:
+  - Moved the **Reset All & Apply** button from under the **Narrator Configuration** block to be positioned directly above the **FACTORY RESET** button at the bottom of the **General & Visuals** sub-drawer.
+  - Made the general **Apply Sysprompt** button under the **Narrator Configuration** block full-width.
+
+## [3.8.5] - 2026-06-24
+
+### Removed
+- **Experimental Features**:
+  - Completely stripped the **Experimental Features** sub-drawer from settings.html.
+  - Removed all corresponding Javascript logic, default options, and UI bindings for **Half Review Mode** and **Full Review Mode**.
+
+## [3.8.4] - 2026-06-24
+
+### Changed
+- **Sysprompt Button Relocations**:
+  - Relocated the **Reset All & Apply** button out of the "Sysprompt Editor & Reset" drawer (SUB-DRAWER 5) and into "General & Visuals" (SUB-DRAWER 1), side-by-side with a duplicate **Apply Sysprompt** button below the Narrator Configuration system prompt builder block.
+  - Renamed the SUB-DRAWER 5 section header to "Apply Sysprompt" to match its updated content.
+
+## [3.8.3] - 2026-06-24
+
+### Changed
+- **Sysprompt Settings Drawer Restructure**:
+  - Renamed the drawer to "Sysprompt Editor & Reset".
+  - Moved the AI-Assisted Section Builder and Custom Sysprompt Library sections to the top of the drawer.
+  - Consolidated the Normal and Legacy update buttons into a single "Apply Sysprompt" button that dynamically chooses between `sysprompt.txt` and `sysprompt_legacy.txt` based on the user's active RNG settings.
+
+## [3.8.2] - 2026-06-24
+
+### Fixed
+- **System Prompts Constraints**:
+  - Removed `[RNG_QUEUE v6.0_PROPER] is ONLY used in active combat` constraint from `sysprompt_legacy.txt` and its fallback copy in `constants.js` under `<RNG_constraints>`.
 ## [3.8.1] - 2026-06-23
 
 ### Fixed

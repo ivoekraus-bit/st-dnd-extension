@@ -10,7 +10,14 @@
  */
 
 import { getSettings } from './state-manager.js';
-import { DEFAULT_STOCK_PROMPTS } from './constants.js';
+import { DEFAULT_STOCK_PROMPTS, resolveTimePromptKey } from './constants.js';
+import {
+    partitionResolvedCombatants,
+    stripResolvedCombatantsFromMemo,
+} from './src/state/combat-persistence.js';
+
+const DEFEATED_COMBATANTS_PROMPT_RULE = '- DEFEATED COMBATANTS: Mark defeated enemies as Status: Defeated. Do not omit them from the memo.';
+const COMBAT_SIDES_PROMPT_RULE = '- COMBAT SIDES: Group combatants under ENEMIES: and NON-PARTY ALLIES: headers, with enemies first. NON-PARTY ALLIES are allied combatants who are NOT listed in [PARTY]. Never put any [PARTY] member in [COMBAT]. Include both headers when non-party allies are present; otherwise include ENEMIES: only.';
 
 // ── String utilities ──────────────────────────────────────────────────────────
 
@@ -22,24 +29,21 @@ import { DEFAULT_STOCK_PROMPTS } from './constants.js';
  * @returns {number}
  */
 function computeFrustrationLocal(quest, currentTime) {
-    if (quest.status !== 'active' && quest.status !== 'past deadline') return 0;
+    if (isEmergentQuest(quest)) return null;
+    if (quest.status !== 'active' && quest.status !== 'past deadline') return null;
+    if (!questHasEffectiveDeadline(quest)) return null;
+
     const accepted = parseInWorldTime(quest.accepted_time);
     const current  = parseInWorldTime(currentTime);
-    if (!accepted || !current) return 0;
+    if (!accepted || !current) return null;
 
     const elapsed = current - accepted;
     if (elapsed <= 0) return -1; // Just accepted — NPC is optimistic
 
     const coeff = Math.max(0.1, quest.frustration_coefficient ?? 1.0);
-
-    if (!quest.deadline_time || String(quest.deadline_time).toLowerCase() === 'none') {
-        // No deadline: NPC remains neutral regardless of time elapsed
-        return 0;
-    }
-
     const deadline = parseInWorldTime(quest.deadline_time);
     const window   = deadline - accepted;
-    if (window <= 0) return 1;
+    if (window <= 0) return null;
 
     const ratio = elapsed / window;
     
@@ -61,6 +65,9 @@ function computeFrustrationLocal(quest, currentTime) {
  */
 export function getQuestMood(quest, currentTime, showFrustration) {
     const frust = computeFrustrationLocal(quest, currentTime);
+    if (frust == null) {
+        return { label: '', color: '#aaaaaa', value: null };
+    }
     let color = '#00cc77';
     let label = 'Pleased';
     if (showFrustration) {
@@ -86,6 +93,39 @@ export function escapeRegex(str) {
 
 export function escapeHtml(str) {
     return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/** Reverse basic HTML entities produced by escapeHtml (and dataset / innerHTML text). */
+export function decodeHtml(str) {
+    if (!str) return '';
+    return String(str)
+        .replace(/&quot;/g, '"')
+        .replace(/&#0?39;/g, "'")
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&amp;/g, '&');
+}
+
+/**
+ * Strips bare timestamp-only lines and a leading timestamp immediately before [CORE].
+ * Used when saving or displaying lorebook record content.
+ * @param {string} content
+ * @returns {string}
+ */
+export function sanitizeLorebookRecordContent(content) {
+    if (!content) return '';
+    let s = content.trim();
+    s = s.replace(/^\s*\[[^\]]+\]\s*(?=\[CORE\])/i, '');
+    s = s.split('\n')
+        .filter(line => {
+            const trimmed = line.trim();
+            if (/^\[\/?core\]$/i.test(trimmed)) return true;
+            return !/^\[[^\]]+\]\s*$/.test(trimmed);
+        })
+        .join('\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+    return s;
 }
 
 /** Wraps parenthetical groups in a highlight span. */
@@ -116,22 +156,52 @@ export function extractCurrentTimeStr(timeBlockContent) {
 }
 
 /**
- * Converts in-world time strings to a comparable numeric value (minutes since Day 1, 00:00).
- * Expected formats: "08:00 AM, Day 1", "Day 4", "10:00 PM"
+ * True when Last Rest has no real timestamp (new character, never rested, etc.).
+ * @param {string} str
+ * @returns {boolean}
+ */
+export function isRestTimeUnset(str) {
+    const v = String(str || '').trim();
+    if (!v) return true;
+    return /^(?:N\/A|NA|NONE|NEVER|NULL|—|-)$/i.test(v);
+}
+
+/**
+ * Converts in-world time strings to a comparable numeric value (minutes since Day 1/epoch date, 00:00).
+ * Expected formats: "08:00 AM, Day 1", "08:00 AM, 01/01/2026", "Day 4", "10:00 PM"
  * @param {string} str 
- * @returns {number}
+ * @returns {number|null} Minutes since epoch, or null when the string has no parseable date/time.
  */
 export function parseInWorldTime(str) {
-    if (!str) return 0;
+    if (!str) return null;
     if (str.includes('\n')) {
         str = extractCurrentTimeStr(str);
     }
+    if (isRestTimeUnset(str)) return null;
+    const ddmmyyMatch = str.match(/\b(\d{1,2})\/(\d{1,2})\/(\d+)\b/);
     const dayMatch = str.match(/(?:Day|D)\s*(\d+)/i);
     const timeMatch = str.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
     
-    let d = dayMatch ? parseInt(dayMatch[1], 10) : 1;
-    let h = 0, m = 0;
+    let d = 1;
+    if (ddmmyyMatch) {
+        const dd = parseInt(ddmmyyMatch[1], 10);
+        const mm = parseInt(ddmmyyMatch[2], 10);
+        let yy = parseInt(ddmmyyMatch[3], 10);
+        if (yy < 100) yy += 2000;
+
+        // Fixed ancient epoch: 0001-01-01 — independent of any user config.
+        // All reasonable calendar years (500–9999 AD) map to large positive numbers.
+        const dateObj = new Date(0, 0, 1);
+        dateObj.setFullYear(yy, mm - 1, dd);
+        const epochObj = new Date(0, 0, 1);
+        epochObj.setFullYear(1, 0, 1);
+        const diffDays = Math.round((dateObj - epochObj) / (1000 * 60 * 60 * 24));
+        d = diffDays + 1;
+    } else if (dayMatch) {
+        d = parseInt(dayMatch[1], 10);
+    }
     
+    let h = 0, m = 0;
     if (timeMatch) {
         h = parseInt(timeMatch[1], 10);
         m = parseInt(timeMatch[2], 10);
@@ -142,8 +212,90 @@ export function parseInWorldTime(str) {
         }
     }
     
-    if (!dayMatch && !timeMatch) return 0;
+    if (!ddmmyyMatch && !dayMatch && !timeMatch) return null;
     return (d - 1) * 1440 + h * 60 + m;
+}
+
+const NO_DEADLINE_SENTINELS = new Set([
+    'none', 'n/a', 'na', 'no deadline', 'no time limit', '-', '—', 'null', 'unlimited', 'tbd', 'unknown',
+]);
+
+/**
+ * Whether a quest has a real, parseable deadline that can drive frustration math.
+ * @param {object} quest
+ * @returns {boolean}
+ */
+export function questHasEffectiveDeadline(quest) {
+    const raw = quest?.deadline_time;
+    if (raw == null) return false;
+    const t = String(raw).trim();
+    if (!t) return false;
+    if (NO_DEADLINE_SENTINELS.has(t.toLowerCase())) return false;
+
+    const deadline = parseInWorldTime(t);
+    if (deadline == null) return false;
+
+    const accepted = parseInWorldTime(quest.accepted_time);
+    if (accepted != null && deadline <= accepted) return false;
+
+    return true;
+}
+
+const EMERGENT_GIVER_RE = /^(self|player|\{\{user\}\}|emergent|none|n\/a|na|-|—)$/i;
+
+/**
+ * Emergent / self-imposed quests have no NPC expecting completion — no FRUSTRATION_COEFF or MOOD.
+ * @param {object} quest
+ * @returns {boolean}
+ */
+export function isEmergentQuest(quest) {
+    if (!quest) return false;
+    if (quest.emergent === true) return true;
+    if (String(quest.type || '').trim().toLowerCase() === 'emergent') return true;
+    return EMERGENT_GIVER_RE.test(String(quest.giver_name || '').trim());
+}
+
+/**
+ * Formats in-world minutes since epoch into a readable string using active settings (12h/24h, Day/Date).
+ * @param {number} totalMins
+ * @returns {string}
+ */
+export function formatInWorldTime(totalMins) {
+    if (totalMins < 0) return 'Never';
+    const settings = getSettings();
+    const use24h = !!settings.use24hTime;
+    const useDdMmYy = !!settings.useDdMmYyFormat;
+
+    const dayIndex = Math.floor(totalMins / 1440) + 1;
+    const remMinutes = totalMins % 1440;
+    const h24 = Math.floor(remMinutes / 60);
+    const m = remMinutes % 60;
+
+    let dateStr = '';
+    if (useDdMmYy) {
+        // Fixed ancient epoch: 0001-01-01 — same reference as parseInWorldTime.
+        const date = new Date(0, 0, 1);
+        date.setFullYear(1, 0, 1 + (dayIndex - 1));
+        const dd = String(date.getDate()).padStart(2, '0');
+        const mm = String(date.getMonth() + 1).padStart(2, '0');
+        let yyyy = String(date.getFullYear());
+        if (yyyy.length < 4) yyyy = yyyy.padStart(4, '0');
+        dateStr = `${dd}/${mm}/${yyyy}`;
+    } else {
+        dateStr = `Day ${dayIndex}`;
+    }
+
+    let timeStr = '';
+    if (use24h) {
+        timeStr = `${String(h24).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+    } else {
+        const suffix = h24 >= 12 ? 'PM' : 'AM';
+        let h12 = h24 % 12;
+        if (h12 === 0) h12 = 12;
+        timeStr = `${String(h12).padStart(2, '0')}:${String(m).padStart(2, '0')} ${suffix}`;
+    }
+
+    return `${dateStr}, ${timeStr}`;
 }
 
 
@@ -216,11 +368,25 @@ export function deduplicateMemo(memo) {
  */
 export function mergeMemo(currentMemo, aiOutput) {
     const settings = getSettings();
+    const benchCommands = benchCommandsEnabled()
+        ? extractBenchCommands(aiOutput)
+        : { benches: [], unbenches: [] };
 
     const tagPattern = /\[([^\]\/][^\]]*)\]([\s\S]*?)\[\/\1\]/gi;
     const matches = [...aiOutput.matchAll(tagPattern)];
 
+    const hasBenchWork = benchCommands.benches.length > 0 || benchCommands.unbenches.length > 0;
+
     if (matches.length === 0) {
+        if (hasBenchWork) {
+            if (settings.debugMode) {
+                console.log('[RPG Tracker] mergeMemo: no closed [TAG] blocks but [BENCH]/[UNBENCH] found — applying bench splice');
+            }
+            return hydratePartyRelocationStats(
+                currentMemo,
+                applyBenchCommands(currentMemo, currentMemo, benchCommands),
+            );
+        }
         console.warn("[RPG Tracker] No valid [TAG]...[/TAG] blocks found in model output — treating as no-change. Output was:", aiOutput);
         return currentMemo;
     }
@@ -233,24 +399,28 @@ export function mergeMemo(currentMemo, aiOutput) {
         const tag = match[1].trim();
         const newContent = match[2].trim();
 
-        // [QUESTS] block — route to appropriate handler based on mode
-        if (tag.toUpperCase() === 'QUESTS') {
-            const s = getSettings();
-            if (s.questLegacyMode) {
-                // Legacy: state model wrote the full text block.
-                // Let the standard replacement logic below integrate it into the memo string.
-                // The memo text is the single source of truth — no separate settings.quests needed.
-            } else {
-                // Tool mode: state model emits a diff JSON.
-                // Apply the diff to our local 'memo' string being built
-                memo = mergeQuestUpdates(newContent, memo);
-                continue;
+        if (tag.toUpperCase() === 'BENCHED PARTY' && isBenchCommandOnlyContent(newContent)) {
+            if (settings.debugMode) {
+                console.log(`[RPG Tracker] mergeMemo: [${tag}] command-only — deferring to applyBenchCommands`);
             }
+            continue;
         }
 
         const isRemoval = /^(?:REMOVED|EXPIRED|CLEARED|NONE|END_COMBAT)$/i.test(newContent);
 
         const escapedTag = escapeRegex(tag);
+        let mergedContent = newContent;
+        if (tag.toUpperCase() === 'COMBAT') {
+            if (isRemoval) {
+                settings.combatDefeatedUi = [];
+            } else {
+                const hadActiveCombat = /\[COMBAT\][\s\S]*?\[\/COMBAT\]/i.test(memo);
+                const priorArchive = hadActiveCombat ? settings.combatDefeatedUi : [];
+                const partitioned = partitionResolvedCombatants(newContent, priorArchive);
+                mergedContent = partitioned.activeContent;
+                settings.combatDefeatedUi = partitioned.defeatedCombatants;
+            }
+        }
         const existingPattern = new RegExp(
             `\\s*\\[${escapedTag}\\][\\s\\S]*?\\[\\/${escapedTag}\\]`,
             'i'
@@ -264,7 +434,7 @@ export function mergeMemo(currentMemo, aiOutput) {
             memo = memo.replace(existingPattern, "").trim();
             if (settings.debugMode) console.log(`[RPG Tracker] mergeMemo: [${tag}] REMOVED`);
         } else {
-            const fullBlock = `[${tag}]\n${newContent}\n[/${tag}]`;
+            const fullBlock = `[${tag}]\n${mergedContent}\n[/${tag}]`;
             const before = memo;
             memo = memo.replace(existingPattern, () => '\n\n' + fullBlock);
             if (memo !== before) {
@@ -277,137 +447,12 @@ export function mergeMemo(currentMemo, aiOutput) {
     }
 
     const cleaned = memo.replace(/\n{3,}/g, '\n\n').trim();
-    return deduplicateMemo(cleaned);
-}
-
-/**
- * Applies a constrained {"updates":[...]} diff from the state model.
- * Parses quests from memoText, applies mutations, and returns the updated string.
- * @param {string} jsonText
- * @param {string} [memoText]
- * @returns {string}
- */
-export function mergeQuestUpdates(jsonText, memoText = null) {
-    const settings = getSettings();
-    const target = (memoText !== null) ? memoText : settings.currentMemo;
-    const quests = parseQuestsFromMemo(target);
-    
-    if (!quests.length) return target;
-
-    let parsed;
-    try {
-        parsed = JSON.parse(jsonText);
-    } catch (e) {
-        console.warn('[RPG Tracker] mergeQuestUpdates: invalid JSON in [QUESTS] diff block:', jsonText);
-        return target;
+    const deduped = deduplicateMemo(cleaned);
+    let result = deduped;
+    if (benchCommands.benches.length || benchCommands.unbenches.length) {
+        result = applyBenchCommands(currentMemo, result, benchCommands);
     }
-
-    const updates = Array.isArray(parsed?.updates) ? parsed.updates : [];
-    if (!updates.length) return target;
-
-    const mods = settings.syspromptModules || {};
-    const isDeadlines = !!mods.questsDeadlines;
-    const isFrustration = !!mods.questsFrustration;
-
-    let changed = false;
-    for (const update of updates) {
-        let quest = quests.find(q => q.id === update.id);
-        let objectiveDirectUpdate = null;
-        if (!quest) {
-            // Check if update.id is an objective ID belonging to some quest
-            for (const q of quests) {
-                const foundObj = q.objectives?.find(o => o.id === update.id);
-                if (foundObj) {
-                    quest = q;
-                    objectiveDirectUpdate = foundObj;
-                    break;
-                }
-            }
-        }
-
-        if (!quest) continue;
-        if (quest.status === 'failed') continue;
-
-        if (objectiveDirectUpdate) {
-            if (update.status && ['active', 'completed', 'failed'].includes(update.status)) {
-                objectiveDirectUpdate.status = update.status;
-                changed = true;
-            }
-            if (typeof update.progress === 'number') {
-                objectiveDirectUpdate.progress = update.progress;
-                changed = true;
-            }
-            continue;
-        }
-
-        if (update.status && ['active', 'completed', 'past deadline', 'failed'].includes(update.status)) {
-            let resolvedStatus = update.status;
-
-            // Frustration ON: deadline expiry → 'past deadline', not 'failed' (AI may get this wrong)
-            if (isFrustration && resolvedStatus === 'failed' && quest.deadline_time && quest.status === 'active') {
-                resolvedStatus = 'past deadline';
-            }
-            // Deadlines ON, Frustration OFF: 'past deadline' is invalid → promote to 'failed'
-            if (isDeadlines && !isFrustration && resolvedStatus === 'past deadline') {
-                resolvedStatus = 'failed';
-            }
-
-            quest.status = resolvedStatus;
-            changed = true;
-        }
-
-        if (Array.isArray(update.objectives)) {
-            for (const objUpdate of update.objectives) {
-                const obj = objUpdate.id ? quest.objectives.find(o => o.id === objUpdate.id) : null;
-                if (obj) {
-                    if (objUpdate.status && ['active', 'completed', 'failed'].includes(objUpdate.status)) {
-                        obj.status = objUpdate.status;
-                        changed = true;
-                    }
-                    if (typeof objUpdate.progress === 'number') {
-                        obj.progress = objUpdate.progress;
-                        changed = true;
-                    }
-                } else if (objUpdate.text) {
-                    // Add new objective
-                    const maxIdx = quest.objectives.reduce((max, o) => {
-                        const m = o.id.match(/^obj_(\d+)$/);
-                        if (m) {
-                            const val = parseInt(m[1], 10);
-                            return val > max ? val : max;
-                        }
-                        return max;
-                    }, -1);
-                    const newId = `obj_${maxIdx + 1}`;
-                    const newObj = {
-                        id: newId,
-                        text: objUpdate.text,
-                        required: objUpdate.required !== false,
-                        status: objUpdate.status && ['active', 'completed', 'failed'].includes(objUpdate.status) ? objUpdate.status : 'active'
-                    };
-                    if (typeof objUpdate.total === 'number') {
-                        newObj.total = objUpdate.total;
-                    }
-                    if (typeof objUpdate.progress === 'number') {
-                        newObj.progress = objUpdate.progress;
-                    }
-                    quest.objectives.push(newObj);
-                    changed = true;
-                }
-            }
-        }
-    }
-
-    if (changed) {
-        if (settings.debugMode) console.log('[RPG Tracker] mergeQuestUpdates: applied quest state changes.');
-        const result = writeQuestsToMemo(quests, target);
-        if (memoText === null) {
-            SillyTavern.getContext().saveSettingsDebounced();
-        }
-        return /** @type {string} */ (result);
-    }
-
-    return target;
+    return hydratePartyRelocationStats(currentMemo, result);
 }
 
 /**
@@ -427,8 +472,8 @@ export function writeQuestsToMemo(quests, memoText = null) {
     const pattern = new RegExp(`\\s*\\[${escapedTag}\\][\\s\\S]*?\\[\\/${escapedTag}\\]`, 'i');
     const blockExists = pattern.test(target);
 
-    // Filter out completed quests to save AI context space
-    const activeQuests = quests.filter(q => q.status !== 'completed');
+    // Filter out archived quests to save AI context space
+    const activeQuests = quests.filter(q => !isArchivedQuestStatus(q.status));
 
     // If no active quests, remove the block if present — never insert an empty one
     if (!activeQuests || !activeQuests.length) {
@@ -438,9 +483,7 @@ export function writeQuestsToMemo(quests, memoText = null) {
         return;
     }
 
-    const content = settings.questLegacyMode
-        ? serializeQuestsToText(activeQuests)
-        : JSON.stringify(activeQuests, null, 2);
+    const content = serializeQuestsToText(activeQuests);
 
     const block = `\n\n[${tag}]\n${content}\n[/${tag}]`;
 
@@ -464,50 +507,521 @@ export function syncQuestsToMemo() {
 }
 
 /**
- * Strips completed quests from the [QUESTS] block inside a raw memo string.
- * Completed quests are kept in settings.quests for UI display but must NEVER
- * appear in the Prior Memo sent to the AI — they are read-only history.
- * Works for both legacy plain-text and JSON quest formats.
- * Pure function — no side effects.
+ * Whether a quest status is archived (removed from memo, shown in completed/failed UI).
+ * @param {string} [status]
+ */
+export function isArchivedQuestStatus(status) {
+    const s = String(status || '').toLowerCase().trim();
+    return s === 'completed' || s === 'failed' || s === 'past deadline';
+}
+
+/**
+ * Split plain-text [QUESTS] inner content into per-quest blocks (QUEST: … boundaries).
+ * @param {string} content
+ * @returns {string[]|null} null if not plain-text quest format
+ */
+function splitQuestTextBlocks(content) {
+    if (!content || !/^QUEST:/m.test(content)) return null;
+    return content.split(/^(?=QUEST:\s)/m).filter(b => b.trim());
+}
+
+/** @param {string} block */
+function questTextBlockIsArchived(block) {
+    const m = block.match(/^\s*STATUS:\s*(.+)$/im);
+    if (!m) return false;
+    return isArchivedQuestStatus(m[1].trim());
+}
+
+/**
+ * Strips archived quests (completed/failed/past deadline) from the [QUESTS] block.
+ * Uses QUEST: line boundaries so only individual quest blocks are removed.
  * @param {string} memoText
  * @returns {string}
  */
-export function stripCompletedQuestsFromMemo(memoText) {
+export function stripArchivedQuestsFromMemo(memoText) {
     if (!memoText) return memoText;
     const questBlockRe = /\[QUESTS\]([\s\S]*?)\[\/QUESTS\]/i;
     const match = memoText.match(questBlockRe);
     if (!match) return memoText;
 
     const content = match[1].trim();
+    const blocks = splitQuestTextBlocks(content);
 
-    // ── Legacy plain-text format ──────────────────────────────────────────────
-    // The AI writes the full [QUESTS] text block directly (questLegacyMode=true).
-    // mergeMemo pastes it into currentMemo verbatim — no filter runs at write time.
-    // We split on QUEST: boundaries and drop any block with STATUS: completed.
-    if (/^QUEST:/m.test(content)) {
-        // Split on the start of each "QUEST:" line, keeping the delimiter.
-        // content already starts with "QUEST:", so no prepend needed.
-        const questBlocks = content.split(/^(?=QUEST:)/m).filter(Boolean);
-        const active = questBlocks.filter(block => !/^\s*STATUS:\s*completed\s*$/im.test(block));
-        if (active.length === questBlocks.length) return memoText; // nothing to strip
+    if (blocks) {
+        const active = blocks.filter(b => !questTextBlockIsArchived(b));
+        if (active.length === blocks.length) return memoText;
         const newContent = active.map(b => b.trim()).join('\n\n').trim();
-        if (!newContent) return memoText.replace(questBlockRe, '').replace(/\n{3,}/g, '\n\n').trim();
+        if (!newContent) {
+            return memoText.replace(questBlockRe, '').replace(/\n{3,}/g, '\n\n').trim();
+        }
         return memoText.replace(questBlockRe, `[QUESTS]\n${newContent}\n[/QUESTS]`);
     }
 
-    // ── JSON / Tool-call format ───────────────────────────────────────────────
-    // writeQuestsToMemo already filters completed at write time, so this branch
-    // is a safety net for any edge case that bypasses that path.
+    // JSON / tool-call format fallback
     try {
         const parsed = JSON.parse(content);
         const quests = Array.isArray(parsed) ? parsed : (parsed.quests || []);
-        const active = quests.filter(q => q.status !== 'completed');
-        if (active.length === quests.length) return memoText; // nothing to strip
+        const active = quests.filter(q => !isArchivedQuestStatus(q.status));
+        if (active.length === quests.length) return memoText;
         if (!active.length) return memoText.replace(questBlockRe, '').replace(/\n{3,}/g, '\n\n').trim();
         return memoText.replace(questBlockRe, `[QUESTS]\n${JSON.stringify(active, null, 2)}\n[/QUESTS]`);
     } catch {
-        return memoText; // unparseable — leave it alone
+        return memoText;
     }
+}
+
+/** @deprecated Use stripArchivedQuestsFromMemo */
+export const stripCompletedQuestsFromMemo = stripArchivedQuestsFromMemo;
+
+// ── Benched Party: [BENCH]/[UNBENCH] commands + context compaction ────────────
+//
+// Tracker emits lean commands; code splices full stat sheets between [PARTY] and
+// [BENCHED PARTY]. Full stat sheets live in the persisted memo; LLM context only
+// needs name + benching reason while a member stays benched.
+
+// Tracker output sometimes wraps [BENCH]/[UNBENCH] commands in a list bullet
+// (e.g. "- [BENCH] Name — reason") even though the stock prompt doesn't show one.
+// Strip any leading bullet before matching so formatting drift doesn't cause the
+// command to be missed entirely and fall through to literal-block persistence.
+const LEADING_BULLET_RX = /^\s*[-*+•–—]\s*(?=\[)/;
+const BENCH_CMD_RX = /^\[BENCH\]\s*(.+?)(?:\s*[—–-]\s*(.+))?$/i;
+const UNBENCH_CMD_RX = /^\[UNBENCH\]\s*(.+)$/i;
+
+function stripLeadingBullet(line) {
+    return line.replace(LEADING_BULLET_RX, '');
+}
+
+function benchCommandsEnabled() {
+    const settings = getSettings();
+    return settings.modules?.['benched party'] !== false && settings.modules?.party !== false;
+}
+
+/** @returns {{ benches: {name: string, reason: string}[], unbenches: string[] }} */
+export function extractBenchCommands(aiOutput) {
+    const benches = [];
+    const unbenches = [];
+    for (const line of (aiOutput || '').split('\n')) {
+        const trimmed = stripLeadingBullet(line.trim());
+        const bench = trimmed.match(BENCH_CMD_RX);
+        if (bench) {
+            benches.push({ name: bench[1].trim(), reason: (bench[2] || '').trim() });
+            continue;
+        }
+        const unbench = trimmed.match(UNBENCH_CMD_RX);
+        if (unbench) unbenches.push(unbench[1].trim());
+    }
+    return { benches, unbenches };
+}
+
+function isBenchCommandOnlyContent(content) {
+    if (!content || /^(?:REMOVED|EXPIRED|CLEARED|NONE)$/i.test(content.trim())) return false;
+    const lines = content.trim().split('\n').map(l => stripLeadingBullet(l.trim())).filter(Boolean);
+    if (!lines.length) return false;
+    return lines.every(l => /^\[(?:BENCH|UNBENCH)\]/i.test(l));
+}
+
+function resolveMemberEntry(entries, queryName) {
+    const q = (queryName || '').trim().toLowerCase();
+    if (!q) return null;
+    for (const entry of entries) {
+        if (memberNameKey(entry.name) === q) return entry;
+    }
+    for (const entry of entries) {
+        const nk = memberNameKey(entry.name);
+        if (nk.startsWith(q + ' ') || nk.startsWith(q + '(')) return entry;
+        if (entry.name.toLowerCase().startsWith(q)) return entry;
+    }
+    return null;
+}
+
+function rebuildPartyBlockContent(entries) {
+    return entries.map(entry => {
+        const lines = [...entry.lines];
+        if (lines.length && !/^-/.test(lines[0])) lines[0] = `- ${lines[0]}`;
+        return lines.join('\n');
+    }).join('\n');
+}
+
+function removeMemberFromBlock(blockContent, queryName) {
+    const entries = splitPartyMemberEntries(blockContent);
+    const removed = resolveMemberEntry(entries, queryName);
+    if (!removed) return { blockContent, removed: null, empty: false };
+    const remaining = entries.filter(e => e !== removed);
+    return {
+        blockContent: rebuildPartyBlockContent(remaining),
+        removed,
+        empty: !remaining.length,
+    };
+}
+
+function setEntryStatus(entry, statusText) {
+    const lines = [...entry.lines];
+    const idx = lines.findIndex(l => /^status:/i.test(l));
+    const newLine = `Status: ${statusText}`;
+    if (idx >= 0) lines[idx] = newLine;
+    else lines.push(newLine);
+    return { name: entry.name, lines };
+}
+
+function clearBenchedStatus(entry) {
+    const lines = [...entry.lines];
+    const idx = lines.findIndex(l => /^status:/i.test(l));
+    if (idx >= 0 && /benched\s*\(/i.test(lines[idx])) {
+        lines[idx] = 'Status: Healthy';
+    }
+    return { name: entry.name, lines };
+}
+
+function getBenchTimestamp(memo) {
+    const timeBlock = parseMemoBlockContent(memo, 'TIME');
+    return extractCurrentTimeStr(timeBlock) || '';
+}
+
+function blockContentFromMemo(memo, tag) {
+    return parseMemoBlockContent(memo, tag) ?? '';
+}
+
+function findMemberEntry(blockContent, queryName) {
+    if (!blockContent) return null;
+    return resolveMemberEntry(splitPartyMemberEntries(blockContent), queryName);
+}
+
+function benchedMemberKeys(memo) {
+    const content = blockContentFromMemo(memo, 'BENCHED PARTY');
+    if (!content || /^(?:REMOVED|EXPIRED|CLEARED|NONE)$/i.test(content.trim())) return new Set();
+    return new Set(splitPartyMemberEntries(content).map(e => memberNameKey(e.name)));
+}
+
+/** Ensures no member appears in both [PARTY] and [BENCHED PARTY] — benched wins. */
+function dedupePartyAgainstBenched(memo) {
+    const benchedKeys = benchedMemberKeys(memo);
+    if (!benchedKeys.size) return memo;
+
+    const partyContent = blockContentFromMemo(memo, 'PARTY');
+    if (!partyContent) return memo;
+
+    const rawEntries = splitPartyMemberEntries(partyContent);
+    // If the block has content but nothing parsed as a member header (unrecognized custom
+    // format), leave it untouched rather than treating it as an empty roster.
+    if (!rawEntries.length) return memo;
+
+    const entries = rawEntries.filter(e => !benchedKeys.has(memberNameKey(e.name)));
+    if (!entries.length) return stripMemoBlock(memo, 'PARTY');
+    return replaceMemoBlock(memo, 'PARTY', rebuildPartyBlockContent(entries));
+}
+
+/**
+ * Applies [BENCH]/[UNBENCH] commands by splicing full stat entries between blocks.
+ * @param {string} priorMemo
+ * @param {string} memo
+ * @param {{ benches: {name: string, reason: string}[], unbenches: string[] }} commands
+ * @returns {string}
+ */
+export function applyBenchCommands(priorMemo, memo, commands) {
+    if (!commands?.benches?.length && !commands?.unbenches?.length) return memo || '';
+
+    let result = memo || '';
+    const timeStr = getBenchTimestamp(result) || getBenchTimestamp(priorMemo);
+
+    for (const { name, reason } of commands.benches) {
+        const resultParty = blockContentFromMemo(result, 'PARTY');
+        const priorParty = blockContentFromMemo(priorMemo, 'PARTY');
+        let removed = null;
+
+        if (findMemberEntry(resultParty, name)) {
+            const { blockContent: newParty, removed: r, empty } = removeMemberFromBlock(resultParty, name);
+            removed = r;
+            if (empty) result = stripMemoBlock(result, 'PARTY');
+            else if (r) result = replaceMemoBlock(result, 'PARTY', newParty);
+        } else if (priorParty) {
+            // Tracker may have already dropped them from a simultaneous [PARTY] output — pull stats from prior memo.
+            ({ removed } = removeMemberFromBlock(priorParty, name));
+        }
+
+        if (!removed) continue;
+
+        const statusText = reason
+            ? `Benched (${timeStr || 'unknown time'}, ${reason})`
+            : `Benched (${timeStr || 'unknown time'})`;
+        const benchedEntry = setEntryStatus(removed, statusText);
+
+        let benchedContent = blockContentFromMemo(result, 'BENCHED PARTY') || blockContentFromMemo(priorMemo, 'BENCHED PARTY');
+        const benchedEntries = splitPartyMemberEntries(benchedContent).filter(
+            e => memberNameKey(e.name) !== memberNameKey(benchedEntry.name),
+        );
+        benchedEntries.push(benchedEntry);
+        result = replaceMemoBlock(result, 'BENCHED PARTY', rebuildPartyBlockContent(benchedEntries));
+    }
+
+    for (const name of commands.unbenches) {
+        const resultBenched = blockContentFromMemo(result, 'BENCHED PARTY');
+        const priorBenched = blockContentFromMemo(priorMemo, 'BENCHED PARTY');
+        let removed = null;
+        let newBenched = resultBenched;
+
+        if (findMemberEntry(resultBenched, name)) {
+            const attempt = removeMemberFromBlock(resultBenched, name);
+            removed = attempt.removed;
+            newBenched = attempt.blockContent;
+        } else if (priorBenched) {
+            ({ removed, blockContent: newBenched } = removeMemberFromBlock(priorBenched, name));
+        }
+
+        if (!removed) continue;
+
+        if (!newBenched || !splitPartyMemberEntries(newBenched).length) result = stripMemoBlock(result, 'BENCHED PARTY');
+        else result = replaceMemoBlock(result, 'BENCHED PARTY', newBenched);
+
+        const partyEntry = clearBenchedStatus(removed);
+        const resultParty = blockContentFromMemo(result, 'PARTY');
+
+        if (findMemberEntry(resultParty, name)) {
+            // Tracker may have already re-added them to [PARTY] — leave roster as-is, hydrate fixes stats.
+            continue;
+        }
+
+        // Never fall back to priorMemo [PARTY] — a same-turn [BENCH] may have removed members
+        // or stripped the block entirely; prior roster would resurrect them as duplicates.
+        const partyEntries = splitPartyMemberEntries(resultParty).filter(
+            e => memberNameKey(e.name) !== memberNameKey(partyEntry.name),
+        );
+        partyEntries.push(partyEntry);
+        result = replaceMemoBlock(result, 'PARTY', rebuildPartyBlockContent(partyEntries));
+    }
+
+    return dedupePartyAgainstBenched(result);
+}
+
+function parseMemoBlockContent(memo, tag) {
+    const re = new RegExp(`\\[${escapeRegex(tag)}\\]([\\s\\S]*?)\\[\\/${escapeRegex(tag)}\\]`, 'i');
+    const m = (memo || '').match(re);
+    return m ? m[1].trim() : null;
+}
+
+function stripMemoBlock(memo, tag) {
+    const re = new RegExp(`\\s*\\[${escapeRegex(tag)}\\][\\s\\S]*?\\[\\/${escapeRegex(tag)}\\]`, 'i');
+    return (memo || '').replace(re, '').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function replaceMemoBlock(memo, tag, innerContent) {
+    const re = new RegExp(`\\s*\\[${escapeRegex(tag)}\\][\\s\\S]*?\\[\\/${escapeRegex(tag)}\\]`, 'i');
+    const block = `[${tag}]\n${innerContent}\n[/${tag}]`;
+    if (re.test(memo)) return memo.replace(re, () => '\n\n' + block).replace(/\n{3,}/g, '\n\n').trim();
+    return (memo ? memo.trimEnd() + '\n\n' : '') + block;
+}
+
+// Member boundary: ONLY a true entity header line (Name (Class): X/Y HP), never a sub-field
+// like "Combat:" or "Status:". Sub-field lines are continuations of the current entry.
+// Custom templates often wrap the HP value in a rendering marker, e.g.
+// "Alice: ((BAR)) 100/100 HP" or "Alice: ((BARRED - #ff0000)) 100/100 HP" — tolerate any
+// number of ((...)) tokens between the colon and the HP figure so those headers still count
+// as a member boundary instead of silently vanishing from the parsed roster.
+const PARTY_MEMBER_MARKER_TOKEN = '(?:\\(\\([^)]*\\)\\)\\s*)*';
+const PARTY_MEMBER_HEADER_RX = new RegExp(
+    `^\\s*[-*+•–—]?(?:\\s+)?(.+?):\\s*${PARTY_MEMBER_MARKER_TOKEN}([+-]?[\\d,]+)(?:\\/([\\d,]+))?\\s*HP\\b`,
+    'i',
+);
+const PARTY_MEMBER_COMPACT_HEADER_RX = /^\s*[-*+•–—]?(?:\s+)?(.+?):\s*(Benched\s*\([^)]*\)|Benched\b.*)$/i;
+const PARTY_SUBFIELD_LABELS = /^(Combat|Gear|Proficiencies|Attr|Saves|Skills|Traits|Abilities|Spells|HD|Status):/i;
+
+function isPartyMemberHeaderLine(line) {
+    const trimmed = line.trim().replace(/^\s*[-*+•–—](?:\s+|(?=[A-Za-z]))/, '');
+    if (PARTY_SUBFIELD_LABELS.test(trimmed)) return false;
+    return PARTY_MEMBER_HEADER_RX.test(trimmed) || PARTY_MEMBER_COMPACT_HEADER_RX.test(trimmed);
+}
+
+/** @returns {{name: string, lines: string[]}[]} */
+function splitPartyMemberEntries(blockContent) {
+    if (!blockContent || /^(?:REMOVED|EXPIRED|CLEARED|NONE)$/i.test(blockContent.trim())) return [];
+    const rawLines = blockContent.split('\n');
+    const entries = [];
+    let currentName = null;
+    let currentLines = [];
+
+    const headerName = (line) => {
+        const trimmed = line.trim().replace(/^\s*[-*+•–—](?:\s+|(?=[A-Za-z]))/, '');
+        if (!isPartyMemberHeaderLine(line)) return null;
+        const hp = trimmed.match(PARTY_MEMBER_HEADER_RX);
+        if (hp) return hp[1].trim();
+        const compact = trimmed.match(PARTY_MEMBER_COMPACT_HEADER_RX);
+        if (compact) return compact[1].trim();
+        return null;
+    };
+
+    for (const rawLine of rawLines) {
+        if (!rawLine.trim()) continue;
+        const name = headerName(rawLine);
+        if (name !== null) {
+            if (currentName) entries.push({ name: currentName, lines: [...currentLines] });
+            currentName = name;
+            currentLines = [rawLine.trim().replace(/^\s*[-*+•–—](?:\s+|(?=[A-Za-z]))/, '')];
+            continue;
+        }
+        if (currentName) currentLines.push(rawLine.trim());
+    }
+    if (currentName) entries.push({ name: currentName, lines: [...currentLines] });
+    return entries;
+}
+
+function entryText(entry) {
+    return entry.lines.join('\n');
+}
+
+function isFullPartyStatEntry(text) {
+    return /Combat:/i.test(text);
+}
+
+function memberNameKey(name) {
+    return (name || '').trim().toLowerCase();
+}
+
+function buildMemberLookup(blockContent) {
+    const map = new Map();
+    for (const entry of splitPartyMemberEntries(blockContent)) {
+        map.set(memberNameKey(entry.name), entry);
+    }
+    return map;
+}
+
+/**
+ * Replaces [BENCHED PARTY] full stat entries with compact name + Status lines for LLM
+ * context injection only. Never call this on the persisted memo.
+ *
+ * Gate rule: only the member name (from the HP header line) and the Status: line survive.
+ * Combat/Gear/Attr/etc. are discarded entirely — not rewritten, not re-labeled.
+ * @param {string} memo
+ * @returns {string}
+ */
+export function compactBenchedPartyForContext(memo) {
+    const settings = getSettings();
+    if (settings.modules?.['benched party'] === false) {
+        return stripMemoBlock(memo, 'BENCHED PARTY');
+    }
+
+    const content = parseMemoBlockContent(memo, 'BENCHED PARTY');
+    if (!content || /^(?:REMOVED|EXPIRED|CLEARED|NONE)$/i.test(content)) return memo || '';
+
+    const compactLines = [];
+    for (const entry of splitPartyMemberEntries(content)) {
+        let status = '';
+        for (const line of entry.lines) {
+            if (/^status:/i.test(line)) {
+                status = line.replace(/^status:\s*/i, '').trim();
+                break;
+            }
+        }
+        if (!status) {
+            const inline = entry.lines[0]?.match(/:\s*(Benched\s*\([^)]*\)|Benched\b.*)$/i);
+            status = inline ? inline[1].trim() : 'Benched';
+        }
+        compactLines.push(`- ${entry.name}: ${status}`);
+    }
+
+    if (!compactLines.length) return memo || '';
+    return replaceMemoBlock(memo, 'BENCHED PARTY', compactLines.join('\n'));
+}
+
+/**
+ * After mergeMemo, restore full stat entries when the Tracker only had compact
+ * [BENCHED PARTY] context (or emitted a header-only relocation).
+ * @param {string} priorMemo
+ * @param {string} mergedMemo
+ * @returns {string}
+ */
+export function hydratePartyRelocationStats(priorMemo, mergedMemo) {
+    if (!priorMemo || !mergedMemo) return mergedMemo || '';
+
+    const priorParty = buildMemberLookup(parseMemoBlockContent(priorMemo, 'PARTY'));
+    const priorBenched = buildMemberLookup(parseMemoBlockContent(priorMemo, 'BENCHED PARTY'));
+
+    let result = mergedMemo;
+    for (const tag of ['PARTY', 'BENCHED PARTY']) {
+        const content = parseMemoBlockContent(result, tag);
+        if (!content) continue;
+        if (/^(?:REMOVED|EXPIRED|CLEARED|NONE)$/i.test(content.trim())) continue;
+
+        const rawEntries = splitPartyMemberEntries(content);
+        // Guard against wiping the block: if the content is non-empty but no member
+        // headers were recognized (e.g. an unexpected custom header format), leave the
+        // block exactly as the model emitted it instead of collapsing it to empty.
+        if (!rawEntries.length) {
+            if (getSettings().debugMode) {
+                console.warn(`[RPG Tracker] hydratePartyRelocationStats: [${tag}] has content but 0 parsed member headers — leaving block untouched to avoid data loss.`);
+            }
+            continue;
+        }
+
+        const hydrated = rawEntries.map(entry => {
+            const text = entryText(entry);
+            if (isFullPartyStatEntry(text)) return entry;
+
+            const key = memberNameKey(entry.name);
+            const full = priorBenched.get(key) || priorParty.get(key);
+            if (!full || !isFullPartyStatEntry(entryText(full))) return entry;
+
+            const fullLines = [...full.lines];
+            if (tag === 'BENCHED PARTY') {
+                const statusIdx = fullLines.findIndex(l => /^status:/i.test(l));
+                const newStatus = entry.lines.find(l => /^status:/i.test(l))
+                    || entry.lines.find(l => /Benched\s*\(/i.test(l));
+                if (newStatus) {
+                    const statusVal = newStatus.replace(/^status:\s*/i, '').trim();
+                    if (statusIdx >= 0) fullLines[statusIdx] = `Status: ${statusVal}`;
+                    else fullLines.push(`Status: ${statusVal}`);
+                }
+            } else if (tag === 'PARTY') {
+                const statusIdx = fullLines.findIndex(l => /^status:/i.test(l));
+                if (statusIdx >= 0) {
+                    const statusLine = fullLines[statusIdx];
+                    if (/Benched\s*\(/i.test(statusLine)) {
+                        fullLines[statusIdx] = 'Status: Healthy';
+                    }
+                }
+            }
+            return { name: entry.name, lines: fullLines };
+        });
+
+        const rebuilt = hydrated.map(e => {
+            const lines = [...e.lines];
+            if (lines.length && !/^-/.test(lines[0])) lines[0] = `- ${lines[0]}`;
+            return lines.join('\n');
+        }).join('\n');
+
+        result = replaceMemoBlock(result, tag, rebuilt);
+    }
+    return result;
+}
+
+/**
+ * Prepares memo text for Tracker LLM context (TRACKER STATE injection).
+ * @param {string} memo
+ * @returns {string}
+ */
+export function memoForTrackerContext(memo) {
+    const activeMemo = stripResolvedCombatantsFromMemo(memo || '');
+    return compactBenchedPartyForContext(stripCompletedQuestsFromMemo(activeMemo));
+}
+
+/**
+ * Prepares memo text for GM narrative context (STATE MEMO injection).
+ * Strips ((MARKER)) render tokens — they are display-only and meaningless to the GM.
+ * ((...)) is exclusively the marker delimiter syntax within the state memo (it is
+ * never used as prose punctuation there — that only happens in GM narrative, a
+ * separate channel). So any ((...)) found here — tag, payload, color suffix, or
+ * anything else inside the double-parens — is unconditionally removed in full.
+ * This is leak-proof by construction: there is no "preserve inner content" case
+ * to get wrong, so new marker syntax (like inline color overrides) never needs
+ * special-casing here.
+ * @param {string} memo
+ * @returns {string}
+ */
+export function memoForGmContext(memo) {
+    const activeMemo = stripResolvedCombatantsFromMemo(memo || '');
+    const stripped = activeMemo.replace(/\[QUESTS\][\s\S]*?\[\/QUESTS\]/gi, '').trim();
+    const noMarkers = stripped
+        .replace(/\(\([^)]*\)\)/g, '')
+        .replace(/ {2,}/g, ' ');
+    return compactBenchedPartyForContext(noMarkers);
 }
 
 // ── Legacy quest text format ───────────────────────────────────────────────────
@@ -545,6 +1059,12 @@ export function parseQuestsFromText(text) {
 
         const rawCoeff = getField('FRUSTRATION_COEFF');
         const coeff = rawCoeff ? parseFloat(rawCoeff) : null;
+
+        const typeField = (getField('TYPE') || '').trim().toLowerCase();
+        const emergentField = (getField('EMERGENT') || '').trim().toLowerCase();
+        const emergent = typeField === 'emergent'
+            || /^(true|yes|1)$/i.test(emergentField)
+            || EMERGENT_GIVER_RE.test(giverName);
 
         // Objectives: OBJ_ACTIVE, OBJ_COMPLETED/OBJ_DONE, or OBJ_FAILED lines
         // Robust: handles both one-per-line and comma-separated objectives on a single line
@@ -617,8 +1137,10 @@ export function parseQuestsFromText(text) {
             giver_location:         giverLoc,
             accepted_time:          getField('ACCEPTED'),
             deadline_time:          getField('DEADLINE'),
-            difficulty:             getField('DIFFICULTY'),
-            frustration_coefficient: coeff !== null && !isNaN(coeff) ? coeff : undefined,
+            emergent:               emergent || undefined,
+            type:                   emergent ? 'emergent' : undefined,
+            // Emergent/self-imposed: no NPC expects completion → never store a coeff
+            frustration_coefficient: (!emergent && coeff !== null && !isNaN(coeff)) ? coeff : undefined,
             objectives,
             rewards,
         });
@@ -639,20 +1161,24 @@ export function serializeQuestsToText(quests) {
         const lines = [`QUEST: ${q.title}`];
         lines.push(`  ID: ${q.id}`);
         lines.push(`  STATUS: ${q.status || 'active'}`);
+        const emergent = isEmergentQuest(q);
+        if (emergent) lines.push(`  TYPE: emergent`);
         lines.push(`  GIVER: ${q.giver_name} @ ${q.giver_location}`);
         if (q.accepted_time)          lines.push(`  ACCEPTED: ${q.accepted_time}`);
         if (q.deadline_time)          lines.push(`  DEADLINE: ${q.deadline_time}`);
-        if (q.difficulty)             lines.push(`  DIFFICULTY: ${q.difficulty}`);
-        if (q.frustration_coefficient != null)
+        // Only NPC-given quests carry a frustration coefficient
+        if (!emergent && q.frustration_coefficient != null)
                                       lines.push(`  FRUSTRATION_COEFF: ${q.frustration_coefficient}`);
 
-        // Inject human-readable mood for the AI narrator
-        if (q.status === 'active' || q.status === 'past deadline') {
+        // Inject human-readable mood for the AI narrator (deadline NPC quests only)
+        if (!emergent && (q.status === 'active' || q.status === 'past deadline')) {
             const settings = getSettings();
             const showFrustration = !!settings.syspromptModules?.questsFrustration;
-            const currentTime = settings.currentMemo?.match(/\[TIME\]([\s\S]*?)\[\/TIME\]/i)?.[1]?.trim() || "";
-            const { label } = getQuestMood(q, currentTime, showFrustration);
-            lines.push(`  MOOD: ${label}`);
+            if (showFrustration && questHasEffectiveDeadline(q)) {
+                const currentTime = settings.currentMemo?.match(/\[TIME\]([\s\S]*?)\[\/TIME\]/i)?.[1]?.trim() || "";
+                const { label } = getQuestMood(q, currentTime, showFrustration);
+                if (label) lines.push(`  MOOD: ${label}`);
+            }
         }
         for (const obj of (q.objectives || [])) {
             let tag = 'OBJ_ACTIVE';
@@ -684,14 +1210,28 @@ export function parseQuestsFromMemo(memoText) {
 
     const content = match[1].trim();
 
+    /** @param {any} q */
+    const normalize = (q) => {
+        if (!q || typeof q !== 'object') return q;
+        if (isEmergentQuest(q)) {
+            return {
+                ...q,
+                emergent: true,
+                type: 'emergent',
+                frustration_coefficient: undefined,
+            };
+        }
+        return q;
+    };
+
     // Auto-detect format: plain-text starts with QUEST:
     if (content.startsWith('QUEST:')) {
-        return parseQuestsFromText(content);
+        return parseQuestsFromText(content).map(normalize);
     } else {
         try {
             const parsed = JSON.parse(content);
             const quests = Array.isArray(parsed) ? parsed : (parsed.quests || []);
-            return quests;
+            return quests.map(normalize);
         } catch (e) {
             console.warn('[RPG Tracker] parseQuestsFromMemo: Failed to parse [QUESTS] as JSON:', e);
             return [];
@@ -724,32 +1264,67 @@ export function syncQuestsFromMemo(memoText) {
     }
 
     const quests = parseQuestsFromMemo(memoText);
-    const existingCompleted = (settings.quests || []).filter(q => q.status === 'completed');
-    
+    const existingArchived = (settings.quests || []).filter(q => isArchivedQuestStatus(q.status));
+
     if (quests.length === 0) {
-        const match = (memoText || '').match(/\[QUESTS\]([\s\S]*?)\[\/QUESTS\]/i);
-        if (!match && settings.quests && settings.quests.length > 0) {
-            if (settings.quests.length !== existingCompleted.length && settings.debugMode) {
+        const blockMatch = (memoText || '').match(/\[QUESTS\]([\s\S]*?)\[\/QUESTS\]/i);
+        if (!blockMatch && settings.quests && settings.quests.length > 0) {
+            if (settings.quests.length !== existingArchived.length && settings.debugMode) {
                 console.log('[RPG Tracker] syncQuestsFromMemo: active quests cleared because [QUESTS] block was removed.');
             }
-            settings.quests = existingCompleted;
+            settings.quests = existingArchived;
         } else if (settings.quests && settings.quests.length > 0) {
-            settings.quests = existingCompleted;
+            settings.quests = existingArchived;
         }
         return;
     }
 
-    // Merge newly parsed quests (which are active/failed) with existing completed ones
+    // Merge parsed memo quests with archived entries stripped from the memo.
+    // Memo wins for any quest id it contains — rollback must not preserve stale archive rows.
     const newIds = new Set(quests.map(q => q.id));
-    const merged = [...quests];
-    for (const eq of existingCompleted) {
+    const merged = quests.filter(q => !isArchivedQuestStatus(q.status));
+    for (const eq of existingArchived) {
         if (!newIds.has(eq.id)) {
             merged.push(eq);
+        }
+    }
+    // Also pick up newly archived quests the model still had in the memo this pass
+    for (const q of quests) {
+        if (isArchivedQuestStatus(q.status)) {
+            const idx = merged.findIndex(m => m.id === q.id);
+            if (idx >= 0) merged[idx] = q;
+            else merged.push(q);
         }
     }
 
     settings.quests = merged;
     if (settings.debugMode) console.log(`[RPG Tracker] syncQuestsFromMemo: updated internal state with ${merged.length} quest(s).`);
+}
+
+/**
+ * Syncs settings.quests from memo, then returns memo with archived quests stripped.
+ * @param {string} memoText
+ * @returns {string}
+ */
+export function applyQuestSyncAndStripMemo(memoText) {
+    syncQuestsFromMemo(memoText);
+    let memo = stripArchivedQuestsFromMemo(memoText);
+    const match = memo.match(/\[QUESTS\]([\s\S]*?)\[\/QUESTS\]/i);
+    if (match?.[1]?.trim().startsWith('QUEST:')) {
+        const rewritten = writeQuestsToMemo(getSettings().quests || [], memo);
+        if (typeof rewritten === 'string') memo = rewritten;
+    }
+    return memo;
+}
+
+/**
+ * Removes a completed/failed quest from the archive (settings.quests).
+ * @param {string} questId
+ */
+export function removeArchivedQuest(questId) {
+    if (!questId) return;
+    const settings = getSettings();
+    settings.quests = (settings.quests || []).filter(q => q.id !== questId);
 }
 
 // ── Delta display ─────────────────────────────────────────────────────────────
@@ -779,6 +1354,59 @@ export function computeDelta(oldMemo, newMemo) {
 }
 
 // ── Tool-call message detection ───────────────────────────────────────────────
+
+/**
+ * Index of the Nth-most-recent user message (1 = latest user turn), including
+ * all assistant/tool messages after it. Returns 0 if fewer than N user messages exist.
+ * @param {any[]} chat
+ * @param {number} n
+ * @returns {number}
+ */
+export function findNthUserMessageStartIdx(chat, n = 1) {
+    if (!chat?.length || n <= 0) return 0;
+    let found = 0;
+    for (let i = chat.length - 1; i >= 0; i--) {
+        if (chat[i]?.is_user) {
+            found++;
+            if (found >= n) return i;
+        }
+    }
+    return 0;
+}
+
+/**
+ * Formats chat messages from startIdx for Lorebook Agent context.
+ * @param {any[]} chat
+ * @param {number} startIdx
+ * @param {boolean} [includeHidden=false]
+ * @param {boolean} [fullIndexCoverage=false] When true (since-last-run), walk every chat slot in range and include all non-system narrative content — tool-call UI shells are still dropped.
+ * @returns {string}
+ */
+export function formatAgentChatLogFromIndex(chat, startIdx, includeHidden = false, fullIndexCoverage = false) {
+    if (!chat?.length || startIdx >= chat.length) return '';
+    const lines = [];
+    for (let i = startIdx; i < chat.length; i++) {
+        const msg = chat[i];
+        if (msg?.is_system) continue;
+        if (!includeHidden && msg?.is_hidden) continue;
+        if (msg?.extra?.['summary'] || msg?.extra?.['is_summary'] || msg?.extra?.['summary_data']) continue;
+
+        const raw = msg.mes || msg.content || '';
+        const toolStripped = cleanToolCallMessage(raw);
+        let content = '';
+        if (toolStripped !== null) {
+            content = cleanMessageContent({ ...msg, mes: toolStripped, content: toolStripped });
+        } else if (fullIndexCoverage) {
+            content = cleanMessageContent({ ...msg, mes: raw, content: raw });
+        }
+        if (!content) continue;
+        if (content.startsWith('[Summary') || content.startsWith('(Summary') || content.includes('Summary of past events:')) continue;
+
+        const name = msg.is_user ? 'Player' : (msg.name || 'Narrator');
+        lines.push(`${name}: ${content}`);
+    }
+    return lines.join('\n\n');
+}
 
 /**
  * Returns null if the message is a tool-call payload (discard it from context).
@@ -887,7 +1515,7 @@ export function getLastUserAction() {
     }
 
     raw = raw.replace(/###\s*STATE MEMO[^]*?(?=\n\[RNG_QUEUE|\n###|\n\[(?!RNG_QUEUE)[A-Z]|$)/i, '');
-    raw = raw.replace(/\[RNG_QUEUE\s[^\]]*\][\s\S]*?\[\/RNG_QUEUE\][ \t]*\n?/gi, '');
+    raw = raw.replace(/\[RNG_QUEUE(?:_d100)?\s[^\]]*\][\s\S]*?\[\/RNG_QUEUE(?:_d100)?\][ \t]*\n?/gi, '');
     raw = raw.replace(/\[[A-Z_]+\][\s\S]*?\[\/[A-Z_]+\]/g, '');
     raw = raw.replace(/###\s*CURRENT USER INPUT[^\n]*\n?/gi, '');
     raw = raw.replace(/\[Continue the narrative\]/gi, '');
@@ -978,35 +1606,58 @@ export function buildModulesInstructionText(settings) {
 
     modulesText += "### CORE MODULES\n";
     for (const [key, prompt] of Object.entries(promptsMap)) {
-        // Never emit the quests_legacy key as its own module — it's a data slot only
-        if (key === 'quests_legacy') continue;
+        // Never emit helper prompts as their own modules
+        if (key === 'time_24h' || key === 'time_ddmmyy' || key === 'time_ddmmyy_24h') continue;
 
+        if (key === 'quests' && settings.syspromptModules?.quests === false) continue;
         if (settings.modules[key]) {
             let p = prompt;
 
-            // ── Dynamic prompt swap for Legacy Quests ──────────────────────
+            // ── Dynamic prompt customization for Quests ──────────────────────
             if (key === 'quests') {
-                const useLegacy = !!settings.questLegacyMode;
-                if (useLegacy) {
-                    const isDeadlines = !!settings.syspromptModules?.questsDeadlines;
-                    const isFrustration = !!settings.syspromptModules?.questsFrustration;
-                    const isDifficulty = !!settings.syspromptModules?.questsDifficulty;
-                    // Use the dedicated legacy format prompt
-                    p = (promptsMap['quests_legacy'] || DEFAULT_STOCK_PROMPTS.quests_legacy);
-                    if (!isDeadlines) p = p.replace(/\n\s*DEADLINE:.*?\n/g, '\n');
-                    if (!isFrustration) p = p.replace(/\n\s*FRUSTRATION_COEFF:.*?\n/g, '\n');
-                    if (!isDifficulty) {
-                        p = p.replace(/\n\s*DIFFICULTY:.*?\n/g, '\n');
-                        p = p.replace(/\n- For difficulty, use the DIFFICULTY marker.*\n/g, '\n');
-                    }
-                    console.log('[RPG Tracker] Quest prompt: using LEGACY format (questLegacyMode=true)');
-                } else {
-                    console.log('[RPG Tracker] Quest prompt: using MODERN/JSON format (questLegacyMode=false)');
+                const isDeadlines = !!settings.syspromptModules?.questsDeadlines;
+                const isFrustration = !!settings.syspromptModules?.questsFrustration;
+                if (settings.useDdMmYyFormat) {
+                    p = p
+                        .replace(/Day 1/g, '01/01/2026')
+                        .replace(/Day 4/g, '04/01/2026')
+                        .replace(/Day N/g, 'DD/MM/YYYY');
                 }
+                if (!isDeadlines) p = p.replace(/\n\s*DEADLINE:.*?\n/g, '\n');
+                if (!isFrustration) {
+                    p = p.replace(/\n\s*FRUSTRATION_COEFF:.*?\n/g, '\n');
+                    p = p.replace(/\n- On quest creation, set FRUSTRATION_COEFF.*\n/g, '\n');
+                    p = p.replace(/\n- For NPC-given quests only[^\n]*\n/g, '\n');
+                    p = p.replace(/\n- Omit FRUSTRATION_COEFF for emergent\/self-imposed quests[^\n]*\n/g, '\n');
+                    p = p.replace(/\n- For emergent\/self-imposed quests: set TYPE: emergent, use GIVER: Self @ —, and omit FRUSTRATION_COEFF entirely \(no NPC expects completion\)\.\n/g, '\n- For emergent/self-imposed quests: set TYPE: emergent and use GIVER: Self @ —.\n');
+                }
+            }
+
+            // ── Dynamic prompt swap for Time Module ─────────────────────────
+            if (key === 'time') {
+                const timeKey = resolveTimePromptKey(settings);
+                if (timeKey !== 'time') {
+                    p = promptsMap[timeKey] || DEFAULT_STOCK_PROMPTS[timeKey];
+                }
+            }
+
+            // This is a state-transport invariant, not theme text. Keep it active
+            // for legacy and customized COMBAT prompts without modifying the saved prompt.
+            if (key === 'combat' && !/\bDEFEATED COMBATANTS\s*:/i.test(p)) {
+                p = `${p}\n${DEFEATED_COMBATANTS_PROMPT_RULE}`;
+            }
+            if (key === 'combat' && !/\bNON-PARTY\s+ALLIES\b/i.test(p)) {
+                p = `${p}\n${COMBAT_SIDES_PROMPT_RULE}`;
             }
 
             modulesText += `- [${key.toUpperCase()}]: ${p}\n`;
         }
+    }
+
+    // Only inject timing anchor on first turn of new campaign (before [TIME] block exists in memo).
+    // Once the State Tracker has written the initial [TIME] block, it manages time itself.
+    if (settings.initialDate && !settings.currentMemo?.match(/\[TIME\]/i)) {
+        modulesText += `\n### CAMPAIGN TIMING RULES\n- The campaign starting date is ${settings.initialDate}. Ensure the very first [TIME] block and all early timeline entries align with this starting anchor.\n`;
     }
 
     const enabledCustomFields = (settings.customFields || []).filter(f => f.enabled && f.tag);

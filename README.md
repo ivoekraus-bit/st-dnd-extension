@@ -2,21 +2,22 @@
 
 *A D&D-based RPG platform/simulation engine for SillyTavern.*
 
-What this framework does is essentially turn SillyTavern into something like AI Dungeon, but with actual mechanics/consequences. Losing or dying is actually a thing. In Big Rigs, you're always WINNER. Not in Multihog D&D! That being said, **the system works just as well for casual "slice of life" type scenarios or modern settings, so no need to worry that you're limited to wizards and goblins.**
+This framework, with its stock settings, essentially turns SillyTavern into something like AI Dungeon, but with actual mechanics/consequences! And I mean that. It's not anti-player, but it can be said to be "player-neutral." The narrative and internal consistency of the world determines how hard or easy something is. There is explicitly zero scaling anywhere to ensure choices matter and consequence is real. Going into the dragon's lair at level 2 should not turn the dragon into anything less than a dragon, and the dragon shouldn't show mercy just because you happen to be level 2.
 
-I wasn't satisfied with any of the commercial offerings available (AI Realm, AI Dungeon, Friends & Fables, etc.), so I made my own D&D platform inside SillyTavern. 
+The core aim and philosophy is to deliver an immersive experience through robust simulation logic, using realistic time passage as the backbone that ties into numerous other systems, and this aforementioned "player-agnosticism/neutrality." Fundamentally it acts as a cohesive RPG framework as well as an anti-sycophancy system.
 
-**Crucially, the system is input-output, not just some glorified stats collector. Everything in the State Tracker is fed back to the AI. What you see is what the AI also sees.**
+I know it says "D&D Framework," but in addition to fantasy, the system works just as well for casual "slice of life" scenarios, modern settings, or anything else imaginable, so you're by no means limited to wizards and goblins. Everything is FULLY customizable and homebrew-friendly, complete with AI wizards, so next to no technical knowledge is required.
 
 ---
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/cde8b1b9-dc31-4089-97dd-ebd16facd3af" width="80%" alt="A basic character sheet" />
+  <img src="https://github.com/user-attachments/assets/878e437c-e7b4-4140-94b9-f9a14aab1002" width="60%" alt="A basic character sheet" />
   <br>
   <em>A basic character sheet</em>
 </p>
 
 ---
+
 
 ### The Core Components:
 
@@ -39,8 +40,7 @@ Together they solve the four core problems of LLM tabletop RP: the AI forgetting
 - **Draggable HUD** with HP bars, spell pips, colored status pills, alert badges, and economy coins.
 - **Automatic spell slot tracking** via 🔵 pips in the UI; never worry about remembering how many you have left.
 - **Buff/debuff temporal decay** via [TIME] delta tracking; statuses expire automatically over time based on time elapsed.
-- **Dynamic enemy scaling** — enemies adapt to quest difficulty and player level contextually.
-- **Snapshot history + delta log** - easy rollback, and see at a glance what was changed in the state.
+- **NO enemy scaling** — the narrative is king and the logic of reality applies; you're not accommodated if you take a task beyond you just because you're weak.
 - **Auto model-switching** so that you can use a different model for tracking the state.
 - **Full-context audit mode** with automatic chunking for massive chat histories.
 - **Custom fields, themes, reorderable sections**; track whatever you want beyond the stock fields and customize the visuals to your liking.
@@ -53,17 +53,24 @@ Together they solve the four core problems of LLM tabletop RP: the AI forgetting
 - **Automatic Long-Context Tracking** via the Lorebook Agent with World Engine simulation.
 - **AI Portrait Generation** via Pollinations.ai — free, non-profit image generation with full lorebook agent context awareness for accurate character portraits.
 - **Inventory Currency Auto-Rendering** — items with a worth value automatically display a styled coin badge (gold, silver, bronze, or dollar) based on the currency type.
+- **Character card importing** — import any existing character into the story as an NPC; AI will automatically adapt it to the story, regardless of setting/theme.
+- **AI-powered Game Systems Wizard** — Simply describe any mechanic to the wizard in natural language (e.g. "reputation system), and the AI will build the system for you according to the structure of the extension (sysprompt + module.) Iterate, regenerate, or manually edit any block directly within the forge before saving.
+- **Life/dating sim-style friendship/affection component.**
+- **Export your entire setup as a "Game Cartridge."**
+- **d100 (percentage-based rolls) support.**
+- **Real-Time Visualization Mode** — Lorebook Agent can be turned into a visual viewer that generates images of the current scene (with adjustable frequency) and displays the portraits of the currently present entities.
+- **Instant Action** — Get started by simply pressing one button.
+-  **Adventure Companion** — Learn the framework with optional Tutorial Mode, discuss your adventure, update campaign state or lore, and even ask it to take your next turn.
   
 ---
 
-<div align="center">
-  <figure>
-    <img width="1918" height="982" alt="Screenshot 2026-06-18 195917" src="https://github.com/user-attachments/assets/a9778adb-8bdf-485e-ac96-973613321407" />
-  </figure>
-</div>
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/8e615285-1eed-4312-98c6-6cb47febaed5" width="100%" alt="Combat in progress" />
+  <br>
+  <em>Some combat in progress</em>
+</p>
 
 ---
-
 
 ## Installation
 
@@ -91,29 +98,48 @@ You can scrap the entire system prompt and all the default fields and track your
 ## What Model to Use?
 Your primary narrator model must support **Tool Calling** for the Hybrid RNG system to work properly, though this is only relevant if you're using tool calls. The extension also works without them (selectable in the settings.)
 
-<img width="920" height="246" alt="image" src="https://github.com/user-attachments/assets/f663cb1e-554a-40a2-a25e-f7af62c1a032" />
+**MiMo 2.5 Pro** or **DeepSeek 4 Pro**: both are great bang for the buck with high GM output quality. I use both myself through OpenRouter. Can't go wrong with either.
 
-For the State Tracker and Lorebook Agent, use Gemini 3.1 Flash. It's good enough and costs peanuts. For the GM/Narrator, MiMo 2.5 Pro in my opinion has the best quality-price ratio. Experiment.
+For the State Tracker and Lorebook Agent, I use **Gemini 3.5 Flash-Lite**. It's very inexpensive and handles the job amazingly well. Gemini 3 Flash or 3.5 Flash are of course even better, but I don't think they're needed. Flash-Lite does the job.
+
+If your model thinks too long in combat, enable **Combat API Override** in State Tracker settings — it auto-switches when the `[COMBAT]` tag is active in the tracker and switches back when combat ends. **Gemini 3.6 Flash** is a great choice for this; set thinking to **Medium** so it still thinks a little.
+
+These are recommendations, not rules — experiment. Different models shine for different styles of play.
+
+---
+
+<table border="0">
+  <tr>
+    <td align="center" valign="bottom">
+      <img src="https://github.com/user-attachments/assets/829b233c-19f0-407b-99a8-f58e80573a0a" width="100%" alt="Lorebook Agent" />
+      <br>
+      <strong>Lorebook Agent</strong>
+    </td>
+    <td align="center" valign="bottom">
+      <img src="https://github.com/user-attachments/assets/de2f7522-e3ff-4153-8a3f-d38ca49ceca7" width="100%" alt="Lorebook Agent" />
+      <br>
+      <strong>Relationship system within Lorebook Agent</strong>
+    </td>
+  </tr>
+</table>
+
+---
+
+<div align="center">
+  <figure>
+    <img width="1918" height="982" alt="Screenshot 2026-06-18 195917" src="https://github.com/user-attachments/assets/7eb15c2b-bfd8-4193-8553-4053bac14c34" />
+  </figure>
+</div>
 
 ---
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/a0e1c88c-092f-488b-b421-48cabe09e6e2" width="100%" alt="Combat in progress" />
+  <img src="https://github.com/user-attachments/assets/6309d516-7a0e-4387-8df8-b82566555ade" width="70%" alt="Combat in progress" />
   <br>
-  <em>Some combat in progress</em>
+  <em>Visualization Mode</em>
 </p>
 
 ---
 
-<p align="center">
-  <img src="https://github.com/user-attachments/assets/0fc898ec-f27a-45f4-bc63-d229e3685695" width="500" alt="Lorebook Agent" />
-  <br>
-  <strong>Lorebook Agent</strong>
-</p>
-
----
-
-## License
-MIT
-
-***
+## Got a Question or Ideas?
+You can find me in the SillyTavern Discord extensions forum. Join the Discord and then head to the sub-forum there: https://discord.gg/sillytavern

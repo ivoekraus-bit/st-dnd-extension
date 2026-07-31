@@ -1,7 +1,9 @@
-import { getSettings, getEffectiveRouterCampaignPrefix } from './state-manager.js';
+import { getSettings, getEffectiveRouterCampaignPrefix, persistWorldProgressionTimer, persistRouterLastRunWatermark, persistRouterLastRunTimestamp, getNpcRelationshipMax, clampRelationshipValue, buildRouterRelationshipInstruction, sanitizeRouterState, adjustPromptTimestamps, DEFAULT_NPC_SECTIONS, saveChatState } from './state-manager.js';
 import { sendStateRequest, sendAgentTurn } from './llm-client.js';
 import { getRequestHeaders } from '../../../../script.js';
-import { extractCurrentTimeStr, cleanMessageContent } from './memo-processor.js';
+import { extractCurrentTimeStr, cleanMessageContent, parseInWorldTime, formatInWorldTime, findNthUserMessageStartIdx, formatAgentChatLogFromIndex, sanitizeLorebookRecordContent } from './memo-processor.js';
+import { recordSchedulerEvent } from './swipe-scheduler-debug.js';
+import { saveSettings } from './src/app/runtime-bridge.js';
 
 let _routerRunning = false;
 let _routerNormalRunCount = 0; // tracks completed normal (non-cleanup) passes for auto-cleanup interval
@@ -28,6 +30,141 @@ export function stopRouterPass() {
 function getLivePrefix() {
     const ctx = SillyTavern.getContext();
     return getEffectiveRouterCampaignPrefix(ctx.chatId || '');
+}
+
+/** World Skeleton lorebooks are only visible to World Progression / skeleton generation. */
+function isSkeletonBookName(bookName) {
+    return (bookName || '').toLowerCase().endsWith('_skeleton');
+}
+
+function isSkeletonEntryId(entryId) {
+    if (!entryId || typeof entryId !== 'string' || !entryId.includes('::')) return false;
+    return isSkeletonBookName(entryId.split('::')[0]);
+}
+
+/** Extract canonical [COMBAT] block from the current memo, if present. */
+function extractActiveCombatBlock(memo) {
+    const match = memo?.match(/\[COMBAT\]([\s\S]*?)\[\/COMBAT\]/i);
+    return match ? `[COMBAT]${match[1].trim()}[/COMBAT]` : null;
+}
+
+/** Router guidance when ACTIVE COMBAT STATE is injected this turn. */
+function buildCombatProfileRouterGuidance(hasCombat, mode = 'basic') {
+    if (!hasCombat) return '';
+    if (mode === 'agent') {
+        return `
+## COMBAT PROFILE (ACTIVE COMBAT STATE provided this turn)
+- **Existing NPCs** (listed in ACTIVE MEMORY with an ID): use \`commit({"core": [{"id": "Book::UID or NPC Name", "field": "Combat Profile", "content": "verbatim stats from [COMBAT]"}]})\`. Do NOT re-record the full NPC via \`record\` or embed a new \`[CORE]\` block in \`update\`.
+- **Brand-new combatants** with no lorebook entry yet: include \`Combat Profile:\` inside \`[CORE]\` in a \`record\` item.
+- Copy stats verbatim from ## ACTIVE COMBAT STATE only — never infer from GM prose.`;
+    }
+    return `
+## COMBAT PROFILE (ACTIVE COMBAT STATE provided this turn)
+- **Existing NPCs** (in ACTIVE MEMORY or ARCHIVE): output \`[[UPDATE_CORE: NPC Name | Combat Profile | verbatim stats from [COMBAT]]]\` — NOT a full \`[[NPC:...]]\` re-record.
+- **Brand-new combatants** with no existing entry: include \`Combat Profile:\` inside \`[CORE]\` in a new \`[[NPC:...]]\` record.
+- Copy stats verbatim from ## ACTIVE COMBAT STATE only — never infer from GM prose.
+- Example: \`[[UPDATE_CORE: Marcus Thorne | Combat Profile | HP: 12, AC: 11, Fort +1, Ref +0, Will +4, weapons: ...]]\``;
+}
+
+/**
+ * Resolve Book::UID or plain NPC label to a full lore entry id.
+ * @returns {Promise<string|null>}
+ */
+async function resolveLoreEntryId(id, allBooks, newlyCreatedMap = {}) {
+    if (!id || typeof id !== 'string') return null;
+    if (id.includes('::')) return id;
+
+    const cleanId = id.toLowerCase().trim();
+    if (newlyCreatedMap[cleanId]) return newlyCreatedMap[cleanId];
+
+    const prefix = getLivePrefix();
+    const npcBookName = prefix ? `${prefix}_NPCs` : 'NPCs';
+    let npcBook = null;
+    try {
+        npcBook = await SillyTavern.getContext().loadWorldInfo(npcBookName);
+    } catch (_) {}
+
+    if (npcBook?.entries) {
+        for (const [uid, entry] of Object.entries(npcBook.entries)) {
+            const label = (entry.comment || '').replace(/^\[.*?\]\s*/i, '').toLowerCase().trim();
+            if (label === cleanId) return `${npcBookName}::${uid}`;
+        }
+    }
+
+    for (const [bookName, bookData] of Object.entries(allBooks || {})) {
+        if (!bookData?.entries) continue;
+        for (const [uid, entry] of Object.entries(bookData.entries)) {
+            const label = (entry.comment || '').replace(/^\[.*?\]\s*/i, '').toLowerCase().trim();
+            if (label === cleanId) return `${bookName}::${uid}`;
+        }
+    }
+
+    return null;
+}
+
+/** Remove any skeleton IDs that leaked into Lorebook Agent active pools. @returns {boolean} */
+function stripSkeletonFromRouterPools() {
+    const settings = getSettings();
+    const strip = (arr) => (arr || []).filter(id => !isSkeletonEntryId(id));
+    const beforeRouter = JSON.stringify(settings.activeRouterKeys || []);
+    const beforeKw = JSON.stringify(settings.keywordActivatedKeys || []);
+    settings.activeRouterKeys = strip(settings.activeRouterKeys);
+    settings.keywordActivatedKeys = strip(settings.keywordActivatedKeys);
+    return beforeRouter !== JSON.stringify(settings.activeRouterKeys)
+        || beforeKw !== JSON.stringify(settings.keywordActivatedKeys);
+}
+
+/**
+ * Lorebook Agent archive fetch — excludes World Skeleton books.
+ * @param {string} prefix
+ * @param {object} ctx
+ * @param {object} settings
+ */
+async function fetchRouterArchiveBooks(prefix, ctx, settings) {
+    if (typeof ctx.updateWorldInfoList === 'function') {
+        try { await ctx.updateWorldInfoList(); } catch (_) {}
+    }
+    const allBookNames = await getWorldInfoNamesSafe();
+    const inScope = (n) => !prefix || bookBelongsToPrefix(n, prefix);
+    const scoped = new Set(prefix ? allBookNames.filter(inScope) : allBookNames);
+
+    const logBookNames = (settings.routerLog || [])
+        .flatMap(e => [...(e.record || []), ...(e.activate || [])].map(id => id.split('::')[0]))
+        .filter(Boolean);
+    for (const n of logBookNames) {
+        if (inScope(n) && !isSkeletonBookName(n)) scoped.add(n);
+    }
+
+    const books = {};
+    const loaded = await Promise.all([...scoped].map(async (n) => {
+        try {
+            const b = await ctx.loadWorldInfo(n);
+            return b?.entries ? [n, b] : null;
+        } catch (_) {
+            return null;
+        }
+    }));
+    for (const row of loaded) {
+        if (row) books[row[0]] = row[1];
+    }
+    return books;
+}
+
+/**
+ * grep_lore / inspect_book helper — never surface skeleton entries to the agent.
+ */
+function grepLoreInBooks(allBooks, query) {
+    const q = (query || '').toLowerCase();
+    const hits = [];
+    for (const [name, book] of Object.entries(allBooks)) {
+        if (isSkeletonBookName(name)) continue;
+        for (const [uid, entry] of Object.entries(book.entries || {})) {
+            if ((entry.content || '').toLowerCase().includes(q) || (entry.comment || '').toLowerCase().includes(q)) {
+                hits.push(`[${name}::${uid}] "${entry.comment || uid}": ${(entry.content || '').substring(0, 120)}...`);
+            }
+        }
+    }
+    return hits;
 }
 
 /**
@@ -58,7 +195,8 @@ function bookBelongsToPrefix(bookName, prefix) {
  */
 function parseTextAction(text) {
     // Find the last "Action:" line to be safe, then extract the balanced JSON argument.
-    const parts = ('\n' + text).split(/\nAction:\s*/i);
+    // Tolerates markdown formatting like **Action:**, *Action:*, ### Action, - Action: etc.
+    const parts = ('\n' + text).split(/\n(?:\*\*|\*|__|_|###|##|#|-|\s)*Action\b(?:\*\*|\*|__|_|:|\s)*\s*/i);
     if (parts.length < 2) return null;
     const lastPart = parts[parts.length - 1].trim();
 
@@ -112,7 +250,8 @@ function broadcastStep(type, content, metadata = {}) {
  * Probes both the frontend cache AND the backend API for ground truth,
  * so that cloned/renamed lorebooks are always discovered.
  */
-async function getWorldInfoNamesSafe() {
+async function getWorldInfoNamesSafe(options = {}) {
+    const fullProbe = options.fullProbe !== false;
     const ctx = SillyTavern.getContext();
     const namesSet = new Set();
     
@@ -123,6 +262,10 @@ async function getWorldInfoNamesSafe() {
     } else if (typeof ctx.getLorebookList === 'function') {
         const res = await ctx.getLorebookList();
         if (Array.isArray(res)) res.forEach(n => namesSet.add(n));
+    }
+
+    if (!fullProbe) {
+        return [...namesSet];
     }
 
     // 2. Unconditionally probe the backend API (ground truth of what exists on disk).
@@ -165,6 +308,7 @@ function buildKeyringText(allBooks, activeKeys = []) {
     const activeSet = new Set(activeKeys);
     let lines = [];
     for (const [bookName, bookData] of Object.entries(allBooks)) {
+        if (isSkeletonBookName(bookName)) continue;
         if (!bookData || !bookData.entries) continue;
         for (const [uid, entry] of Object.entries(bookData.entries)) {
             if (activeSet.has(`${bookName}::${uid}`)) continue; // shown in ACTIVE MEMORY
@@ -202,33 +346,19 @@ export async function runRouterPass(narrativeOutput, manualPrompt = null, custom
             return;
         }
         let basicSummary = '';
-        
+
+        if (stripSkeletonFromRouterPools()) {
+            void saveSettings();
+        }
+
         async function fetchArchiveBooks() {
-            // Flush ST's in-memory registry so books written via HTTP API in prior passes are visible
-            if (typeof ctx.updateWorldInfoList === 'function') {
-                try { await ctx.updateWorldInfoList(); } catch (_) {}
-            }
-            const allBookNames = await getWorldInfoNamesSafe();
-            const inScope = (n) => !prefix || bookBelongsToPrefix(n, prefix);
-            const scoped = new Set(prefix ? allBookNames.filter(inScope) : allBookNames);
-
-            // Also sweep books referenced in routerLog (catches books not yet formally indexed)
-            const logBookNames = (settings.routerLog || [])
-                .flatMap(e => [...(e.record || []), ...(e.activate || [])].map(id => id.split('::')[0]))
-                .filter(Boolean);
-            for (const n of logBookNames) {
-                if (inScope(n)) scoped.add(n);
-            }
-
-            const books = {};
-            for (const n of scoped) {
-                const b = await ctx.loadWorldInfo(n);
-                if (b?.entries) books[n] = b;
-            }
-            return books;
+            return fetchRouterArchiveBooks(prefix, ctx, settings);
         }
 
         let archiveBooks = await fetchArchiveBooks();
+        let _routerTriggerMsg = null;
+        let _routerSnapshotRunId = null;
+        let _routerPrePassWatermark = 0;
 
         // ?? Snapshot state BEFORE this pass (for rollback) ??????????????????
         {
@@ -236,15 +366,26 @@ export async function runRouterPass(narrativeOutput, manualPrompt = null, custom
                 timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
                 activeRouterKeys: JSON.parse(JSON.stringify(settings.activeRouterKeys || [])),
                 activeWorldKeys: JSON.parse(JSON.stringify(settings.activeWorldKeys || [])),
-                bookSnapshots: {}
+                routerLastRunChatLength: settings.routerLastRunChatLength ?? 0,
+                bookSnapshots: {},
+                runId: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
             };
+            _routerSnapshotRunId = snapshot.runId;
+            _routerPrePassWatermark = snapshot.routerLastRunChatLength;
+            _routerTriggerMsg = [...(ctx.chat || [])].reverse().find(m => !m.is_user && !m.is_system);
             for (const [name, book] of Object.entries(archiveBooks)) {
                 snapshot.bookSnapshots[name] = JSON.parse(JSON.stringify(book));
             }
             if (!settings.routerHistory) settings.routerHistory = [];
             settings.routerHistory.unshift(snapshot);
             if (settings.routerHistory.length > 5) settings.routerHistory.length = 5;
-            ctx.saveSettingsDebounced();
+            recordSchedulerEvent('la_pass_snapshot', {
+                runId: snapshot.runId,
+                preWm: _routerPrePassWatermark,
+                historyLen: settings.routerHistory.length,
+                isManual,
+            });
+            void saveSettings();
         }
         let activeEntriesFull = [];
         let newlyTriggeredFull = [];
@@ -254,12 +395,34 @@ export async function runRouterPass(narrativeOutput, manualPrompt = null, custom
         function updateActiveEntries() {
             activeEntriesFull = [];
             newlyTriggeredFull = [];
+            const relValues = settings.npcRelationshipValues || {};
             for (const [name, book] of Object.entries(archiveBooks)) {
+                if (isSkeletonBookName(name)) continue;
                 for (const [uid, entry] of Object.entries(book.entries)) {
                     const fullId = `${name}::${uid}`;
                     if (settings.activeRouterKeys?.includes(fullId)) {
                         const label = entry.comment || entry.key?.[0] || fullId;
-                        const block = `### [ACTIVE] ${label}\nID: ${fullId}\nContent: ${entry.content}`;
+                        let block = `### [ACTIVE] ${label}\nID: ${fullId}\nContent: ${entry.content}`;
+                        // Append cap-constraint hints for NPC relationship values.
+                        // Totals are intentionally hidden so the agent awards deltas from
+                        // a consistent baseline, uncorrupted by the existing pool size.
+                        // Only inject a hint when a value is near the cap (within 15 points)
+                        // so the agent knows further movement in that direction is futile.
+                        const rel = relValues[fullId];
+                        if (rel !== undefined) {
+                            const relMax = getNpcRelationshipMax(settings);
+                            const fVal = rel.friendship ?? 0;
+                            const aVal = rel.affection  ?? 0;
+                            // Always inject current totals so the agent can calibrate delta magnitude
+                            block += `\n[Current Relations: Friendship ${fVal >= 0 ? '+' : ''}${fVal}, Affection ${aVal >= 0 ? '+' : ''}${aVal} (range ±${relMax})]`;
+                            // Cap-constraint hints (only when at limit)
+                            const hints = [];
+                            if (fVal >= relMax)  hints.push('Friendship is at maximum — do not award further positive increments');
+                            if (fVal <= -relMax) hints.push('Friendship is at minimum — do not award further negative increments');
+                            if (aVal >= relMax)  hints.push('Affection is at maximum — do not award further positive increments');
+                            if (aVal <= -relMax) hints.push('Affection is at minimum — do not award further negative increments');
+                            if (hints.length > 0) block += `\n⚠ Relationship constraint: ${hints.join('; ')}.`;
+                        }
                         if (triggeredSet.has(fullId)) {
                             newlyTriggeredFull.push(block);
                         } else {
@@ -278,50 +441,43 @@ export async function runRouterPass(narrativeOutput, manualPrompt = null, custom
         if (overrideChatLog) {
             recentChatString = overrideChatLog;
         } else {
-            // Three-way lookback priority (only applies to auto-passes; Direct Prompt always passes customLookback)
+            // Three-way lookback priority (only applies to auto-passes; Direct Prompt always passes customLookback).
+            // Since-last-run uses a chat-length watermark (every array slot, including tool-call messages).
+            // Fixed/direct lookback counts user turns, not raw message slots — tool calls can inflate the latter.
             const sinceLastRun  = customLookback === null && settings.routerLookbackSinceLastRun !== false;
             const sinceLastUser = customLookback === null && !sinceLastRun && settings.routerLookbackSinceLastUser === true;
             let startIdx;
             if (sinceLastRun) {
-                const lastLen = settings.routerLastRunChatLength || 0;
+                let lastLen = settings.routerLastRunChatLength || 0;
+                if (lastLen > chat.length) {
+                    lastLen = 0;
+                    persistRouterLastRunWatermark(0);
+                }
                 if (lastLen > 0 && lastLen < chat.length) {
-                    // Slice from where we left off — the agent sees exactly the messages it hasn't processed yet
                     startIdx = lastLen;
+                } else if (lastLen === 0) {
+                    startIdx = 0;
                 } else {
-                    // First run ever (or watermark invalid) — fall back to last user message
-                    startIdx = chat.length - 1;
-                    while (startIdx > 0 && !(/** @type {any} */ (chat[startIdx])).is_user) {
-                        startIdx--;
-                    }
-                    if (startIdx === 0 && !(/** @type {any} */ (chat[0]))?.is_user) {
-                        startIdx = Math.max(0, chat.length - 4);
-                    }
+                    startIdx = chat.length;
                 }
             } else if (sinceLastUser) {
-                // Walk backward to find the most recent user message, then include it
-                // and everything after — captures the full turn including tool call messages.
-                startIdx = chat.length - 1;
-                while (startIdx > 0 && !(/** @type {any} */ (chat[startIdx])).is_user) {
-                    startIdx--;
-                }
-                // If no user message found (all-AI chat), fall back to last 4
-                if (startIdx === 0 && !(/** @type {any} */ (chat[0]))?.is_user) {
-                    startIdx = Math.max(0, chat.length - 4);
-                }
+                startIdx = findNthUserMessageStartIdx(chat, 1);
             } else {
-                const N = customLookback !== null ? customLookback : (settings.routerLookback || 4);
-                startIdx = Math.max(0, chat.length - N);
+                const turnCount = customLookback !== null ? customLookback : (settings.routerLookback || 4);
+                startIdx = findNthUserMessageStartIdx(chat, Math.max(1, turnCount));
             }
-            recentChatString = chat.slice(startIdx).map(m => {
-                const name = (/** @type {any} */ (m)).is_user ? 'Player' : ((/** @type {any} */ (m)).name || 'Narrator');
-                return `${name}: ${cleanMessageContent(m)}`;
-            }).join('\n\n');
+            recentChatString = formatAgentChatLogFromIndex(
+                chat,
+                startIdx,
+                !!settings.routerIncludeHidden,
+                sinceLastRun
+            );
         }
 
 
 
         // Extract Current Context (Time & Location)
-        const timeRegex = /([0-9]{1,2}:[0-9]{2}\s*[AP]M,\s*Day\s*[0-9]+)/i;
+        const timeRegex = /(\d{1,2}:\d{2}\s*(?:AM|PM)?,\s*(?:Day\s*\d+|\d{1,2}\/\d{1,2}\/\d+))/i;
         const narrativeTimeMatch = recentChatString.match(timeRegex);
         const memoTimeMatch = settings.currentMemo?.match(/\[TIME\]([\s\S]*?)\[\/TIME\]/i);
         const cleanMemoTime = memoTimeMatch ? extractCurrentTimeStr(memoTimeMatch[1]) : '';
@@ -362,7 +518,15 @@ export async function runRouterPass(narrativeOutput, manualPrompt = null, custom
               `Justify each deactivation.`
             : '';
 
-        const basePrompt = (settings.routerSystemPromptTemplate || 'You are the Lorebook Agent. Maintain narrative consistency and manage lorebooks.')
+        const activeCombatBlock = extractActiveCombatBlock(settings.currentMemo);
+        const activeCombatSection = activeCombatBlock
+            ? `## ACTIVE COMBAT STATE (canonical mechanical stats — use this as the source for NPC Combat Profiles, not the GM prose)\n${activeCombatBlock}\n\n`
+            : '';
+        const combatProfileGuidanceBasic = buildCombatProfileRouterGuidance(!!activeCombatBlock, 'basic');
+        const combatProfileGuidanceAgent = buildCombatProfileRouterGuidance(!!activeCombatBlock, 'agent');
+
+        const sysTemplate = adjustPromptTimestamps(settings.routerSystemPromptTemplate || 'You are the Lorebook Agent. Maintain narrative consistency and manage lorebooks.', settings);
+        const basePrompt = sysTemplate
             .replace(/\{\{campaignRoot\}\}/g, prefix || 'World Chronicle')
             .replace(/\{\{user\}\}/g, ctx.name1 || 'User');
 
@@ -473,7 +637,10 @@ export async function runRouterPass(narrativeOutput, manualPrompt = null, custom
 7. Do NOT activate, deactivate, record, or delete entries except via CONSOLIDATE targets.
 8. Do NOT consolidate entries of different categories (e.g., do NOT merge an NPC or Location into a Quest or Event). Consolidation is strictly for true duplicates representing the exact same entity or concept (e.g., two entries for the same NPC).
 9. Do NOT merge multiple distinct chronological events into a single entry to "reduce fragmentation". Each distinct event must remain as a separate entry so it triggers on its own keywords.
-10. Output your reasoning first, then the tags.`;
+10. NEVER modify, shorten, or delete content within \`[CORE] ... [/CORE]\` blocks under any circumstances. Keep the tags and their inner content completely unchanged. The system programmatically overwrites any modifications to the CORE block with the original, so editing it is useless.
+11. For legacy NPC entries lacking these tags, identify their persistent sections (Appearance/Species, Appearance, Personality, Brief Background, Habits/Behaviors) and wrap them inside a \`[CORE] ... [/CORE]\` block to protect them from future passes. Do not include Relationship, Friendship/Rapport, or Affection/Interest lines inside the block.
+12. Compress turn-by-turn or granular combat status logs (e.g., creature HP changes, turn-by-turn action lists, temporary conditions mid-fight) into high-level updates: for long combats, preserve the initiation (who/what attacked {{user}}), a progress summary every ~5 rounds (capturing major shifts or stalemates), and the final outcome.
+13. Output your reasoning first, then the tags.`;
 
             let agentInstructionPrompt = `You are the Lorebook Archivist. Consolidate bloated lorebook entries using the tools provided.
 
@@ -492,7 +659,10 @@ For each flagged entry:
 6. Do NOT activate, deactivate, record, or create new entries.
 7. Do NOT consolidate entries of different categories (e.g., do NOT merge an NPC or Location into a Quest or Event). Consolidation is strictly for true duplicates representing the exact same entity (e.g., two entries for the same NPC).
 8. Do NOT merge multiple distinct chronological events into a single entry to "reduce fragmentation". Each distinct historical event must remain as its own entry so it triggers on its specific keywords.
-9. Call commit exactly once at the end. Do not call it per-entry.`;
+9. NEVER modify, shorten, or delete content within \`[CORE] ... [/CORE]\` blocks under any circumstances. Keep the tags and their inner content completely unchanged. The system programmatically overwrites any modifications to the CORE block with the original, so editing it is useless.
+10. For legacy NPC entries lacking these tags, identify their persistent sections (Appearance/Species, Appearance, Personality, Brief Background, Habits/Behaviors) and wrap them inside a \`[CORE] ... [/CORE]\` block to protect them from future passes. Do not include Relationship, Friendship/Rapport, or Affection/Interest lines inside the block.
+11. Compress turn-by-turn or granular combat status logs (e.g., creature HP changes, turn-by-turn action lists, temporary conditions mid-fight) into high-level updates: for long combats, preserve the initiation (who/what attacked {{user}}), a progress summary every ~5 rounds (capturing major shifts or stalemates), and the final outcome.
+12. Call commit exactly once at the end. Do not call it per-entry.`;
 
             if (customInstructions) {
                 const overrideText = `\n\n## USER CUSTOM REQUIREMENTS\nYou MUST adhere strictly to these custom compression instructions:\n- ${customInstructions}`;
@@ -513,7 +683,7 @@ For each flagged entry:
                     : agentInstructionPrompt + `
 
 ## ACTIONS
-You do NOT have access to native function calling. Output exactly ONE action per turn in plain text:
+You do NOT have access to native function calling. Output exactly ONE action per turn in plain text (do NOT use markdown bold/italic formatting on the 'Action:' or 'Thought:' labels, write them as plain text):
   Action: toolname({"arg": "value"})
 
 Available actions:
@@ -686,11 +856,13 @@ Action: commit({"rewrite": [{"id": "Eldoria_Events::3", "content": "Compressed v
                 const callId = /** @type {any} */ (resolvedToolCall).id || `call_cleanup_${Date.now()}_${cleanupTurns}`;
                 broadcastStep('tool', `${toolName}(...)`);
 
-                cleanupMessages.push({
+                const _asstCleanup = {
                     role: 'assistant',
                     content: result.content || null,
                     tool_calls: [{ id: callId, type: 'function', function: { name: toolName, arguments: JSON.stringify(args) } }]
-                });
+                };
+                if (result.reasoning) _asstCleanup.reasoning_content = result.reasoning;
+                cleanupMessages.push(_asstCleanup);
 
                 let observation = '';
                 if (toolName === 'commit') {
@@ -707,23 +879,21 @@ Action: commit({"rewrite": [{"id": "Eldoria_Events::3", "content": "Compressed v
                     }
                 } else if (toolName === 'read_entry') {
                     const uid = args.uid || '';
-                    const [bookName, id] = uid.split('::');
-                    const book = await ctx.loadWorldInfo(bookName);
-                    observation = book?.entries?.[id] ? book.entries[id].content : `Entry "${uid}" not found.`;
-                } else if (toolName === 'grep_lore') {
-                    const query = (args.query || '').toLowerCase();
-                    const hits = [];
-                    for (const [name, book] of Object.entries(archiveBooks)) {
-                        for (const [uid, entry] of Object.entries(book.entries)) {
-                            if ((entry.content || '').toLowerCase().includes(query) || (entry.comment || '').toLowerCase().includes(query)) {
-                                hits.push(`[${name}::${uid}] "${entry.comment || uid}": ${(entry.content || '').substring(0, 120)}...`);
-                            }
-                        }
+                    if (isSkeletonEntryId(uid)) {
+                        observation = 'World Skeleton entries are not accessible to the Lorebook Agent.';
+                    } else {
+                        const [bookName, id] = uid.split('::');
+                        const book = await ctx.loadWorldInfo(bookName);
+                        observation = book?.entries?.[id] ? book.entries[id].content : `Entry "${uid}" not found.`;
                     }
+                } else if (toolName === 'grep_lore') {
+                    const hits = grepLoreInBooks(archiveBooks, args.query);
                     observation = hits.length > 0 ? hits.join('\n') : `No entries found for "${args.query}".`;
                 } else if (toolName === 'inspect_book') {
                     const bookName = args.book_name || '';
-                    if (archiveBooks[bookName]) {
+                    if (isSkeletonBookName(bookName)) {
+                        observation = 'World Skeleton lorebooks are not accessible to the Lorebook Agent.';
+                    } else if (archiveBooks[bookName]) {
                         observation = Object.entries(archiveBooks[bookName].entries)
                             .map(([uid, e]) => `${bookName}::${uid} -- ${e.comment || e.key?.[0] || uid}`)
                             .join('\n');
@@ -751,6 +921,13 @@ Action: commit({"rewrite": [{"id": "Eldoria_Events::3", "content": "Compressed v
         }
         // ── End Cleanup Mode ──────────────────────────────────────────────────
 
+        // -- Section Names List Setup ------------------------------------------
+        let coreSections = settings.npcCoreSections;
+        if (!coreSections || !Array.isArray(coreSections) || coreSections.length === 0) {
+            coreSections = DEFAULT_NPC_SECTIONS;
+        }
+        const sectionNamesList = coreSections.map(s => s.name).join(', ');
+
         // -- Basic Mode (tag-based, one-shot, no tool calling) -----------------
         if (settings.routerBasicMode) {
 
@@ -776,6 +953,18 @@ Action: commit({"rewrite": [{"id": "Eldoria_Events::3", "content": "Compressed v
             modularPrompt = modularPrompt.replace(/\{\{#if_world\}\}[\s\S]*?\{\{\/if_world\}\}/g, '');
             modularPrompt = modularPrompt.replace(/\{\{#if_world\}\}|\{\{\/if_world\}\}|\{\{dayStr\}\}|\{\{prevDay\}\}/g, '');
 
+            const relSection = settings.npcRelationshipBars ? `
+${buildRouterRelationshipInstruction(getNpcRelationshipMax(settings))}
+` : '';
+
+            // coreSections and sectionNamesList are defined above
+            let exampleCoreLines = '';
+            if (coreSections[0]) exampleCoreLines += `${coreSections[0].name}: A burly human blacksmith with a scar on his cheek.\n`;
+            if (coreSections[1]) exampleCoreLines += `${coreSections[1].name}: Gruff but reliable.\n`;
+            if (coreSections[2]) exampleCoreLines += `${coreSections[2].name}: Retired from the militia to open his own forge.\n`;
+            if (coreSections[3]) exampleCoreLines += `${coreSections[3].name}: Wipes his brow with a greasy rag.\n`;
+            exampleCoreLines = exampleCoreLines.trim();
+
             const basicSystemPrompt = `You are the Research Assistant. Your task is to identify and record important narrative entities and events.
 
 ${modularPrompt}
@@ -786,25 +975,56 @@ ${modularPrompt}
 3. **ARCHIVE INDEX**: Inactive entries — labels and keywords only. You CANNOT see their full biography.
 4. **RECALL**: To read or update an archive entry, use [[ACTIVATE: Name]]. Its full content becomes visible next turn.
 5. **LIMIT**: You are limited to **${settings.routerMaxActivations || 8} active entries**. Nothing is archived automatically. If you exceed this limit you will see a **BUDGET VIOLATION** line and you MUST use [[DEACTIVATE: Name]] on the least relevant active entries to return within budget before this pass ends.
+${relSection}
+## [CORE] BY CATEGORY
+- **NPC**: structured \`[CORE]\` with ${sectionNamesList} (see NPC field instructions below).
+- **LOC**: plain \`[CORE]\` with 1–2 sentences describing the place. No field headers.
+- **FAC**: plain \`[CORE]\` wrapping permanent history, ideology, schemes, and members. No field headers.
+- **QUEST, EVENT**: do NOT use \`[CORE]\`. Use timestamped chronicle lines only.
 
+## PLAYER CHARACTER SAFEGUARD
+- Do NOT create a lorebook entry (NPC, Location, Faction, etc.) for the player character under any circumstances.
+- The player character is the speaker labeled "Player" (and prompt replacement "{{user}}"). In the chat logs, pay close attention to what name(s) or alias(es) the other characters use when addressing or referring to the "Player" (e.g., if they call the Player "Dave Davidson" or "Dave", then "Dave Davidson" is the player character).
+- Under no circumstances should you create an NPC entry for these names/aliases, because they refer to the player.
+- Always use the exact macro string \`{{user}}\` when referring to the player. Do NOT write the plain word "user", "player", "Player", or the player's roleplay character name (like "Dave Davidson") in plain text in any entry updates or descriptions.
+
+## NPC CORE UPDATES (NPC only)
+If any field inside the permanent [CORE] block changes, is updated, or new information is revealed (${sectionNamesList}), output:
+  [[UPDATE_CORE: Book::UID or NPC Name | FieldName | New field text]]
+Use the exact FieldName (e.g. ${sectionNamesList}). Do NOT log core updates as normal event/update entries.
+
+## DO NOT RE-RECORD EXISTING ENTITIES
+Before outputting [[NPC:...]], [[LOC:...]], [[FAC:...]], etc. for anyone or anything, check ACTIVE MEMORY and ARCHIVE INDEX for a matching name (they may be listed under a different label — check keywords too).
+- If the entity ALREADY EXISTS (in ACTIVE MEMORY, in NEWLY ACTIVATED, or in the ARCHIVE INDEX): do NOT output a new [[NPC:...]]/[[LOC:...]]/[[FAC:...]] tag with a fresh [CORE] block for them, even if you don't currently see their full content. Instead:
+  - To change/add a [CORE] field: use [[UPDATE_CORE: Name | FieldName | new text]].
+  - To append a chronicle/timeline note: use the module's normal update format (e.g. re-use the [[EVENT:...]] name to accumulate, or update the existing entry) — never a second [CORE] block.
+  - To bring an archived entry into full view first: use [[ACTIVATE: Name]].
+- Only use a fresh [[NPC:...]]/[[LOC:...]]/[[FAC:...]] record for entities that are BRAND NEW and have never appeared in ACTIVE MEMORY or ARCHIVE INDEX before.
+${combatProfileGuidanceBasic}
 ## RULES
 1. Only record persistent or significant entities/events.
 2. Use ACTIVATE to bring an existing entry into the current scene context.
 3. Use DEACTIVATE to remove an entry that is no longer relevant to the scene.
 4. Use DELETE to permanently remove duplicate or redundant entries.
-5. Output your thoughts first, then the tags.
+5. Do NOT create any entry for the player character (e.g. "Player" or "Dave Davidson").
+6. CRITICAL: Do NOT blindly copy the formatting or sections of other characters found in ACTIVE MEMORY. You MUST strictly use ONLY the sections instructed below (${sectionNamesList}) for NPCs and ignore any other sections.
+7. Output your thoughts first, then the tags.
 
 Example:
 Thought: I see a new NPC named Barnaby in Khelt's Rust-Lantern District. I will record him and the tavern.
-[[NPC: Barnaby | A retired blacksmith with a scar on his cheek. | Barnaby, blacksmith, ally]]
-[[LOC: Khelt :: Rust-Lantern District :: Barnaby's Forge | Barnaby's old workshop, still smelling of soot. | forge, Khelt, Rust-Lantern]]
-[[FAC: Iron Syndicate | Wary of outsiders after the forge raid; still dominant in the industrial quarter. | Founded by ex-mercenaries forty years ago; controls scrap tariffs and smuggling. Lieutenant Marna Voss handles street enforcement. | Iron Syndicate, Khelt, faction, smuggling]]`;
+[[NPC: Barnaby | [CORE]
+${exampleCoreLines}
+[/CORE] | Barnaby, blacksmith, ally]]
+[[LOC: Khelt :: Rust-Lantern District :: Barnaby's Forge | [CORE]
+A squat iron building managing mining contracts; soot-stained walls and a clanging workshop floor.
+[/CORE] | Barnaby's Forge, forge, Khelt, Rust-Lantern]]
+[[FAC: Iron Syndicate | Wary of outsiders after the forge raid; still dominant in the industrial quarter. | [CORE]Founded by ex-mercenaries forty years ago; controls scrap tariffs and smuggling. Lieutenant Marna Voss handles street enforcement.[/CORE] | Iron Syndicate, Khelt, faction, smuggling]]`;
 
             const finalBasicSystemPrompt = basicSystemPrompt;
 
             const questMatchB = settings.currentMemo?.match(/\[QUESTS\]([\s\S]*?)\[\/QUESTS\]/i);
             const questBlockB = questMatchB ? `[QUESTS]${questMatchB[1].trim()}[/QUESTS]` : 'None';
-            const basicUserPrompt = `## BUDGET STATUS\n${budgetLine}${overflowInstruction}\n\n## NEWLY ACTIVATED THIS TURN\n${newlyTriggeredFull.join('\n\n') || 'None.'}\n\n## ACTIVE MEMORY (Lore)\n${activeEntriesFull.join('\n\n') || 'None.'}\n\n## ARCHIVE INDEX\n${keyringText || 'Empty.'}\n\n## CURRENT LOCATION\n${currentHierarchy || 'Unknown'}\n\n## ACTIVE QUESTS\n${questBlockB}\n\n## NARRATIVE\n${recentChatString}\n\n${manualPrompt ? `## INSTRUCTION\n${manualPrompt}\n\n` : ''}`;
+            const basicUserPrompt = `## BUDGET STATUS\n${budgetLine}${overflowInstruction}\n\n## NEWLY ACTIVATED THIS TURN\n${newlyTriggeredFull.join('\n\n') || 'None.'}\n\n## ACTIVE MEMORY (Lore)\n${activeEntriesFull.join('\n\n') || 'None.'}\n\n## ARCHIVE INDEX\n${keyringText || 'Empty.'}\n\n## CURRENT LOCATION\n${currentHierarchy || 'Unknown'}\n\n## ACTIVE QUESTS\n${questBlockB}\n\n${activeCombatSection}## NARRATIVE\n${recentChatString}\n\n${manualPrompt ? `## INSTRUCTION\n${manualPrompt}\n\n` : ''}`;
 
             broadcastStep('thought', 'Thinking...');
             const basicResp = await sendStateRequest(routerSettings, finalBasicSystemPrompt, basicUserPrompt, _routerSignal);
@@ -814,11 +1034,12 @@ Thought: I see a new NPC named Barnaby in Khelt's Rust-Lantern District. I will 
             broadcastStep('thought', 'Parsing tags...');
             const basicAction = parseBasicTags(basicResp, archiveBooks);
 
-            if (basicAction.record.length > 0 || basicAction.update.length > 0 || basicAction.activate.length > 0 || basicAction.delete_ids?.length > 0) {
+            if (basicAction.record.length > 0 || basicAction.update.length > 0 || basicAction.activate.length > 0 || basicAction.delete_ids?.length > 0 || basicAction.rel?.length > 0 || basicAction.appearance?.length > 0 || basicAction.core?.length > 0) {
                 const summaries = [];
                 if (basicAction.record.length) summaries.push(`New: ${basicAction.record.length}`);
                 if (basicAction.update.length) summaries.push(`Updates: ${basicAction.update.length}`);
                 if (basicAction.activate.length) summaries.push(`Activations: ${basicAction.activate.length}`);
+                if (basicAction.core?.length || basicAction.appearance?.length) summaries.push(`Core: ${(basicAction.core?.length || 0) + (basicAction.appearance?.length || 0)}`);
                 basicAction.reason = (thoughtMatchB ? thoughtMatchB[1].trim() : 'Tag-based update.') + ` (${summaries.join(', ')})`;
                 await applyAction(basicAction, archiveBooks, currentTime, breadcrumb);
                 basicSummaryText = summaries.join(', ');
@@ -835,6 +1056,125 @@ Thought: I see a new NPC named Barnaby in Khelt's Rust-Lantern District. I will 
                 ...(settings.routerCustomTags || []).map(t => t.tag.toUpperCase()),
             ];
             const categoryEnum = validCategories.length ? validCategories : ['NPC', 'LOC', 'QUEST', 'FAC', 'EVENT'];
+
+            // Dynamically build the commit tool parameters based on settings
+            const commitProperties = {
+                record: {
+                    type: 'array',
+                    description: 'Creates a BRAND-NEW entry only. Never use this for a name that already appears in ACTIVE MEMORY, NEWLY ACTIVATED THIS TURN, or the ARCHIVE INDEX — that would duplicate their [CORE] block. For an existing entity, use "core" (identity/Combat Profile fields) or "update" (chronicle text) instead.',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            label: { type: 'string', description: 'Entity name only. NO tag prefix (e.g. "Iron Syndicate", NOT "FAC: Iron Syndicate"). Do NOT record the player character under any name (including "Player" or their roleplay character name/alias like "Dave Davidson").' },
+                            keys:  { type: 'array', items: { type: 'string' }, description: 'Search keywords. Include the entity name/title itself (without timestamps like "[Day 1]") as a keyword, plus any ancestor location names.' },
+                            content:  { type: 'string', description: `Full entry body. NPC: structured [CORE] with ${sectionNamesList}. LOC: plain [CORE] with 1–2 sentences (no field headers). FAC: plain [CORE] wrapping permanent history, ideology, schemes. QUEST/EVENT: no [CORE]; use chronicle format.` },
+                            category: { type: 'string', enum: categoryEnum, description: 'Determines which lorebook the entry goes into.' }
+                        },
+                        required: ['label', 'keys', 'content', 'category']
+                    }
+                },
+                update: {
+                    type: 'array',
+                    description: 'Append new information to existing entries.',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            id:      { type: 'string', description: 'Book::UID format (e.g. "Eldoria_NPCs::0").' },
+                            content: { type: 'string', description: 'New information to append.' }
+                        },
+                        required: ['id', 'content']
+                    }
+                },
+                activate:   { type: 'array', items: { type: 'string' }, description: 'Book::UID IDs to move into active context.' },
+                deactivate: { type: 'array', items: { type: 'string' }, description: 'Book::UID IDs to remove from active context.' },
+                delete_ids: { type: 'array', items: { type: 'string' }, description: 'Book::UID IDs to permanently delete.' },
+                rewrite: {
+                    type: 'array',
+                    description: 'Replace the entire content of existing entries. Use for compressing bloated entries.',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            id:      { type: 'string', description: 'Book::UID of the entry to rewrite.' },
+                            content: { type: 'string', description: 'New canonical content. Replaces everything.' }
+                        },
+                        required: ['id', 'content']
+                    }
+                },
+                consolidate: {
+                    type: 'array',
+                    description: 'Merge multiple entries into one. All targets are deleted; the survivor gets the new content. Use rename in the same commit to give the survivor a canonical label/keys after merging.',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            targets:  {
+                                type: 'array',
+                                items: { type: 'string' },
+                                description: 'One or more Book::UID IDs to delete after merging.'
+                            },
+                            survivor: { type: 'string', description: 'Book::UID of the entry to keep, with merged content.' },
+                            content:  { type: 'string', description: 'Full merged canonical content for the survivor.' }
+                        },
+                        required: ['targets', 'survivor', 'content']
+                    }
+                },
+                rename: {
+                    type: 'array',
+                    description: 'Change the display label and/or keyword list of an existing entry without modifying its content. Use when an entity is revealed, renamed, or destroyed, or to give a consolidation survivor a canonical label. Max 6 keywords per entry — choose only the most essential trigger words.',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            id:    { type: 'string', description: 'Book::UID of the entry to rename/rekey.' },
+                            label: { type: 'string', description: 'New display label. Omit to keep the current label.' },
+                            keys:  { type: 'array', items: { type: 'string' }, description: 'Full replacement keyword list (max 6). Replaces existing keywords entirely. Omit to keep current keywords.' }
+                        },
+                        required: ['id']
+                    }
+                }
+            };
+
+            if (settings.npcRelationshipBars) {
+                const relMax = getNpcRelationshipMax(settings);
+                commitProperties.rel = {
+                    type: 'array',
+                    description: `Set INITIAL/STARTING relationship values for NEWLY RECORDED NPCs only. When you record a new NPC, infer an appropriate starting delta from narrative context (see NPC relationship guidelines — values scale to ±${relMax}). Do NOT use this for ongoing relationship changes — those are tracked automatically by the system from the narrative output. Output only the delta, not the total.`,
+                    items: {
+                        type: 'object',
+                        properties: {
+                            id:    { type: 'string', description: 'Book::UID or plain NPC name.' },
+                            field: { type: 'string', enum: ['friendship', 'affection'], description: 'Which relationship axis to update.' },
+                            delta: { type: 'integer', description: `Signed integer delta (e.g. 15 or -20). Range: -${relMax} to +${relMax}.` }
+                        },
+                        required: ['id', 'field', 'delta']
+                    }
+                };
+            }
+
+            commitProperties.appearance = {
+                type: 'array',
+                description: 'Surgically update the Appearance field inside an NPC\'s [CORE] block. Only use when the NPC\'s physical appearance changes significantly.',
+                items: {
+                    type: 'object',
+                    properties: {
+                        id:      { type: 'string', description: 'Book::UID of the NPC entry.' },
+                        content: { type: 'string', description: 'New appearance text. Replaces only the Appearance field inside [CORE].' }
+                    },
+                    required: ['id', 'content']
+                }
+            };
+
+            commitProperties.core = {
+                type: 'array',
+                description: `Surgically update one of the fields inside an NPC's [CORE] block (${sectionNamesList}). Only use when new information is revealed or permanent changes occur.`,
+                items: {
+                    type: 'object',
+                    properties: {
+                        id:      { type: 'string', description: 'Book::UID or plain NPC name (from ACTIVE MEMORY).' },
+                        field:   { type: 'string', enum: coreSections.map(s => s.name), description: 'The exact field inside [CORE] to update.' },
+                        content: { type: 'string', description: 'New field content text.' }
+                    },
+                    required: ['id', 'field', 'content']
+                }
+            };
 
             /** @type {Array<object>} */
             const agentTools = [
@@ -881,79 +1221,7 @@ Thought: I see a new NPC named Barnaby in Khelt's Rust-Lantern District. I will 
                         description: 'Write all changes to the lorebook and finish the research pass. The ONLY way to persist data.',
                         parameters: {
                             type: 'object',
-                            properties: {
-                                record: {
-                                    type: 'array',
-                                    description: 'New entries to create. Recording an entry with an existing label automatically updates it.',
-                                    items: {
-                                        type: 'object',
-                                        properties: {
-                                            label: { type: 'string', description: 'Entity name only. NO tag prefix (e.g. "Iron Syndicate", NOT "FAC: Iron Syndicate").' },
-                                            keys:  { type: 'array', items: { type: 'string' }, description: 'Search keywords. Include the entity name/title itself (without timestamps like "[Day 1]") as a keyword, plus any ancestor location names.' },
-                                            content:  { type: 'string', description: 'Full description.' },
-                                            category: { type: 'string', enum: categoryEnum, description: 'Determines which lorebook the entry goes into.' }
-                                        },
-                                        required: ['label', 'keys', 'content', 'category']
-                                    }
-                                },
-                                update: {
-                                    type: 'array',
-                                    description: 'Append new information to existing entries.',
-                                    items: {
-                                        type: 'object',
-                                        properties: {
-                                            id:      { type: 'string', description: 'Book::UID format (e.g. "Eldoria_NPCs::0").' },
-                                            content: { type: 'string', description: 'New information to append.' }
-                                        },
-                                        required: ['id', 'content']
-                                    }
-                                },
-                                activate:   { type: 'array', items: { type: 'string' }, description: 'Book::UID IDs to move into active context.' },
-                                deactivate: { type: 'array', items: { type: 'string' }, description: 'Book::UID IDs to remove from active context.' },
-                                delete_ids: { type: 'array', items: { type: 'string' }, description: 'Book::UID IDs to permanently delete.' },
-                                rewrite: {
-                                    type: 'array',
-                                    description: 'Replace the entire content of existing entries. Use for compressing bloated entries.',
-                                    items: {
-                                        type: 'object',
-                                        properties: {
-                                            id:      { type: 'string', description: 'Book::UID of the entry to rewrite.' },
-                                            content: { type: 'string', description: 'New canonical content. Replaces everything.' }
-                                        },
-                                        required: ['id', 'content']
-                                    }
-                                },
-                                consolidate: {
-                                    type: 'array',
-                                    description: 'Merge multiple entries into one. All targets are deleted; the survivor gets the new content. Use rename in the same commit to give the survivor a canonical label/keys after merging.',
-                                    items: {
-                                        type: 'object',
-                                        properties: {
-                                            targets:  {
-                                                type: 'array',
-                                                items: { type: 'string' },
-                                                description: 'One or more Book::UID IDs to delete after merging.'
-                                            },
-                                            survivor: { type: 'string', description: 'Book::UID of the entry to keep, with merged content.' },
-                                            content:  { type: 'string', description: 'Full merged canonical content for the survivor.' }
-                                        },
-                                        required: ['targets', 'survivor', 'content']
-                                    }
-                                },
-                                rename: {
-                                    type: 'array',
-                                    description: 'Change the display label and/or keyword list of an existing entry without modifying its content. Use when an entity is revealed, renamed, or destroyed, or to give a consolidation survivor a canonical label. Max 6 keywords per entry — choose only the most essential trigger words.',
-                                    items: {
-                                        type: 'object',
-                                        properties: {
-                                            id:    { type: 'string', description: 'Book::UID of the entry to rename/rekey.' },
-                                            label: { type: 'string', description: 'New display label. Omit to keep the current label.' },
-                                            keys:  { type: 'array', items: { type: 'string' }, description: 'Full replacement keyword list (max 6). Replaces existing keywords entirely. Omit to keep current keywords.' }
-                                        },
-                                        required: ['id']
-                                    }
-                                }
-                            }
+                            properties: commitProperties
                         }
                     }
                 }
@@ -973,6 +1241,17 @@ Maximum Active Entities: **${settings.routerMaxActivations || 8}**.
 - Entries whose keywords appeared in the latest narrator output may already appear under **NEWLY ACTIVATED THIS TURN** with full content — you do not need to activate those again.
 - Always use exact Book::UID format (e.g. "Eldoria_NPCs::0") for activate/update/deactivate/delete_ids.
 
+## DO NOT RE-RECORD EXISTING ENTITIES
+Before using \`record\` for anyone or anything, check ACTIVE MEMORY, NEWLY ACTIVATED THIS TURN, and the ARCHIVE INDEX for a matching name (check keywords too, they may be listed under a different label).
+- If the entity ALREADY EXISTS anywhere in that context — even if you only see its label in the ARCHIVE INDEX with no full content — do NOT call \`record\` for it. Instead:
+  - To change/add a [CORE] field (identity, appearance, or Combat Profile): use \`commit({"core": [{"id": "Book::UID or Name", "field": "...", "content": "..."}]})\`.
+  - To append new chronicle text: use \`commit({"update": [{"id": "Book::UID or Name", "content": "..."}]})\`.
+  - To see its full content first: use \`read_entry\` or \`grep_lore\`, or \`activate\` it.
+- Only use \`record\` for entities that are BRAND NEW and have never appeared in ACTIVE MEMORY, NEWLY ACTIVATED, or the ARCHIVE INDEX before.
+
+## WORLD SKELETON (OFF-LIMITS)
+World Skeleton lorebooks (names ending in _Skeleton) are hidden seed data for World Progression only. They are NOT in your archive, tools cannot access them, and you must NEVER activate, read, update, or commit changes to Skeleton entries.
+
 ## CAMPAIGN CONTEXT
 Campaign Root: "${prefix || 'World Archive'}"
   NPCs -> "${prefix ? prefix + '_NPCs' : 'NPCs'}"
@@ -985,9 +1264,21 @@ Include the entity name/title itself (without timestamps like "[Day 1]") as a ke
 - Each time-stamped event must start on its own line. Do NOT chain multiple '[Day X, ...]' entries on the same line.
 - Correct: '[Day 2, 10:42] Corruption manifests.\n[Day 2, 10:44] Sentry targets Rozach.'
 - Wrong:   '[Day 2, 10:42] Corruption manifests. [Day 2, 10:44] Sentry targets Rozach.'
+- **[CORE] by category:** NPC = structured fields inside [CORE] (see NPC instructions). LOC = plain [CORE], 1–2 sentences, no field headers. FAC = plain [CORE] wrapping permanent history/ideology, no field headers. QUEST/EVENT = no [CORE].
+- CRITICAL: Do NOT blindly copy the formatting or sections of other characters found in ACTIVE MEMORY. You MUST strictly use ONLY the sections instructed below for NPCs and ignore any other sections.
 
 ## FIELD INSTRUCTIONS
-${Object.values(settings.routerModules || {}).filter(m => m.enabled).map(m => `- ${m.tag}: ${m.instruction}`).join('\n')}${(settings.routerCustomTags || []).length ? '\n\n### CUSTOM CATEGORIES\n' + (settings.routerCustomTags || []).map(m => `- ${m.tag.toUpperCase()}: ${m.instruction}`).join('\n') : ''}`;
+${Object.values(settings.routerModules || {}).filter(m => m.enabled).map(m => `- ${m.tag}: ${m.instruction}`).join('\n')}${(settings.routerCustomTags || []).length ? '\n\n### CUSTOM CATEGORIES\n' + (settings.routerCustomTags || []).map(m => `- ${m.tag.toUpperCase()}: ${m.instruction}`).join('\n') : ''}${combatProfileGuidanceAgent}`;
+
+            const commitActionSchema = settings.npcRelationshipBars
+                ? `commit({"record": [...], "update": [...], "rename": [...], "activate": [...], "deactivate": [...], "delete_ids": [...], "rel": [...], "core": [...]}) — write all changes and finish`
+                : `commit({"record": [...], "update": [...], "rename": [...], "activate": [...], "deactivate": [...], "delete_ids": [...], "core": [...]}) — write all changes and finish`;
+
+            const commitRelDescription = settings.npcRelationshipBars
+                ? `\ncommit rel items: {"id": "Book::UID or NPC Name", "field": "friendship"|"affection", "delta": ±N} — set INITIAL relationship values for newly recorded NPCs only (signed integer delta)`
+                : ``;
+
+            const adjustedSharedContext = adjustPromptTimestamps(sharedContext, settings);
 
             const agentSystemPrompt = usesNativeTools
                 // Clean prompt for native tool calling ? model gets schemas via the API
@@ -997,7 +1288,7 @@ ${Object.values(settings.routerModules || {}).filter(m => m.enabled).map(m => `-
 You are a lorebook research agent. Maintain the campaign lorebook using the provided tools.
 Use grep_lore / inspect_book / read_entry to look up existing data before recording.
 When research is complete, call commit once to write all changes. Stop immediately after.
-${sharedContext}`
+${adjustedSharedContext}`
                 // Text-format prompt for profile/default ? model outputs Action:/Observation: text
                 : `${basePrompt}
 
@@ -1007,27 +1298,28 @@ Use grep_lore / inspect_book / read_entry to look up existing data before record
 When research is complete, output commit once to write all changes, then stop.
 
 ## ACTIONS
-Output exactly ONE action per turn in this format:
+Output exactly ONE action per turn in this format (do NOT use markdown bold/italic formatting on the 'Action:' or 'Thought:' labels, write them as plain text):
   Action: toolname({"arg": "value"})
 
 Available actions:
 - grep_lore({"query": "..."}) ? search lorebooks for entries matching a keyword
 - inspect_book({"book_name": "..."}) ? list UIDs in a lorebook
 - read_entry({"uid": "Book::0"}) ? read full content of an entry
-- commit({"record": [...], "update": [...], "rename": [...], "activate": [...], "deactivate": [...], "delete_ids": [...]}) ? write all changes and finish
+- commit({${settings.npcRelationshipBars ? '"record": [...], "update": [...], "rename": [...], "activate": [...], "deactivate": [...], "delete_ids": [...], "rel": [...], "core": [...]' : '"record": [...], "update": [...], "rename": [...], "activate": [...], "deactivate": [...], "delete_ids": [...], "core": [...]'}}) ? write all changes and finish
 
 commit record items: {"label": "Name only (NO tag prefix)", "keys": ["kw1","kw2"], "content": "...", "category": "NPC|LOC|FAC|QUEST|EVENT"}
 commit update items: {"id": "Book::UID", "content": "new text to append"}
-commit rename items: {"id": "Book::UID", "label": "New Name (optional)", "keys": ["kw1","kw2"] (optional, max 6)}
+commit rename items: {"id": "Book::UID", "label": "New Name (optional)", "keys": ["kw1","kw2"] (optional, max 6)}${commitRelDescription}
+commit core items: {"id": "Book::UID or NPC Name", "field": "${coreSections.map(s => s.name).join('|')}", "content": "new field content"} — surgically updates a field inside [CORE] on NPC entries only (prefer over re-recording the full NPC)
 
 ## EXAMPLE
 Thought: I see a new faction called Iron Syndicate. I will record it.
 Action: commit({"record": [{"label": "Iron Syndicate", "keys": ["Khelt", "faction"], "content": "The dominant industrial authority.", "category": "FAC"}]})
-${sharedContext}`;
+${adjustedSharedContext}`;
 
             const questMatchA = settings.currentMemo?.match(/\[QUESTS\]([\s\S]*?)\[\/QUESTS\]/i);
             const questBlockA = questMatchA ? `[QUESTS]${questMatchA[1].trim()}[/QUESTS]` : 'None';
-            const contextMessage = `## BUDGET STATUS\n${budgetLine}${overflowInstruction}\n\n## NEWLY ACTIVATED THIS TURN\n${newlyTriggeredFull.join('\n\n') || 'None.'}\n\n## ACTIVE MEMORY (Lore)\n${activeEntriesFull.join('\n\n') || 'None yet.'}\n\n## ARCHIVE INDEX\n${keyringText || 'Empty.'}\n\n## CURRENT LOCATION\n${currentHierarchy || 'Unknown'}\n\n## ACTIVE QUESTS\n${questBlockA}\n\n## NARRATIVE\n${recentChatString}${manualPrompt ? `\n\n## INSTRUCTION\n${manualPrompt}` : ''}`;
+            const contextMessage = `## BUDGET STATUS\n${budgetLine}${overflowInstruction}\n\n## NEWLY ACTIVATED THIS TURN\n${newlyTriggeredFull.join('\n\n') || 'None.'}\n\n## ACTIVE MEMORY (Lore)\n${activeEntriesFull.join('\n\n') || 'None yet.'}\n\n## ARCHIVE INDEX\n${keyringText || 'Empty.'}\n\n## CURRENT LOCATION\n${currentHierarchy || 'Unknown'}\n\n## ACTIVE QUESTS\n${questBlockA}\n\n${activeCombatSection}## NARRATIVE\n${recentChatString}${manualPrompt ? `\n\n## INSTRUCTION\n${manualPrompt}` : ''}`;
 
             /** @type {Array<{role:string, content:string|null, tool_calls?:any[], tool_call_id?:string}>} */
             const messages = [
@@ -1085,8 +1377,9 @@ ${sharedContext}`;
                 const callId = /** @type {any} */ (resolvedToolCall).id || `call_${Date.now()}_${turns}`;
                 broadcastStep('tool', `${toolName}(...)`);
 
-                // Append the assistant turn (with tool_calls) to the conversation
-                messages.push({
+                // Append the assistant turn (with tool_calls) to the conversation.
+                // DeepSeek thinking models require reasoning_content to be passed back.
+                const _asstMsg = {
                     role: 'assistant',
                     content: result.content || null,
                     tool_calls: [{
@@ -1094,7 +1387,9 @@ ${sharedContext}`;
                         type: 'function',
                         function: { name: toolName, arguments: JSON.stringify(args) }
                     }]
-                });
+                };
+                if (result.reasoning) _asstMsg.reasoning_content = result.reasoning;
+                messages.push(_asstMsg);
 
                 let observation = '';
 
@@ -1112,19 +1407,13 @@ ${sharedContext}`;
                         observation = `Committed successfully. ${details.join(' | ')}`;
                     }
                 } else if (toolName === 'grep_lore') {
-                    const query = (args.query || '').toLowerCase();
-                    const hits = [];
-                    for (const [name, book] of Object.entries(archiveBooks)) {
-                        for (const [uid, entry] of Object.entries(book.entries)) {
-                            if ((entry.content || '').toLowerCase().includes(query) || (entry.comment || '').toLowerCase().includes(query)) {
-                                hits.push(`[${name}::${uid}] "${entry.comment || uid}": ${(entry.content || '').substring(0, 120)}...`);
-                            }
-                        }
-                    }
+                    const hits = grepLoreInBooks(archiveBooks, args.query);
                     observation = hits.length > 0 ? hits.join('\n') : `No entries found for "${args.query}".`;
                 } else if (toolName === 'inspect_book') {
                     const bookName = args.book_name || '';
-                    if (archiveBooks[bookName]) {
+                    if (isSkeletonBookName(bookName)) {
+                        observation = 'World Skeleton lorebooks are not accessible to the Lorebook Agent.';
+                    } else if (archiveBooks[bookName]) {
                         observation = Object.entries(archiveBooks[bookName].entries)
                             .map(([uid, e]) => `${bookName}::${uid} -- ${e.comment || e.key?.[0] || uid}`)
                             .join('\n');
@@ -1133,9 +1422,13 @@ ${sharedContext}`;
                     }
                 } else if (toolName === 'read_entry') {
                     const uid = args.uid || '';
-                    const [bookName, id] = uid.split('::');
-                    const book = await ctx.loadWorldInfo(bookName);
-                    observation = book?.entries?.[id] ? book.entries[id].content : `Entry "${uid}" not found.`;
+                    if (isSkeletonEntryId(uid)) {
+                        observation = 'World Skeleton entries are not accessible to the Lorebook Agent.';
+                    } else {
+                        const [bookName, id] = uid.split('::');
+                        const book = await ctx.loadWorldInfo(bookName);
+                        observation = book?.entries?.[id] ? book.entries[id].content : `Entry "${uid}" not found.`;
+                    }
                 } else {
                     observation = `Unknown tool: ${toolName}`;
                 }
@@ -1158,13 +1451,49 @@ ${sharedContext}`;
         const finishMsg = basicSummaryText ? `Finished in ${totalTime}s -- ${basicSummaryText}` : `Finished in ${totalTime}s`;
         broadcastStep('finish', finishMsg, { time: totalTime, turns });
 
-        // Update the "since last run" watermark — only for auto (non-manual, non-cleanup) passes.
+        // Advance the "since last run" watermark only when this pass actually used that lookback mode.
         // Aborted/errored passes never reach here (they go to catch), so the watermark is safe.
-        if (!isManual && manualPrompt !== '__CLEANUP__') {
-            settings.routerLastRunChatLength = ctx.chat.length;
-            const { saveSettingsDebounced } = SillyTavern.getContext();
-            if (saveSettingsDebounced) saveSettingsDebounced();
+        const usedSinceLastRun = !overrideChatLog && customLookback === null && settings.routerLookbackSinceLastRun !== false;
+        if (!isManual && manualPrompt !== '__CLEANUP__' && usedSinceLastRun) {
+            persistRouterLastRunWatermark(ctx.chat.length);
         }
+
+        // Stamp the triggering AI message only after a successful pass so swipe-rollback
+        // can match this run to routerHistory and rewind the watermark if the user swipes
+        // away from the generation that triggered the agent.
+        if (manualPrompt !== '__CLEANUP__' && _routerTriggerMsg && _routerSnapshotRunId) {
+            const postWm = ctx.chat.length;
+            _routerTriggerMsg.extra = _routerTriggerMsg.extra || {};
+            _routerTriggerMsg.extra.rpgRouterRunId = _routerSnapshotRunId;
+            _routerTriggerMsg.extra.rpgRouterRanForSwipe = _routerTriggerMsg.swipe_id ?? 0;
+            _routerTriggerMsg.extra.rpgRouterPrePassWatermark = _routerPrePassWatermark;
+            _routerTriggerMsg.extra.rpgRouterPostPassWatermark = postWm;
+            if (typeof ctx.saveChatDebounced === 'function') ctx.saveChatDebounced();
+            recordSchedulerEvent('la_pass_stamped_message', {
+                runId: _routerSnapshotRunId,
+                swipeId: _routerTriggerMsg.swipe_id ?? 0,
+                preWm: _routerPrePassWatermark,
+                postWm,
+                isManual,
+            });
+        }
+
+        // "Last ran at" display timestamp — updates for any completed pass (manual or auto).
+        // Cleanup passes never reach this line (they return earlier), so no extra guard is needed.
+        persistRouterLastRunTimestamp();
+
+        // Manual passes don't go through onGenerationEnded's throttle reset — treat like an auto run.
+        if (typeof globalThis._rpgResetRouterAutoTick === 'function') {
+            globalThis._rpgResetRouterAutoTick('lore_agent_pass_complete');
+        }
+        document.dispatchEvent(new CustomEvent('rt_generation_tick'));
+        recordSchedulerEvent('la_pass_complete', {
+            runId: _routerSnapshotRunId,
+            isManual,
+            usedSinceLastRun,
+            chatLength: ctx.chat.length,
+            watermark: settings.routerLastRunChatLength ?? 0,
+        });
 
         // Non-blocking bloat hint and auto-cleanup check
         {
@@ -1216,6 +1545,7 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
     let changed = false;
     const errors = [];
     const allBookNames = Object.keys(allBooks);
+    const TIMESTAMP_REGEX = /(?:\[Day\s+\d+|\[\d{1,2}\/\d{1,2}\/\d+)\b/i;
 
     const timePrefix = currentTime ? `[${currentTime}] ` : '';
 
@@ -1233,6 +1563,10 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
     for (const k of activate) {
         if (typeof k !== 'string' || !k.includes('::')) {
             errors.push(`Invalid ID format: ${k}`);
+            continue;
+        }
+        if (isSkeletonEntryId(k)) {
+            errors.push(`Cannot activate World Skeleton entry (hidden from Lorebook Agent): ${k}`);
             continue;
         }
         const [bookName, uid] = k.split('::');
@@ -1273,17 +1607,27 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
     // 2. Update existing
     const updates = action.update || [];
     for (const up of updates) {
+        if (!up || typeof up !== 'object') continue;
+        if (typeof up.id !== 'string' || !up.id.includes('::')) {
+            errors.push(`Invalid update ID format: ${up ? up.id : 'undefined'}`);
+            continue;
+        }
+        if (isSkeletonEntryId(up.id)) {
+            errors.push(`Cannot update World Skeleton entry: ${up.id}`);
+            continue;
+        }
         const [bookName, uid] = up.id.split('::');
         const book = await ctx.loadWorldInfo(bookName);
         if (book?.entries?.[uid]) {
             // Strip [ID:] stamp from anywhere in the delta (model sometimes echoes it)
             let delta = (up.content || '').replace(/\[ID:[^\]]+\]\n?/gi, '').trim();
-            // Ensure each [Day X,...] timestamp begins on its own line (model sometimes chains them on one line)
-            delta = delta.replace(/(.)\s+(\[Day\s)/g, '$1\n$2');
+            delta = sanitizeLorebookRecordContent(delta);
+            // Ensure each [Day X,...] or [DD/MM/YY,...] timestamp begins on its own line
+            delta = delta.replace(/(.)\s+(\[(?:Day\s+\d+|\d{1,2}\/\d{1,2}\/\d+))/gi, '$1\n$2');
             // Append delta to the existing chronicle
             const existing = (book.entries[uid].content || '').replace(/^\[ID:[^\]]+\]\n?/i, '').trimEnd();
             delta = deduplicateContent(existing, delta);
-            if (delta && timePrefix && !delta.includes('[Day')) {
+            if (delta && timePrefix && !TIMESTAMP_REGEX.test(delta)) {
                 delta = timePrefix.trim() + ' ' + delta;
             }
             book.entries[uid].content = existing && delta ? `${existing}\n${delta}` : (existing || delta);
@@ -1295,10 +1639,20 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
     // 2b. Rewrite (full content replacement — no append, no dedup)
     const rewriteIds = [];
     for (const rw of (action.rewrite || [])) {
+        if (!rw || typeof rw !== 'object') continue;
+        if (typeof rw.id !== 'string' || !rw.id.includes('::')) {
+            errors.push(`Invalid rewrite ID format: ${rw ? rw.id : 'undefined'}`);
+            continue;
+        }
+        if (isSkeletonEntryId(rw.id)) {
+            errors.push(`Cannot rewrite World Skeleton entry: ${rw.id}`);
+            continue;
+        }
         const [bookName, uid] = rw.id.split('::');
         const book = await ctx.loadWorldInfo(bookName);
         if (book?.entries?.[uid]) {
-            book.entries[uid].content = rw.content;
+            const originalContent = book.entries[uid].content || '';
+            book.entries[uid].content = protectCoreBlock(originalContent, rw.content);
             await ctx.saveWorldInfo(bookName, book);
             rewriteIds.push(rw.id);
             changed = true;
@@ -1310,16 +1664,27 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
     // 2c. Rename (label and/or keyword list update — no content change)
     const renameIds = [];
     for (const rn of (action.rename || [])) {
-        if (!rn.id || !rn.id.includes('::')) {
-            errors.push(`Invalid rename ID format: ${rn.id}`);
+        if (!rn || typeof rn !== 'object') continue;
+        if (typeof rn.id !== 'string' || !rn.id.includes('::')) {
+            errors.push(`Invalid rename ID format: ${rn ? rn.id : 'undefined'}`);
+            continue;
+        }
+        if (isSkeletonEntryId(rn.id)) {
+            errors.push(`Cannot rename World Skeleton entry: ${rn.id}`);
             continue;
         }
         const [bookName, uid] = rn.id.split('::');
         const book = await ctx.loadWorldInfo(bookName);
         if (book?.entries?.[uid]) {
+            const oldLabel = book.entries[uid].comment || '';
             if (rn.label !== undefined) book.entries[uid].comment = rn.label;
             if (rn.keys  !== undefined) book.entries[uid].key = cleanKeys(rn.keys);
             await ctx.saveWorldInfo(bookName, book);
+            if (rn.label !== undefined && oldLabel && rn.label !== oldLabel) {
+                // Dynamic import avoids a static cycle (index → router → portraits → index).
+                const { renamePortraitEntity } = await import('./portraits.js');
+                await renamePortraitEntity(oldLabel, rn.label);
+            }
             renameIds.push(rn.id);
             changed = true;
         } else {
@@ -1330,11 +1695,21 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
     // 2d. Consolidate (many-to-one merge with deletion)
     const consolidateIds = [];
     for (const op of (action.consolidate || [])) {
+        if (!op || typeof op !== 'object') continue;
+        if (typeof op.survivor !== 'string' || !op.survivor.includes('::')) {
+            errors.push(`Invalid survivor ID format: ${op ? op.survivor : 'undefined'}`);
+            continue;
+        }
+        if (isSkeletonEntryId(op.survivor) || (op.targets || []).some(isSkeletonEntryId)) {
+            errors.push('Cannot consolidate World Skeleton entries.');
+            continue;
+        }
         // Update the survivor with merged content
         const [sBook, sUid] = op.survivor.split('::');
         const sBookData = await ctx.loadWorldInfo(sBook);
         if (sBookData?.entries?.[sUid]) {
-            sBookData.entries[sUid].content = op.content;
+            const originalContent = sBookData.entries[sUid].content || '';
+            sBookData.entries[sUid].content = protectCoreBlock(originalContent, op.content);
             await ctx.saveWorldInfo(sBook, sBookData);
             consolidateIds.push(op.survivor);
         } else {
@@ -1345,6 +1720,7 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
         // Delete each target and scrub from active/keyword key lists
         for (const targetId of (op.targets || [])) {
             if (targetId === op.survivor) continue; // Do not delete the survivor entry!
+            if (typeof targetId !== 'string' || !targetId.includes('::')) continue;
             const [tBook, tUid] = targetId.split('::');
             const tBookData = await ctx.loadWorldInfo(tBook);
             if (tBookData?.entries?.[tUid]) {
@@ -1368,6 +1744,7 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
     }
 
     // 3. Record new (with Deduplication)
+    const newlyCreatedMap = {};
     // Group entries by target book and commit once per book to avoid UID collisions
     const records = action.record || [];
     const prefix = getLivePrefix();
@@ -1398,6 +1775,10 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
                 break;
             }
         }
+        if (isSkeletonBookName(targetBook)) {
+            errors.push(`Cannot record to World Skeleton lorebook: ${targetBook}`);
+            continue;
+        }
 
         // Strip any accidental "TAG: " prefix the model may have included in the label
         // e.g. "FAC: Iron Syndicate" ? "Iron Syndicate", "STATS: Thalric Thorne" ? "Thalric Thorne"
@@ -1413,20 +1794,18 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
         const isWorld = targetBook.toLowerCase().endsWith('_world') || targetBook.toLowerCase() === 'world';
 
         if (cat.includes('EVENT')) {
-            if (currentTime && !rec.label.includes('[Day')) {
+            if (currentTime && !TIMESTAMP_REGEX.test(rec.label)) {
                 rec.label = `[${currentTime}] ${rec.label}`;
             }
         }
 
         if (isWorld) {
-            if (rec.label && !rec.content.includes('[Day') && !rec.content.startsWith('[')) {
+            if (rec.label && !TIMESTAMP_REGEX.test(rec.content) && !rec.content.startsWith('[')) {
                 rec.content = `[${rec.label}] ` + rec.content;
             }
             rec.keys = [];
         } else {
-            if (timePrefix && !rec.content.includes('[Day')) {
-                rec.content = timePrefix + rec.content;
-            }
+            rec.content = sanitizeLorebookRecordContent(rec.content || '');
             // Add location hierarchy keywords (plain fragments, no 'In:' prefix)
             // Matches status footer tokens for native ST keyword triggering.
             {
@@ -1499,9 +1878,24 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
                     bookData.entries[existingUid].disable = true;
                 } else {
                     // Append delta to existing chronicle (dedup path)
-                    const existing = (bookData.entries[existingUid].content || '').replace(/^\[ID:[^\]]+\]\n?/i, '').trimEnd();
-                    // Ensure each [Day X,...] timestamp begins on its own line
-                    delta = delta.replace(/(.)\s+(\[Day\s)/g, '$1\n$2');
+                    let existing = (bookData.entries[existingUid].content || '').replace(/^\[ID:[^\]]+\]\n?/i, '').trimEnd();
+
+                    // Safety net: the model sometimes re-records an entity that already has a
+                    // [CORE] block instead of using UPDATE_CORE/commit core. Blindly appending
+                    // would leave two [CORE]...[/CORE] blocks in the same entry. If the new
+                    // delta ALSO contains a full [CORE] block, replace the old one in place
+                    // (last write wins) rather than duplicating it, and only append whatever
+                    // chronicle text (if any) remains outside that block.
+                    const newCoreMatch = delta.match(/\[CORE\][\s\S]*?\[\/CORE\]/i);
+                    const existingHasCore = /\[CORE\][\s\S]*?\[\/CORE\]/i.test(existing);
+                    if (newCoreMatch && existingHasCore) {
+                        existing = existing.replace(/\[CORE\][\s\S]*?\[\/CORE\]/i, newCoreMatch[0]);
+                        delta = delta.replace(newCoreMatch[0], '').trim();
+                        if (settings.debugMode) console.warn(`[RPG Tracker] Record targeted existing entry "${rec.label}" with a full [CORE] block — replaced in place instead of duplicating (agent should have used UPDATE_CORE/commit core).`);
+                    }
+
+                    // Ensure each [Day X,...] or [DD/MM/YY,...] timestamp begins on its own line
+                    delta = delta.replace(/(.)\s+(\[(?:Day\s+\d+|\d{1,2}\/\d{1,2}\/\d+))/gi, '$1\n$2');
                     delta = deduplicateContent(existing, delta);
                     bookData.entries[existingUid].content = existing && delta ? `${existing}\n${delta}` : (existing || delta);
 
@@ -1521,6 +1915,7 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
                     if (!newActive.includes(fullId)) newActive.push(fullId);
                 }
                 recordedIds.push(`${fullId} (updated)`);
+                newlyCreatedMap[rec.label.toLowerCase().trim()] = fullId;
             } else {
                 // Append new entry with the next sequential UID
                 const uids = Object.keys(bookData.entries).map(Number).filter(n => !isNaN(n));
@@ -1548,6 +1943,7 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
                     if (!newActive.includes(fullId)) newActive.push(fullId);
                 }
                 recordedIds.push(fullId);
+                newlyCreatedMap[rec.label.toLowerCase().trim()] = fullId;
             }
             changed = true;
         }
@@ -1596,6 +1992,10 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
     // 4. Delete
     const deleteIds = action.delete_ids || [];
     for (const id of deleteIds) {
+        if (isSkeletonEntryId(id)) {
+            errors.push(`Cannot delete World Skeleton entry: ${id}`);
+            continue;
+        }
         const parts = id.split('::');
         if (parts.length < 2) continue;
         const [bookName, uid] = parts;
@@ -1639,8 +2039,224 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
             }
         }
 
-        ctx.saveSettingsDebounced();
+        void saveSettings();
         document.dispatchEvent(new CustomEvent('rt_lore_agent_updated'));
+    }
+
+    // 5. Relationship deltas
+    // Track a rollback record on the last AI message for each applied delta, mirroring
+    // parseAndApplyNarrativeRelTags() in narrative-hooks.js. Without this, swipe rollback
+    // only undoes inline "(Friendship: Name +X)" narrative tags — Lorebook Agent-driven
+    // [[REL: ...]] deltas would silently survive a swipe since they're never recorded.
+    const relChat = ctx.chat;
+    const relLastAiMsg = relChat ? [...relChat].reverse().find(m => !m.is_user && !m.is_system) : null;
+    let relSwipeId = 0;
+    if (relLastAiMsg) {
+        relLastAiMsg.extra = relLastAiMsg.extra || {};
+        relSwipeId = relLastAiMsg.swipe_id ?? 0;
+        relLastAiMsg.extra.rpgRollbackData = relLastAiMsg.extra.rpgRollbackData || {};
+        relLastAiMsg.extra.rpgRollbackData[relSwipeId] = relLastAiMsg.extra.rpgRollbackData[relSwipeId] || [];
+    }
+    for (const item of (action.rel || [])) {
+        const { id, field, delta } = item;
+        if (!id || !field || typeof delta !== 'number') {
+            errors.push(`Invalid rel item: ${JSON.stringify(item)}`);
+            continue;
+        }
+        if (isSkeletonEntryId(id)) {
+            errors.push(`Cannot update relationship on World Skeleton entry: ${id}`);
+            continue;
+        }
+        const f = field.toLowerCase();
+        if (f !== 'friendship' && f !== 'affection') {
+            errors.push(`Unknown relationship field "${field}" for ${id}`);
+            continue;
+        }
+
+        let resolvedId = id;
+        if (!resolvedId.includes('::')) {
+            const cleanId = resolvedId.toLowerCase().trim();
+            if (newlyCreatedMap[cleanId]) {
+                resolvedId = newlyCreatedMap[cleanId];
+            } else {
+                const prefix = getLivePrefix();
+                const npcBookName = prefix ? `${prefix}_NPCs` : 'NPCs';
+                let npcBook = null;
+                try {
+                    npcBook = await ctx.loadWorldInfo(npcBookName);
+                } catch (_) {}
+                
+                let foundUid = null;
+                if (npcBook && npcBook.entries) {
+                    for (const [uid, entry] of Object.entries(npcBook.entries)) {
+                        const label = (entry.comment || '').replace(/^\[.*?\]\s*/i, '').toLowerCase().trim();
+                        if (label === cleanId) {
+                            foundUid = uid;
+                            break;
+                        }
+                    }
+                }
+                if (foundUid !== null) {
+                    resolvedId = `${npcBookName}::${foundUid}`;
+                } else {
+                    let fallbackFound = null;
+                    for (const [bookName, bookData] of Object.entries(allBooks)) {
+                        if (!bookData || !bookData.entries) continue;
+                        for (const [uid, entry] of Object.entries(bookData.entries)) {
+                            const label = (entry.comment || '').replace(/^\[.*?\]\s*/i, '').toLowerCase().trim();
+                            if (label === cleanId) {
+                                fallbackFound = `${bookName}::${uid}`;
+                                break;
+                            }
+                        }
+                        if (fallbackFound) break;
+                    }
+                    if (fallbackFound) {
+                        resolvedId = fallbackFound;
+                    } else {
+                        errors.push(`Could not resolve NPC name "${id}" to a Book::UID`);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if (!settings.npcRelationshipValues) settings.npcRelationshipValues = {};
+        if (!settings.npcRelationshipValues[resolvedId]) settings.npcRelationshipValues[resolvedId] = { friendship: 0, affection: 0 };
+        const current = settings.npcRelationshipValues[resolvedId][f] ?? 0;
+        const relMax = getNpcRelationshipMax(settings);
+        const newValue = clampRelationshipValue(current + delta, relMax);
+        settings.npcRelationshipValues[resolvedId][f] = newValue;
+        // Append to relationship change log (capped at 50 entries per NPC)
+        if (!settings.npcRelationshipLog) settings.npcRelationshipLog = {};
+        if (!settings.npcRelationshipLog[resolvedId]) settings.npcRelationshipLog[resolvedId] = [];
+        const relLogTimestamp = Date.now();
+        settings.npcRelationshipLog[resolvedId].unshift({ timestamp: relLogTimestamp, field: f, delta, newValue, source: 'agent' });
+        if (settings.npcRelationshipLog[resolvedId].length > 50) settings.npcRelationshipLog[resolvedId].length = 50;
+        changed = true;
+
+        // Record rollback data so a swipe on this AI message can undo this delta (see comment above).
+        if (relLastAiMsg) {
+            relLastAiMsg.extra.rpgRollbackData[relSwipeId].push({
+                npcId: resolvedId,
+                field: f,
+                actualAppliedDelta: newValue - current,
+                expectedValue: newValue,
+                logTimestamp: relLogTimestamp
+            });
+        }
+    }
+
+    // 6. Core identity updates — surgical replacement of specified fields inside [CORE]
+    const coreUpdates = [
+        ...(action.appearance || []).map(item => ({ id: item.id, field: 'Appearance/Species', content: item.content })),
+        ...(action.core || [])
+    ];
+
+    for (const item of coreUpdates) {
+        const { id, field, content: newContent } = item;
+        if (!id || !field || !newContent) {
+            errors.push(`Invalid core update item: ${JSON.stringify(item)}`);
+            continue;
+        }
+        const resolvedId = await resolveLoreEntryId(id, allBooks, newlyCreatedMap);
+        if (!resolvedId) {
+            errors.push(`Could not resolve core update target "${id}" to a Book::UID`);
+            continue;
+        }
+        if (isSkeletonEntryId(resolvedId)) {
+            errors.push(`Cannot update core on World Skeleton entry: ${resolvedId}`);
+            continue;
+        }
+        const [bookName, uid] = resolvedId.split('::');
+        const book = await ctx.loadWorldInfo(bookName);
+        if (!book?.entries?.[uid]) {
+            errors.push(`Core update target not found: ${resolvedId}`);
+            continue;
+        }
+        const entryContent = book.entries[uid].content || '';
+        
+        // Match the [CORE]...[/CORE] block
+        const coreMatch = entryContent.match(/\[CORE\]([\s\S]*?)\[\/CORE\]/i);
+        if (!coreMatch) {
+            errors.push(`[CORE] block not found for ${id} — no update made.`);
+            continue;
+        }
+        
+        const coreBody = coreMatch[1];
+        
+        // Define field aliases for matching
+        let fieldPatterns = [];
+        const normField = field.trim().toLowerCase();
+        if (normField.includes('appearance') || normField.includes('species')) {
+            fieldPatterns = ['Appearance/Species', 'Appearance'];
+        } else if (normField.includes('personality')) {
+            fieldPatterns = ['Personality'];
+        } else if (normField.includes('background')) {
+            fieldPatterns = ['Brief Background', 'Background'];
+        } else if (normField.includes('habit') || normField.includes('behavior')) {
+            fieldPatterns = ['Habits/Behaviors', 'Habits', 'Behaviors'];
+        } else if (normField.includes('combat')) {
+            fieldPatterns = ['Combat Profile'];
+        } else {
+            fieldPatterns = [field];
+        }
+
+        const escapedPatterns = fieldPatterns.map(p => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+        const otherHeaders = ['Appearance/Species', 'Appearance', 'Personality', 'Brief Background', 'Background', 'Habits/Behaviors', 'Habits', 'Behaviors', 'Relationship'];
+        try {
+            const s = getSettings();
+            const coreSecs = (s.npcCoreSections && Array.isArray(s.npcCoreSections) && s.npcCoreSections.length > 0) ? s.npcCoreSections : DEFAULT_NPC_SECTIONS;
+            coreSecs.forEach(sec => {
+                if (!otherHeaders.includes(sec.name)) otherHeaders.push(sec.name);
+            });
+        } catch (_) {}
+        // Also discover any lazily-appended fields present in the actual coreBody (e.g. "Combat Profile")
+        for (const rawLine of coreBody.split('\n')) {
+            const hm = rawLine.trim().match(/^([A-Z][A-Za-z0-9 \/&]+?)\s*:/);
+            if (hm) {
+                const nm = hm[1].trim();
+                if (!otherHeaders.includes(nm)) otherHeaders.push(nm);
+            }
+        }
+        // Escape headers; prevent short aliases from matching inside longer ones
+        // (e.g. "Background" inside "Brief Background", "Behaviors" inside "Habits/Behaviors").
+        const otherHeadersRegexStr = otherHeaders.map(h => {
+            const esc = h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            if (h === 'Background') return '(?<!Brief\\s)Background';
+            if (h === 'Behaviors') return '(?<!Habits\\/)(?<!Habits & )(?<!Habits and )Behaviors';
+            if (h === 'Appearance') return '(?<!/)Appearance(?!\\/Species)';
+            return esc;
+        }).join('|');
+
+        // Match from the target field's colon to the next core field header or the end of the string
+        const targetFieldRegex = new RegExp(`(?:(${escapedPatterns.join('|')})\\s*:)([\\s\\S]*?)(?=(?:${otherHeadersRegexStr})\\s*:|$)`, 'i');
+        const fieldMatch = coreBody.match(targetFieldRegex);
+        
+        if (!fieldMatch) {
+            // Lazily append the field to the end of the [CORE] block (e.g. first-time Combat Profile)
+            const fieldName = fieldPatterns[0] || field.trim();
+            const replacement = `${fieldName}: ${newContent.trim()}\n`;
+            let newCoreBody = coreBody.trimEnd();
+            newCoreBody = newCoreBody ? `${newCoreBody}\n${replacement}` : replacement;
+
+            book.entries[uid].content = entryContent.replace(coreMatch[0], `[CORE]\n${newCoreBody}[/CORE]`);
+            await ctx.saveWorldInfo(bookName, book);
+            changed = true;
+            continue;
+        }
+
+        const matchedFieldName = fieldMatch[1];
+        const targetSubstring = `${matchedFieldName}:${fieldMatch[2]}`;
+        
+        // Perform replacement
+        const replacement = `${matchedFieldName}: ${newContent.trim()}\n`;
+        const newCoreBody = coreBody.replace(targetSubstring, replacement);
+        
+        // Update entry content
+        book.entries[uid].content = entryContent.replace(coreMatch[0], `[CORE]${newCoreBody}[/CORE]`);
+        await ctx.saveWorldInfo(bookName, book);
+        changed = true;
     }
 
     return { success: true, errors, recordedIds };
@@ -1735,10 +2351,14 @@ export async function rollbackRouterPass(index = 0) {
         settings.activeRouterKeys = JSON.parse(JSON.stringify(snapshot.activeRouterKeys || []));
         settings.activeWorldKeys = JSON.parse(JSON.stringify(snapshot.activeWorldKeys || []));
 
-        // -- Step 4: Trim snapshots newer than the restored point --------------
+        // -- Step 4: Restore "since last run" watermark and trim history --------
         settings.routerHistory = history.slice(index + 1);
+        if (snapshot.routerLastRunChatLength !== undefined) {
+            persistRouterLastRunWatermark(snapshot.routerLastRunChatLength);
+        } else {
+            void saveSettings();
+        }
 
-        ctx.saveSettingsDebounced();
         document.dispatchEvent(new CustomEvent('rt_lore_agent_updated'));
         return true;
     } catch (e) {
@@ -1788,7 +2408,12 @@ export async function reapplyRouterPass(prePassSnapshot, postPassState) {
         settings.activeRouterKeys = JSON.parse(JSON.stringify(postPassState.activeRouterKeys || []));
         settings.activeWorldKeys = JSON.parse(JSON.stringify(postPassState.activeWorldKeys || []));
 
-        ctx.saveSettingsDebounced();
+        if (postPassState.routerLastRunChatLength !== undefined) {
+            persistRouterLastRunWatermark(postPassState.routerLastRunChatLength);
+        } else {
+            void saveSettings();
+        }
+
         document.dispatchEvent(new CustomEvent('rt_lore_agent_updated'));
         return true;
     } catch (e) {
@@ -1802,7 +2427,7 @@ export async function reapplyRouterPass(prePassSnapshot, postPassState) {
  * Parses basic narrative tags [[TAG: ...]]
  */
 function parseBasicTags(text, archiveBooks) {
-    const action = { record: [], update: [], activate: [], deactivate: [], delete_ids: [], rewrite: [], consolidate: [] };
+    const action = { record: [], update: [], activate: [], deactivate: [], delete_ids: [], rewrite: [], consolidate: [], rel: [], appearance: [], core: [] };
     const settings = getSettings();
 
     // REWRITE tag parser
@@ -1822,6 +2447,41 @@ function parseBasicTags(text, archiveBooks) {
         const survivor = cm[2].trim();
         const content  = cm[3].trim();
         action.consolidate.push({ targets, survivor, content });
+    }
+
+    // REL tag parser: [[REL: Book::UID | Friendship | +15]]
+    const relRegex = /\[\[REL:\s*([^|]+)\|\s*(friendship|affection)\s*\|\s*([+-]?\d+)\s*\]\]/gi;
+    let rm;
+    while ((rm = relRegex.exec(text)) !== null) {
+        const id    = rm[1].trim();
+        const field = rm[2].trim().toLowerCase();
+        const delta = parseInt(rm[3], 10);
+        if (id && field && !isNaN(delta)) {
+            action.rel.push({ id, field, delta });
+        }
+    }
+
+    // UPDATE_APPEARANCE tag parser: [[UPDATE_APPEARANCE: Book::UID | new appearance text]]
+    const appearRegex = /\[\[UPDATE_APPEARANCE:\s*([^|]+)\|([\s\S]*?)\]\]/gi;
+    let am;
+    while ((am = appearRegex.exec(text)) !== null) {
+        const id      = am[1].trim();
+        const content = am[2].trim();
+        if (id && content) {
+            action.appearance.push({ id, content });
+        }
+    }
+
+    // UPDATE_CORE tag parser: [[UPDATE_CORE: Book::UID | field | new content]]
+    const coreRegex = /\[\[UPDATE_CORE:\s*([^|]+)\|\s*([^|]+)\|\s*([\s\S]*?)\]\]/gi;
+    let co;
+    while ((co = coreRegex.exec(text)) !== null) {
+        const id      = co[1].trim();
+        const field   = co[2].trim();
+        const content = co[3].trim();
+        if (id && field && content) {
+            action.core.push({ id, field, content });
+        }
     }
 
     const processMatch = (name, content, keywords, category) => {
@@ -1856,7 +2516,7 @@ function parseBasicTags(text, archiveBooks) {
 
     while ((match = tagRegex.exec(text)) !== null) {
         const tagName = match[1].toUpperCase();
-        if (tagName === 'REWRITE' || tagName === 'CONSOLIDATE') continue; // Collision protection
+        if (tagName === 'REWRITE' || tagName === 'CONSOLIDATE' || tagName === 'REL' || tagName === 'UPDATE_APPEARANCE' || tagName === 'UPDATE_CORE') continue; // Collision protection
 
         const inner = match[2];
         const parts = inner.split('|').map(p => p.trim());
@@ -2024,7 +2684,7 @@ Output a JSON object:
                 reason: `Saved scene: ${data.desc} -> ${lorebookName} (${data.id})`
             });
             settings.activeRouterKeys.push(newId);
-            ctx.saveSettingsDebounced();
+            void saveSettings();
             document.dispatchEvent(new CustomEvent('rt_lore_agent_updated'));
             
             (/** @type {any} */ (toastr)).success(`Saved scene: ${data.desc}`, 'Lorebook Agent');
@@ -2037,29 +2697,33 @@ Output a JSON object:
 
 /**
  * Fetches a manifest of all campaign-scoped lorebook entries for the UI.
+ * @param {boolean} skipUpdate When true, skips updateWorldInfoList and backend name probes (fast path).
  */
-export async function getLorebookManifest() {
+export async function getLorebookManifest(skipUpdate = false) {
     const settings = getSettings();
     const ctx = SillyTavern.getContext();
     const prefix = getLivePrefix();
+    sanitizeRouterState(settings);
     
-    // Always flush ST's registry from disk first so books written via HTTP API are visible
-    if (typeof ctx.updateWorldInfoList === 'function') {
+    // Always flush ST's registry from disk first so books written via HTTP API are visible,
+    // unless skipUpdate is explicitly requested for speed.
+    if (!skipUpdate && typeof ctx.updateWorldInfoList === 'function') {
         try { await ctx.updateWorldInfoList(); } catch (_) {}
     }
 
-    const names = await getWorldInfoNamesSafe();
+    const names = await getWorldInfoNamesSafe({ fullProbe: !skipUpdate });
     // With no prefix, show nothing ? the user hasn't set a campaign yet.
     if (!prefix) return [];
-    const scoped = names.filter(n => bookBelongsToPrefix(n, prefix));
+    const scopedSet = new Set(names.filter(n => bookBelongsToPrefix(n, prefix)));
     
     // Fallback 1: books referenced in activeRouterKeys (not yet in registry)
     const activeBookNames = (settings.activeRouterKeys || [])
         .map(k => k.split('::')[0])
         .filter(Boolean);
     for (const n of activeBookNames) {
-        if (!scoped.includes(n) && bookBelongsToPrefix(n, prefix)) {
-            scoped.push(n);
+        if (isSkeletonBookName(n)) continue;
+        if (!scopedSet.has(n) && bookBelongsToPrefix(n, prefix)) {
+            scopedSet.add(n);
         }
     }
     
@@ -2069,24 +2733,38 @@ export async function getLorebookManifest() {
         .flatMap(e => [...(e.record || []), ...(e.activate || [])].map(id => id.split('::')[0]))
         .filter(Boolean);
     for (const n of logBookNames) {
-        if (!scoped.includes(n) && bookBelongsToPrefix(n, prefix)) {
-            scoped.push(n);
+        if (isSkeletonBookName(n)) continue;
+        if (!scopedSet.has(n) && bookBelongsToPrefix(n, prefix)) {
+            scopedSet.add(n);
         }
     }
-    
+
+    const activeRouterSet = new Set(settings.activeRouterKeys || []);
+    const activeWorldSet = new Set(settings.activeWorldKeys || []);
+    const booksToLoad = [...scopedSet].filter(n => !isSkeletonBookName(n));
+    const loadedBooks = await Promise.all(booksToLoad.map(async (n) => {
+        try {
+            const b = await ctx.loadWorldInfo(n);
+            return b?.entries ? { bookName: n, entries: b.entries } : null;
+        } catch (_) {
+            return null;
+        }
+    }));
+
     const manifest = [];
-    for (const n of scoped) {
-        const b = await ctx.loadWorldInfo(n);
-        if (!b?.entries) continue;
-        for (const [uid, entry] of Object.entries(b.entries)) {
+    for (const row of loadedBooks) {
+        if (!row) continue;
+        const { bookName, entries } = row;
+        for (const [uid, entry] of Object.entries(entries)) {
+            const id = `${bookName}::${uid}`;
             manifest.push({
-                id: `${n}::${uid}`,
-                book: n,
+                id,
+                book: bookName,
                 uid: uid,
                 label: entry.comment || (entry.key?.[0]) || uid,
                 keys: entry.key || [],
                 content: entry.content,
-                is_active: settings.activeRouterKeys?.includes(`${n}::${uid}`) || settings.activeWorldKeys?.includes(`${n}::${uid}`)
+                is_active: activeRouterSet.has(id) || activeWorldSet.has(id)
             });
         }
     }
@@ -2197,7 +2875,7 @@ export async function scanAssistantOutputForKeywords(narrativeText, opts = {}) {
             .filter(Boolean);
         const scopedSet = new Set(scoped);
         for (const n of logBookNames) {
-            if (bookBelongsToPrefix(n, prefix)) scopedSet.add(n);
+            if (bookBelongsToPrefix(n, prefix) && !isSkeletonBookName(n)) scopedSet.add(n);
         }
         booksToScan = [...scopedSet];
     }
@@ -2208,7 +2886,7 @@ export async function scanAssistantOutputForKeywords(narrativeText, opts = {}) {
     const chat = ctx.chat || [];
     const recentMessages = chat.filter(m => !m.is_system); // exclude system messages
 
-    const currentActive = new Set(settings.activeRouterKeys || []);
+    const currentActive = new Set((settings.activeRouterKeys || []).filter(id => !isSkeletonEntryId(id)));
     const currentKeyword = new Set(settings.keywordActivatedKeys || []);
     const newlyTriggered = [];
 
@@ -2220,8 +2898,7 @@ export async function scanAssistantOutputForKeywords(narrativeText, opts = {}) {
     const bookCache = new Map();
 
     for (const bookName of booksToScan) {
-        // _Skeleton books are strictly for World Progression engine — never inject into narrative
-        if (bookName.toLowerCase().endsWith('_skeleton')) continue;
+        if (isSkeletonBookName(bookName)) continue;
         const book = await ctx.loadWorldInfo(bookName);
         if (!book?.entries) continue;
         bookCache.set(bookName, book);
@@ -2359,13 +3036,178 @@ export async function scanAssistantOutputForKeywords(narrativeText, opts = {}) {
     settings.activeRouterKeys = [...currentActive];
     settings.keywordActivatedKeys = [...currentKeyword];
     settings.lastKeywordTriggeredKeys = newlyTriggered;
-    ctx.saveSettingsDebounced();
+    void saveSettings();
 
     if (settings.debugMode && newlyTriggered.length > 0) {
         console.log('[RPG Tracker] Keyword scanner activated:', newlyTriggered);
     }
 
     return newlyTriggered;
+}
+
+/** @param {string} bookName */
+function isNpcBookName(bookName) {
+    const lower = (bookName || '').toLowerCase();
+    return lower.endsWith('_npcs') || lower.endsWith('_npc') || lower === 'npcs' || lower === 'npc';
+}
+
+/**
+ * NPC entry IDs newly recorded (not updated) on the latest Lorebook Agent pass.
+ * Used to tighten Present-Now matching so agent-created entries need a full-name hit.
+ * @param {object} [settings]
+ * @returns {Set<string>}
+ */
+function getRecentlyRecordedNpcIds(settings) {
+    const log = (settings || getSettings()).routerLog?.[0];
+    if (!log?.record?.length) return new Set();
+    const ids = new Set();
+    for (const item of log.record) {
+        const raw = String(item || '').trim();
+        if (!raw || /\(updated\)/i.test(raw)) continue;
+        const id = raw.replace(/\s*\(.*\)\s*$/g, '').trim();
+        if (!id.includes('::')) continue;
+        const bookName = id.split('::')[0];
+        if (isNpcBookName(bookName)) ids.add(id);
+    }
+    return ids;
+}
+
+/**
+ * Most recent single assistant/narrator message only (not the whole multi-message turn block).
+ * @param {boolean} [includeHidden]
+ * @returns {string}
+ */
+function getMostRecentNarrativeText(includeHidden = false) {
+    const { chat } = SillyTavern.getContext();
+    if (!chat?.length) return '';
+    for (let i = chat.length - 1; i >= 0; i--) {
+        const msg = chat[i];
+        if (msg.is_user) break;
+        if (msg.is_system) continue;
+        if (!includeHidden && /** @type {any} */ (msg).is_hidden) continue;
+        if (msg.extra?.['summary'] || msg.extra?.['is_summary'] || msg.extra?.['summary_data']) continue;
+        const mes = cleanMessageContent(msg);
+        if (!mes) continue;
+        if (mes.startsWith('[Summary') || mes.startsWith('(Summary') || mes.includes('Summary of past events:')) continue;
+        return mes;
+    }
+    return '';
+}
+
+/**
+ * Present-Now name scanner — separate from the Lorebook Agent keyword scanner.
+ * Scans ONLY the latest single narrator message for NPC names (entry comment/label).
+ * First/last name tokens are enough for established NPCs; NPCs the agent just
+ * recorded this pass require a full-name match so loose tokens/keys do not
+ * instantly populate Present Now. Lorebook key[] arrays are never scanned.
+ *
+ * Call immediately before location scene image generation (and when building Present Now UI).
+ *
+ * @param {string} [narrativeText] Defaults to the latest assistant output.
+ * @returns {Promise<Array<{ id: string, label: string, content: string }>>}
+ */
+export async function scanRecentOutputForPresentNpcs(narrativeText) {
+    const settings = getSettings();
+    const text = (narrativeText != null && narrativeText !== '')
+        ? String(narrativeText)
+        : getMostRecentNarrativeText(!!settings.routerIncludeHidden);
+    if (!text.trim()) return [];
+
+    const ctx = SillyTavern.getContext();
+    const prefix = getLivePrefix();
+    if (!prefix) return [];
+
+    const chatId = typeof globalThis._rpgCurrentChatId === 'function' ? globalThis._rpgCurrentChatId() : null;
+    const knownBooks = chatId ? (settings.chatStates?.[chatId]?.campaignBooks || []) : [];
+
+    let booksToScan;
+    if (knownBooks.length > 0) {
+        booksToScan = knownBooks.filter(n => isNpcBookName(n) && !isSkeletonBookName(n));
+    } else {
+        const allNames = await getWorldInfoNamesSafe({ fullProbe: false });
+        booksToScan = allNames.filter(n =>
+            bookBelongsToPrefix(n, prefix) && isNpcBookName(n) && !isSkeletonBookName(n),
+        );
+    }
+    if (!booksToScan.length) return [];
+
+    const recentlyRecordedNpcIds = getRecentlyRecordedNpcIds(settings);
+
+    /** @type {Array<{ id: string, label: string, content: string }>} */
+    const matched = [];
+    const seenLabels = new Set();
+
+    for (const bookName of booksToScan) {
+        let book;
+        try {
+            book = await ctx.loadWorldInfo(bookName);
+        } catch {
+            continue;
+        }
+        if (!book?.entries) continue;
+
+        for (const [uid, entry] of Object.entries(book.entries)) {
+            const fullId = `${bookName}::${uid}`;
+            // Name-only: use the entry label (comment), never lorebook key[] keywords.
+            const label = (entry.comment || '').replace(/^\[.*?\]\s*/i, '').trim();
+            if (!label) continue;
+
+            const requireFullName = recentlyRecordedNpcIds.has(fullId);
+            if (!narrativeMentionsNpcName(text, label, { requireFullName })) continue;
+
+            const labelKey = label.replace(/\s*\(.*?\)/g, '').trim().toLowerCase();
+            if (seenLabels.has(labelKey)) continue;
+            seenLabels.add(labelKey);
+
+            matched.push({
+                id: `${bookName}::${uid}`,
+                label,
+                content: (entry.content || '').trim(),
+            });
+        }
+    }
+
+    if (settings.debugMode) {
+        console.log('[RPG Tracker] Present-Now name scan (latest output only):', matched.map(m => m.label));
+    }
+    return matched;
+}
+
+/**
+ * True if narrative text mentions the NPC's full name, or any first/last name token.
+ * Case-sensitive word-boundary match; ignores parenthetical suffixes and very short tokens.
+ * @param {string} narrativeText
+ * @param {string} npcLabel
+ * @param {{ requireFullName?: boolean }} [opts] When true, only a full-name match counts (no first/last token).
+ * @returns {boolean}
+ */
+function narrativeMentionsNpcName(narrativeText, npcLabel, opts = {}) {
+    const text = String(narrativeText || '');
+    const cleaned = String(npcLabel || '')
+        .replace(/\s*\(.*?\)/g, '')
+        .replace(/[^\p{L}\p{N}\s'-]/gu, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    if (!cleaned || text.length === 0) return false;
+
+    const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const wordBoundaryRe = (phrase) => new RegExp(
+        `(?:^|[^\\p{L}\\p{N}])${phrase}(?:[^\\p{L}\\p{N}]|$)`,
+        'u',
+    );
+
+    if (cleaned.length >= 2) {
+        const fullPattern = escapeRe(cleaned).replace(/\s+/g, '\\s+');
+        if (wordBoundaryRe(fullPattern).test(text)) return true;
+    }
+
+    if (opts.requireFullName) return false;
+
+    const tokens = cleaned.split(/\s+/).filter(t => t.length >= 2);
+    for (const token of tokens) {
+        if (wordBoundaryRe(escapeRe(token)).test(text)) return true;
+    }
+    return false;
 }
 
 
@@ -2386,22 +3228,33 @@ export async function disableManagedEntries() {
     if (!prefix) return;
 
     try {
-        const allNames = await getWorldInfoNamesSafe();
-        const scoped = allNames.filter(n => bookBelongsToPrefix(n, prefix));
-        for (const bookName of scoped) {
-            const book = await ctx.loadWorldInfo(bookName);
-            if (!book?.entries) continue;
-            let changed = false;
-            for (const entry of Object.values(book.entries)) {
-                if (!entry.disable) {
-                    entry.disable = true;
-                    changed = true;
-                }
-            }
-            if (changed) {
-                try { await ctx.saveWorldInfo(bookName, book); } catch (_) {}
-            }
+        /** @type {string[]} */
+        let scoped;
+        const chatId = ctx.chatId || '';
+        const savedBooks = chatId && settings.chatStates?.[chatId]?.campaignBooks;
+        if (savedBooks?.length) {
+            scoped = savedBooks.filter(n => bookBelongsToPrefix(n, prefix) && !isSkeletonBookName(n));
+        } else {
+            const allNames = await getWorldInfoNamesSafe({ fullProbe: false });
+            scoped = allNames.filter(n => bookBelongsToPrefix(n, prefix) && !isSkeletonBookName(n));
         }
+
+        await Promise.all(scoped.map(async (bookName) => {
+            try {
+                const book = await ctx.loadWorldInfo(bookName);
+                if (!book?.entries) return;
+                let changed = false;
+                for (const entry of Object.values(book.entries)) {
+                    if (!entry.disable) {
+                        entry.disable = true;
+                        changed = true;
+                    }
+                }
+                if (changed) {
+                    try { await ctx.saveWorldInfo(bookName, book); } catch (_) {}
+                }
+            } catch (_) { /* book may not exist yet */ }
+        }));
     } catch (e) {
         console.warn('[RPG Tracker] disableManagedEntries failed:', e);
     }
@@ -2434,6 +3287,32 @@ function deduplicateContent(existing, delta) {
     });
     return newLines.join('\n').trim();
 }
+
+/**
+ * Ensures that if the original content had a [CORE] ... [/CORE] block,
+ * that block is preserved exactly in the new/rewritten content.
+ * Prevents the model from shortening, modifying, or removing the CORE block.
+ * @param {string} originalContent
+ * @param {string} newContent
+ * @returns {string}
+ */
+function protectCoreBlock(originalContent, newContent) {
+    if (!originalContent || !newContent) return newContent;
+    const coreRegex = /\[CORE\]([\s\S]*?)\[\/CORE\]/i;
+    const originalCoreMatch = originalContent.match(coreRegex);
+    if (!originalCoreMatch) return newContent;
+
+    const originalCoreBlock = originalCoreMatch[0];
+    const newCoreMatch = newContent.match(coreRegex);
+    if (newCoreMatch) {
+        // Swap out the new core block with the original pristine one
+        return newContent.replace(coreRegex, originalCoreBlock);
+    } else {
+        // Prepend the original pristine core block if omitted
+        return `${originalCoreBlock}\n${newContent}`;
+    }
+}
+
 
 /**
  * Estimates token count using a ~4 chars/token heuristic.
@@ -2493,6 +3372,99 @@ function countRedundantPairs(content, threshold = 0.6) {
 // -- World Progression ---------------------------------------------------------------
 
 /**
+ * Removes all entries from a lorebook while preserving book-level metadata.
+ * @param {string} bookName
+ * @returns {Promise<{ existed: boolean, cleared: number }>}
+ */
+async function clearWorldInfoBookEntries(bookName) {
+    const ctx = SillyTavern.getContext();
+    let book = null;
+    try {
+        book = await ctx.loadWorldInfo(bookName);
+    } catch (_) { /* book may not exist yet */ }
+
+    const cleared = book?.entries ? Object.keys(book.entries).length : 0;
+    if (!book && cleared === 0) {
+        return { existed: false, cleared: 0 };
+    }
+
+    const emptyBook = {
+        entries: {},
+        name: bookName,
+        scan_depth: book?.scan_depth ?? 4,
+        token_budget: book?.token_budget ?? 400,
+        recursive: book?.recursive ?? false,
+        extensions: book?.extensions ?? {},
+    };
+
+    await fetch('/api/worldinfo/edit', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ name: bookName, data: emptyBook }),
+    });
+    if (typeof ctx.saveWorldInfo === 'function') {
+        try { await ctx.saveWorldInfo(bookName, emptyBook); } catch (_) { /* non-fatal */ }
+    }
+    if (typeof ctx.updateWorldInfoList === 'function') {
+        try { await ctx.updateWorldInfoList(); } catch (_) { /* non-fatal */ }
+    }
+
+    return { existed: true, cleared };
+}
+
+/**
+ * Wipes World Progression lore + timer state for the active chat's campaign prefix.
+ * Clears all reports ({prefix}_World) and skeleton seed data ({prefix}_Skeleton), resets
+ * the per-chat timer, and drops active world report keys so prior chats cannot leak in.
+ * @param {{ includeSkeleton?: boolean }} [opts]
+ * @returns {Promise<{ prefix: string, worldBookName: string, skeletonBookName: string, worldCleared: number, skeletonCleared: number }>}
+ */
+export async function purgeWorldHistoryForChat(opts = {}) {
+    const includeSkeleton = opts.includeSkeleton !== false;
+    const settings = getSettings();
+    const ctx = SillyTavern.getContext();
+    const chatId = ctx.chatId || '';
+    const prefix = getLivePrefix();
+    const worldBookName = prefix ? `${prefix}_World` : 'World';
+    const skeletonBookName = prefix ? `${prefix}_Skeleton` : 'World_Skeleton';
+
+    const worldResult = await clearWorldInfoBookEntries(worldBookName);
+    let skeletonResult = { cleared: 0, existed: false };
+    if (includeSkeleton) {
+        skeletonResult = await clearWorldInfoBookEntries(skeletonBookName);
+    }
+
+    settings.activeWorldKeys = [];
+    settings.worldProgressionLastFiredAtMinutes = -1;
+    settings.worldProgressionLastFiredPeriodLabel = '';
+    settings.worldProgressionSkeletonAtmosphereSummary = '';
+
+    if (settings.chatStates && chatId && settings.chatStates[chatId]) {
+        const cs = settings.chatStates[chatId];
+        cs.activeWorldKeys = [];
+        cs.worldProgressionLastFiredAtMinutes = -1;
+        cs.worldProgressionLastFiredPeriodLabel = '';
+        cs.worldProgressionSkeletonAtmosphereSummary = '';
+    }
+
+    persistWorldProgressionTimer();
+    void saveSettings();
+    if (settings.chatLinkEnabled && chatId) {
+        saveChatState(chatId);
+    }
+
+    document.dispatchEvent(new CustomEvent('rt_lore_agent_updated'));
+
+    return {
+        prefix: prefix || '(none)',
+        worldBookName,
+        skeletonBookName,
+        worldCleared: worldResult.cleared,
+        skeletonCleared: skeletonResult.cleared,
+    };
+}
+
+/**
  * Parses an in-world time string (e.g. "11:52 AM, Day 3") into total minutes
  * from campaign start (Day 1, 00:00 = 0). Returns -1 if unparseable.
  * @param {string} timeStr
@@ -2500,36 +3472,15 @@ function countRedundantPairs(content, threshold = 0.6) {
  */
 export function parseInWorldMinutes(timeStr) {
     if (!timeStr) return -1;
-    const m = timeStr.match(/(\d{1,2}):(\d{2})\s*(AM|PM),\s*Day\s*(\d+)/i);
-    if (!m) return -1;
-    let hours = parseInt(m[1], 10);
-    const minutes = parseInt(m[2], 10);
-    const ampm = m[3].toUpperCase();
-    const day = parseInt(m[4], 10);
-    if (ampm === 'PM' && hours !== 12) hours += 12;
-    if (ampm === 'AM' && hours === 12) hours = 0;
-    return (day - 1) * 24 * 60 + hours * 60 + minutes;
+    const ddmmyyMatch = timeStr.match(/\b(\d{1,2})\/(\d{1,2})\/(\d+)\b/);
+    const dayMatch = timeStr.match(/(?:Day|D)\s*(\d+)/i);
+    const timeMatch = timeStr.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
+    if (!ddmmyyMatch && !dayMatch && !timeMatch) return -1;
+    return parseInWorldTime(timeStr);
 }
 
-/**
- * Computes the label for a World Progression period given start/end in total-minutes.
- * Daily or longer intervals: "Day N". Sub-daily: "Day N, HH:MM-HH:MM".
- * @param {number} startMinutes
- * @param {number} endMinutes
- * @param {number} intervalHours
- * @returns {string}
- */
 function computePeriodLabel(startMinutes, endMinutes, intervalHours) {
-    const day = Math.floor(endMinutes / (24 * 60)) + 1;
-    const minutesOfToday = endMinutes % (24 * 60);
-    let hours = Math.floor(minutesOfToday / 60);
-    const mins = minutesOfToday % 60;
-    const ampm = hours >= 12 ? 'PM' : 'AM';
-    let displayHours = hours % 12;
-    if (displayHours === 0) displayHours = 12;
-    const displayHoursStr = String(displayHours).padStart(2, '0');
-    const displayMins = String(mins).padStart(2, '0');
-    return `Day ${day}, ${displayHoursStr}:${displayMins} ${ampm}`;
+    return formatInWorldTime(endMinutes);
 }
 
 /**
@@ -2561,11 +3512,12 @@ export async function runWorldProgressionPass(timeStr, currentMinutes, extraInst
         openaiModel: settings.worldOpenaiModel,
     };
 
-    const lastFired = settings.worldProgressionLastFiredAtMinutes ?? -1;
+    const lastFiredLabel = settings.worldProgressionLastFiredPeriodLabel || '';
+    const lastFired = lastFiredLabel ? parseInWorldMinutes(lastFiredLabel) : null;
     const intervalMinutes = intervalHours * 60;
 
     // Determine the start of the period we're reporting on
-    const periodStart = lastFired >= 0 ? lastFired : currentMinutes - intervalMinutes;
+    const periodStart = lastFired !== null ? lastFired : currentMinutes - intervalMinutes;
     const periodEnd = periodStart + intervalMinutes;
     const periodLabel = computePeriodLabel(periodStart, periodEnd, intervalHours);
 
@@ -2596,9 +3548,8 @@ export async function runWorldProgressionPass(timeStr, currentMinutes, extraInst
             const existingLabel = (entry.comment || '').toLowerCase().trim();
             if (existingLabel === cleanPeriod) {
                 broadcastStep('thought', `\uD83C\uDF0D World Progression: "${periodLabel}" already exists - advancing timer.`);
-                settings.worldProgressionLastFiredAtMinutes = periodEnd;
                 settings.worldProgressionLastFiredPeriodLabel = periodLabel;
-                SillyTavern.getContext().saveSettingsDebounced();
+                persistWorldProgressionTimer();
                 return;
             }
         }
@@ -2750,7 +3701,8 @@ ${rawDump}`;
     const skeletonFactionDescs = []; // { name, desc }
     const skeletonLocationDescs = []; // { name, desc }
 
-    // Compute exclusion list
+    // Compute exclusion list (manual, general-purpose — soft: only affects the
+    // randomized designation pool, not raw context visibility, by long-standing design).
     const excludedTerms = [];
     if (settings.worldProgressionExclusionList) {
         settings.worldProgressionExclusionList
@@ -2759,22 +3711,42 @@ ${rawDump}`;
             .filter(Boolean)
             .forEach(term => excludedTerms.push(term));
     }
-    if (settings.worldProgressionAutoExcludeParty) {
-        const memo = settings.currentMemo || '';
-        const partyMatch = memo.match(/\[PARTY\]([\s\S]*?)\[\/PARTY\]/i);
-        if (partyMatch) {
-            const blockContent = partyMatch[1];
-            const lines = blockContent.split('\n').map(l => l.trim()).filter(Boolean);
-            for (const line of lines) {
-                const colonIdx = line.indexOf(':');
-                const entityPart = colonIdx !== -1 ? line.substring(0, colonIdx).trim() : line;
-                const namePart = entityPart.replace(/\s*\([^)]*\)/g, '').trim();
-                if (namePart && namePart !== '(unnamed)') {
-                    excludedTerms.push(namePart.toLowerCase());
-                }
-            }
+
+    // Party presence, unconditional (no toggle) — [PARTY] members are HARD-excluded below
+    // (stripped from context entirely, not just the randomization pool), because they are
+    // physically with {{user}} right now and any off-screen activity for them risks
+    // contradicting the live scene. [BENCHED PARTY] members are the opposite: eligible for
+    // simulation, with their benching note captured as flavor for their designation entry.
+    // See <leaving_vs_benching> in sysprompt.txt / DEFAULT_STOCK_PROMPTS['benched party'] for the
+    // inference contract that keeps these two blocks in sync with the narrative.
+    function extractPartyRoster(memo, tagName) {
+        const roster = [];
+        const re = new RegExp(`\\[${tagName}\\]([\\s\\S]*?)\\[\\/${tagName}\\]`, 'i');
+        const match = memo.match(re);
+        if (!match) return roster;
+        const blockContent = match[1];
+        // Each member starts a new "Name (Class): cur/max HP" line — split on those anchors
+        // rather than every line, so we can carry a member's Status line along with their name.
+        const memberChunks = blockContent.split(/\n(?=[^\n]*\([^)]*\):\s*\d)/);
+        for (const chunk of memberChunks) {
+            const lines = chunk.split('\n').map(l => l.trim()).filter(Boolean);
+            if (!lines.length) continue;
+            const headerLine = lines[0];
+            const colonIdx = headerLine.indexOf(':');
+            const entityPart = colonIdx !== -1 ? headerLine.substring(0, colonIdx).trim() : headerLine;
+            const namePart = entityPart.replace(/\s*\([^)]*\)/g, '').trim();
+            if (!namePart || namePart === '(unnamed)') continue;
+            const statusLine = lines.find(l => l.toLowerCase().startsWith('status:'));
+            const note = statusLine ? statusLine.substring(statusLine.indexOf(':') + 1).trim() : '';
+            roster.push({ name: namePart, note });
         }
+        return roster;
     }
+
+    const memoForParty = settings.currentMemo || '';
+    const presentPartyRoster = extractPartyRoster(memoForParty, 'PARTY');
+    const benchedPartyRoster = extractPartyRoster(memoForParty, 'BENCHED PARTY');
+    const presentPartyNames = new Set(presentPartyRoster.map(m => m.name.toLowerCase()));
 
     function getBookCategoryHeader(bookName, prefix) {
         let cleanName = bookName;
@@ -2813,6 +3785,19 @@ ${rawDump}`;
                           (!isSkeletonBook && (categoryHeader === 'FAC' || categoryHeader === 'FACTIONS' || nameLower.includes('faction') || nameLower.includes('guild')));
             const isConflict = (isSkeletonBook && entry.extensions?.rpgCategory === 'EVENT') ||
                                (!isSkeletonBook && (categoryHeader === 'EVENT' || categoryHeader === 'EVENTS' || categoryHeader === 'QUEST' || categoryHeader === 'QUESTS' || nameLower.includes('event') || nameLower.includes('conflict') || nameLower.includes('quest')));
+
+            // HARD exclusion for present party members: skip this entry entirely (never enters
+            // skeletonLines/loreGrouped/any name pool) if it's an NPC-type entry representing
+            // someone currently in [PARTY]. Historical [_World] reports are exempt — they're
+            // archived record of the past, not something being freshly selected now.
+            if (isNpc && !isWorldBook && presentPartyNames.size > 0) {
+                const labelLower = label.toLowerCase();
+                const primaryKeysForParty = Array.isArray(entry.key) ? entry.key.map(k => String(k).trim().toLowerCase()) : [];
+                const matchesPresentParty = [...presentPartyNames].some(name =>
+                    labelLower.includes(name) || primaryKeysForParty.some(k => k.includes(name))
+                );
+                if (matchesPresentParty) continue;
+            }
 
             // Check exclusion list
             let isExcluded = false;
@@ -2862,6 +3847,19 @@ ${rawDump}`;
         }
     }
 
+    // Benched party members are eligible for simulation regardless of whether they also have
+    // a standalone NPC lorebook entry — synthesize a category so WP has real content to work
+    // with (their benching note as flavor), and make them selectable via the same NPC
+    // designation pool as any other narrative NPC.
+    if (benchedPartyRoster.length > 0) {
+        const benchedLabel = 'PARTY MEMBERS (BENCHED)';
+        loreGrouped[benchedLabel] = benchedPartyRoster.map(m =>
+            `### ${m.name}\n${m.note || 'Currently separated from {{user}}.'}`
+        );
+        for (const m of benchedPartyRoster) {
+            narrativeNpcNames.push(m.name);
+        }
+    }
 
     const skeletonDump = skeletonLines.length
         ? skeletonLines.join('\n\n')
@@ -2908,6 +3906,10 @@ ${rawDump}`;
     let systemPrompt = rawPrompt
         .replace(/\{periodLabel\}/g, periodLabel)
         .replace(/\{wordTarget\}/g, String(wordTarget));
+
+    if (settings.useDdMmYyFormat) {
+        systemPrompt += `\n\n## DATE FORMAT RULE\n- CRITICAL: All dates generated in this report MUST use the DD/MM/YYYY calendar format (e.g. 05/01/2026 for the 5th of January, 2026). Do NOT use the American MM/DD/YYYY format.`;
+    }
 
     if (extraInstructions && extraInstructions.trim()) {
         systemPrompt += `\n\n## EXTRA INSTRUCTIONS FOR THIS RUN\n${extraInstructions.trim()}`;
@@ -3045,6 +4047,71 @@ ${historicalDump}`;
         reason: `World Progression: auto-generated report for ${periodLabel}`,
     }, archiveBooks, timeStr, '');
 
+    // 7b. Breadcrumb write-back: for each benched party member mentioned in this report,
+    // concatenate the matching bullet(s) into their [BENCHED PARTY] Status field as a
+    // period-timestamped "last update" trailer. This keeps a benched companion's thread
+    // alive in the always-injected memo even after the _World book's rolling window
+    // (worldProgressionKeepActive) moves past the report that mentioned them. Bullets in a
+    // single report are synchronous (one shared period timestamp) — there is no ordering to
+    // exploit across multiple matches, so all matches are kept, not just "the last one".
+    if (benchedPartyRoster.length > 0) {
+        const bullets = reportContent
+            .split(/\n\s*\n/)
+            .map(b => b.replace(/^[-*]\s*/, '').trim())
+            .filter(Boolean);
+
+        let memoForBreadcrumbs = settings.currentMemo || '';
+        let anyBreadcrumbWritten = false;
+
+        for (const member of benchedPartyRoster) {
+            const escapedName = member.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const nameRx = new RegExp(`\\b${escapedName}\\b`, 'i');
+            const matchingBullets = bullets.filter(b => nameRx.test(b));
+            if (matchingBullets.length === 0) continue;
+
+            const breadcrumb = matchingBullets.join('; ');
+
+            // Locate this member's chunk within [BENCHED PARTY] the same way extractPartyRoster
+            // split it, so we only touch this member's Status line, not the whole block.
+            const blockRe = /\[BENCHED PARTY\]([\s\S]*?)\[\/BENCHED PARTY\]/i;
+            const blockMatch = memoForBreadcrumbs.match(blockRe);
+            if (!blockMatch) break; // block vanished mid-loop (shouldn't happen) — bail safely
+
+            const blockContent = blockMatch[1];
+            const chunks = blockContent.split(/\n(?=[^\n]*\([^)]*\):\s*\d)/);
+            const chunkIdx = chunks.findIndex(c => {
+                const headerLine = c.split('\n').map(l => l.trim()).filter(Boolean)[0] || '';
+                const colonIdx = headerLine.indexOf(':');
+                const entityPart = colonIdx !== -1 ? headerLine.substring(0, colonIdx).trim() : headerLine;
+                const namePart = entityPart.replace(/\s*\([^)]*\)/g, '').trim();
+                return namePart.toLowerCase() === member.name.toLowerCase();
+            });
+            if (chunkIdx === -1) continue;
+
+            let chunk = chunks[chunkIdx];
+            const statusLineRe = /^(\s*Status:\s*)(.*)$/im;
+            if (statusLineRe.test(chunk)) {
+                chunk = chunk.replace(statusLineRe, (full, prefix, value) => {
+                    // Strip any prior "— Last update: ..." trailer before appending the fresh one.
+                    const baseValue = value.replace(/\s*—\s*Last update:.*$/i, '').trim();
+                    return `${prefix}${baseValue} — Last update: ${periodLabel}: ${breadcrumb}`;
+                });
+            } else {
+                chunk = chunk.trim() + `\nStatus: Benched — Last update: ${periodLabel}: ${breadcrumb}`;
+            }
+            chunks[chunkIdx] = chunk;
+
+            const newBlockContent = chunks.join('\n');
+            memoForBreadcrumbs = memoForBreadcrumbs.replace(blockRe, `[BENCHED PARTY]${newBlockContent}[/BENCHED PARTY]`);
+            anyBreadcrumbWritten = true;
+        }
+
+        if (anyBreadcrumbWritten) {
+            settings.currentMemo = memoForBreadcrumbs;
+            void saveSettings();
+        }
+    }
+
     // 8. Rolling window: keep only the N most recent WORLD entries active.
     await new Promise(r => setTimeout(r, 300));
     let freshWorldBook = null;
@@ -3082,10 +4149,9 @@ ${historicalDump}`;
         }
     }
 
-    // 9. Advance the timer and persist
-    settings.worldProgressionLastFiredAtMinutes = periodEnd;
+    // 9. Advance the timer — only the period label is stored; numeric field is legacy.
     settings.worldProgressionLastFiredPeriodLabel = periodLabel;
-    SillyTavern.getContext().saveSettingsDebounced();
+    persistWorldProgressionTimer();
 
     broadcastStep('finish', `\uD83C\uDF0D World Progression: "${periodLabel}" report saved.`);
     if (typeof globalThis._rpgRenderRouterUI === 'function') {
@@ -3155,9 +4221,11 @@ function parseSkeletonOutput(rawText) {
             continue;
         }
 
-        // 3. Check for list items like * **Name**: description
+        // 3. Bold names are explicit entry titles. A plain `Name: description`
+        // line is only a title when no entry is open; otherwise it is ordinary
+        // content such as `Parties involved:` or a hyphenated description.
         let listMatch = line.match(listRegexBold);
-        if (!listMatch) {
+        if (!listMatch && !currentItem) {
             listMatch = line.match(listRegexPlain);
         }
         if (listMatch) {
@@ -3456,22 +4524,37 @@ export async function runSkeletonGenerationPass(atmosphereSummary, append = fals
         const existing = new Set(settings.chatStates[chatId].campaignBooks || []);
         existing.add(skeletonBookName);
         settings.chatStates[chatId].campaignBooks = [...existing];
-        ctx.saveSettingsDebounced();
+        void saveSettings();
     }
 
     // Refresh the SillyTavern UI so it updates immediately without F5
-    setTimeout(async () => {
+    if (typeof ctx.executeSlashCommandsWithOptions === 'function') {
         try {
+            await new Promise(r => setTimeout(r, 300));
             if (typeof ctx.updateWorldInfoList === 'function') {
                 await ctx.updateWorldInfoList();
             }
+            await ctx.executeSlashCommandsWithOptions(`/world state=on silent=true "${skeletonBookName}"`);
             if (typeof ctx.reloadWorldInfoEditor === 'function') {
                 ctx.reloadWorldInfoEditor(skeletonBookName, true);
             }
         } catch (uiErr) {
             console.warn('[RPG Tracker] UI refresh after skeleton generation failed:', uiErr);
         }
-    }, 200);
+    } else {
+        setTimeout(async () => {
+            try {
+                if (typeof ctx.updateWorldInfoList === 'function') {
+                    await ctx.updateWorldInfoList();
+                }
+                if (typeof ctx.reloadWorldInfoEditor === 'function') {
+                    ctx.reloadWorldInfoEditor(skeletonBookName, true);
+                }
+            } catch (uiErr) {
+                console.warn('[RPG Tracker] UI refresh after skeleton generation failed:', uiErr);
+            }
+        }, 200);
+    }
 
     broadcastStep('finish', `\uD83D\uDDE6 World Skeleton: ${records.length} entries generated and saved to "${skeletonBookName}".`);
     return records.length;
@@ -3744,7 +4827,7 @@ export async function runAtmosphereGenerationPass(lookbackCount) {
         }
         // Basic cleanup of tracking structures
         text = text.replace(/###\s*STATE MEMO[^]*?(?=\n\[RNG_QUEUE|\n###|\n\[(?!RNG_QUEUE)[A-Z]|$)/i, '');
-        text = text.replace(/\[RNG_QUEUE\s[^\]]*\][\s\S]*?\[\/RNG_QUEUE\][ \t]*\n?/gi, '');
+        text = text.replace(/\[RNG_QUEUE(?:_d100)?\s[^\]]*\][\s\S]*?\[\/RNG_QUEUE(?:_d100)?\][ \t]*\n?/gi, '');
         text = text.replace(/\[[A-Z_]+\][\s\S]*?\[\/[A-Z_]+\]/g, '');
         text = text.replace(/###\s*CURRENT USER INPUT[^\n]*\n?/gi, '');
         text = text.replace(/\[Continue the narrative\]/gi, '');
@@ -3814,4 +4897,4 @@ Generate the Atmosphere Summary:`;
     }
 
     return summary;
-}
+}

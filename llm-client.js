@@ -10,6 +10,33 @@
 import { getSettings } from './state-manager.js';
 import { logTransaction } from './debug-viewer.js';
 
+/** Placeholder that survives SillyTavern substituteParams() in generateRaw. */
+export const RT_USER_MACRO_SENTINEL = '__RT_USER_MACRO__';
+
+/** Prevents {{user}} from being resolved to the active persona name before an LLM call. */
+export function shieldUserMacro(text) {
+    if (!text) return text;
+    return String(text).replace(/\{\{user\}\}/gi, RT_USER_MACRO_SENTINEL);
+}
+
+/**
+ * Restores {{user}} after an LLM call and rewrites any leaked persona/player names.
+ * @param {string} text
+ * @param {string[]} [names] Persona or player names to replace with {{user}}
+ */
+export function restoreUserMacro(text, names = []) {
+    if (!text) return text;
+    let out = String(text).split(RT_USER_MACRO_SENTINEL).join('{{user}}');
+    const unique = [...new Set((names || []).map(n => String(n).trim()).filter(n => n.length >= 2))];
+    unique.sort((a, b) => b.length - a.length);
+    for (const name of unique) {
+        const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        out = out.replace(new RegExp(`\\b${esc}'s\\b`, 'gi'), "{{user}}'s");
+        out = out.replace(new RegExp(`\\b${esc}\\b`, 'g'), '{{user}}');
+    }
+    return out;
+}
+
 // ── Connection Profile Helpers ─────────────────────────────────────────────────
 
 export async function checkConnectionProfilesActive() {
@@ -37,6 +64,185 @@ export async function setCompletionPreset(name) {
     if (!name) return;
     const { executeSlashCommandsWithOptions } = SillyTavern.getContext();
     await executeSlashCommandsWithOptions(`/preset "${name}"`);
+}
+
+// ── Combat Main-Profile Auto-Switch ────────────────────────────────────────────
+
+const MAIN_PROFILE_NONE = '<None>';
+
+/** @type {string|null} Profile name to restore when combat ends. */
+let _combatBaselineProfileName = null;
+/** @type {string|null} Preset name to restore when combat ends. */
+let _combatBaselinePresetName = null;
+/** @type {boolean} Whether the extension currently owns a combat profile override. */
+let _combatProfileOverrideActive = false;
+/** @type {Promise<void>|null} Serializes concurrent profile switches. */
+let _combatProfileSwitchChain = null;
+
+/** Returns true when the memo contains an active (non-empty, non-END_COMBAT) [COMBAT] block. */
+export function isCombatActive(memo) {
+    if (!memo) return false;
+    const match = memo.match(/\[COMBAT\]([\s\S]*?)\[\/COMBAT\]/i);
+    if (!match) return false;
+    const body = match[1].trim();
+    return body.length > 0 && !/^END_COMBAT$/i.test(body);
+}
+
+function escapeSlashArg(value) {
+    return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function getProfileNameById(profileId) {
+    if (!profileId) return null;
+    try {
+        const ctx = SillyTavern.getContext();
+        const service = ctx.ConnectionManagerRequestService;
+        if (service?.getProfile) {
+            return service.getProfile(profileId)?.name ?? null;
+        }
+        const profiles = ctx.extensionSettings?.connectionManager?.profiles || [];
+        return profiles.find(p => p.id === profileId)?.name ?? null;
+    } catch {
+        return null;
+    }
+}
+
+/** Returns the name of the currently active main ST connection profile, or null for None. */
+export async function getCurrentMainProfileName() {
+    if (!(await checkConnectionProfilesActive())) return null;
+    const { executeSlashCommandsWithOptions } = SillyTavern.getContext();
+    const result = await executeSlashCommandsWithOptions('/profile');
+    const name = result?.pipe?.trim();
+    if (!name || name === MAIN_PROFILE_NONE) return null;
+    return name;
+}
+
+async function switchMainConnectionProfileByName(profileName) {
+    if (!(await checkConnectionProfilesActive())) return;
+    const { executeSlashCommandsWithOptions } = SillyTavern.getContext();
+    const arg = profileName ? escapeSlashArg(profileName) : MAIN_PROFILE_NONE;
+    await executeSlashCommandsWithOptions(`/profile "${arg}"`);
+}
+
+async function applyCombatOverrides(combatProfileName, combatPresetId) {
+    await switchMainConnectionProfileByName(combatProfileName);
+    if (combatPresetId) {
+        await setCompletionPreset(combatPresetId);
+    }
+}
+
+async function restoreCombatBaseline(baselineProfile, baselinePreset) {
+    await switchMainConnectionProfileByName(baselineProfile);
+    if (baselinePreset) {
+        await setCompletionPreset(baselinePreset);
+    }
+}
+
+function combatOverridesMatch(currentProfile, currentPreset, combatProfileName, combatPresetId) {
+    if (currentProfile !== combatProfileName) return false;
+    if (!combatPresetId) return true;
+    return currentPreset === combatPresetId;
+}
+
+function runSerializedCombatSwitch(fn) {
+    const run = async () => {
+        if (_combatProfileSwitchChain) await _combatProfileSwitchChain.catch(() => { });
+        await fn();
+    };
+    _combatProfileSwitchChain = run();
+    return _combatProfileSwitchChain;
+}
+
+/** Restores the pre-combat main profile if the extension currently owns the override. */
+export async function resetCombatProfileOverride(settings) {
+    settings = settings || getSettings();
+    if (!_combatProfileOverrideActive) return;
+
+    const baseline = _combatBaselineProfileName;
+    const baselinePreset = _combatBaselinePresetName;
+    _combatProfileOverrideActive = false;
+    _combatBaselineProfileName = null;
+    _combatBaselinePresetName = null;
+
+    await runSerializedCombatSwitch(async () => {
+        try {
+            await restoreCombatBaseline(baseline, baselinePreset);
+            if (settings.debugMode) {
+                console.log(`[RPG Tracker] Combat profile override reset → ${baseline ?? MAIN_PROFILE_NONE}${baselinePreset ? ` / preset: ${baselinePreset}` : ''}`);
+            }
+        } catch (e) {
+            console.warn('[RPG Tracker] Failed to reset combat profile override:', e);
+        }
+    });
+}
+
+/**
+ * Switches the main ST connection profile based on [COMBAT] presence in the memo.
+ * Called after each narration generation (post State Tracker pass).
+ * @param {string} memo
+ * @param {ReturnType<import('./state-manager.js').getSettings>} [settings]
+ */
+export async function syncCombatProfile(memo, settings) {
+    settings = settings || getSettings();
+
+    if (!settings.combatProfileAutoSwitch || !settings.enabled || settings.paused) {
+        await resetCombatProfileOverride(settings);
+        return;
+    }
+
+    if (!(await checkConnectionProfilesActive())) return;
+
+    const combatProfileId = settings.combatConnectionProfileId;
+    if (!combatProfileId) return;
+
+    const combatProfileName = getProfileNameById(combatProfileId);
+    if (!combatProfileName) return;
+
+    const combatPresetId = String(settings.combatCompletionPresetId || '').trim();
+    const combatActive = isCombatActive(memo);
+
+    await runSerializedCombatSwitch(async () => {
+        try {
+            const currentName = await getCurrentMainProfileName();
+            const currentPreset = await getCurrentCompletionPreset();
+
+            if (combatActive) {
+                if (!_combatProfileOverrideActive) {
+                    if (combatOverridesMatch(currentName, currentPreset, combatProfileName, combatPresetId)) return;
+                    _combatBaselineProfileName = currentName;
+                    _combatBaselinePresetName = currentPreset;
+                    _combatProfileOverrideActive = true;
+                    await applyCombatOverrides(combatProfileName, combatPresetId);
+                    if (settings.debugMode) {
+                        console.log(`[RPG Tracker] Combat profile activated: ${combatProfileName}${combatPresetId ? ` / preset: ${combatPresetId}` : ''} (baseline: ${_combatBaselineProfileName ?? MAIN_PROFILE_NONE}${_combatBaselinePresetName ? ` / ${_combatBaselinePresetName}` : ''})`);
+                    }
+                } else if (!combatOverridesMatch(currentName, currentPreset, combatProfileName, combatPresetId)) {
+                    await applyCombatOverrides(combatProfileName, combatPresetId);
+                    if (settings.debugMode) {
+                        console.log(`[RPG Tracker] Re-applied combat profile: ${combatProfileName}${combatPresetId ? ` / preset: ${combatPresetId}` : ''}`);
+                    }
+                }
+                return;
+            }
+
+            if (!_combatProfileOverrideActive) return;
+
+            const baseline = _combatBaselineProfileName;
+            const baselinePreset = _combatBaselinePresetName;
+            _combatProfileOverrideActive = false;
+            _combatBaselineProfileName = null;
+            _combatBaselinePresetName = null;
+
+            if (!combatOverridesMatch(currentName, currentPreset, baseline, baselinePreset || null)) {
+                await restoreCombatBaseline(baseline, baselinePreset);
+                if (settings.debugMode) {
+                    console.log(`[RPG Tracker] Combat ended — restored profile: ${baseline ?? MAIN_PROFILE_NONE}${baselinePreset ? ` / preset: ${baselinePreset}` : ''}`);
+                }
+            }
+        } catch (e) {
+            console.warn('[RPG Tracker] Combat profile sync failed:', e);
+        }
+    });
 }
 
 // ── CORS Proxy Helpers ─────────────────────────────────────────────────────────
@@ -302,9 +508,21 @@ export async function testOpenAIConnection(url, apiKey, model) {
  * @param {ReturnType<import('./state-manager.js').getSettings>} settings
  * @param {string} systemPrompt
  * @param {string} userPrompt
+ * @param {AbortSignal|null} [signal]
+ * @param {{ preserveUserMacro?: boolean, userMacroNames?: string[] }} [options]
  * @returns {Promise<string>}
  */
-export async function sendStateRequest(settings, systemPrompt, userPrompt, signal = null) {
+export async function sendStateRequest(settings, systemPrompt, userPrompt, signal = null, options = {}) {
+    const preserveUserMacro = !!options.preserveUserMacro;
+    const userMacroNames = options.userMacroNames || [];
+    const finalize = (text) => (preserveUserMacro && typeof text === 'string')
+        ? restoreUserMacro(text, userMacroNames)
+        : text;
+    if (preserveUserMacro) {
+        systemPrompt = shieldUserMacro(systemPrompt);
+        userPrompt = shieldUserMacro(userPrompt);
+    }
+
     const context = SillyTavern.getContext();
 
     console.log(`[RPG Tracker] sendStateRequest — source: "${settings.connectionSource}", profileId: "${settings.connectionProfileId}", preset: "${settings.completionPresetId}"`);
@@ -384,9 +602,9 @@ export async function sendStateRequest(settings, systemPrompt, userPrompt, signa
                         ?? parsed.choices?.[0]?.text
                         ?? raw;
                     logTransaction('Tracker', [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }], text);
-                    return text;
+                    return finalize(text);
                 }
-                return raw;
+                return finalize(raw);
             }
             const r = /** @type {any} */ (raw);
             let text = r?.content
@@ -404,7 +622,7 @@ export async function sendStateRequest(settings, systemPrompt, userPrompt, signa
 
             if (typeof text === 'string') {
                 logTransaction('Tracker', [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }], text);
-                return text;
+                return finalize(text);
             }
             throw new Error(`[RPG Tracker] Profile request returned unexpected type: ${JSON.stringify(raw).substring(0, 200)}`);
         }
@@ -431,13 +649,13 @@ export async function sendStateRequest(settings, systemPrompt, userPrompt, signa
     // ── Ollama Mode ──
     if (settings.connectionSource === 'ollama') {
         if (settings.debugMode) console.log(`[RPG Tracker] Sending via Ollama: ${settings.ollamaModel}`);
-        return await sendViaOllama(settings.ollamaUrl, settings.ollamaModel, systemPrompt, userPrompt, settings.maxTokens, presetSettings, signal);
+        return finalize(await sendViaOllama(settings.ollamaUrl, settings.ollamaModel, systemPrompt, userPrompt, settings.maxTokens, presetSettings, signal));
     }
 
     // ── OpenAI Compatible Mode ──
     if (settings.connectionSource === 'openai') {
         if (settings.debugMode) console.log(`[RPG Tracker] Sending via OpenAI Compatible: ${settings.openaiModel}`);
-        return await sendViaOpenAI(settings.openaiUrl, settings.openaiKey, settings.openaiModel, systemPrompt, userPrompt, settings.maxTokens, presetSettings, signal);
+        return finalize(await sendViaOpenAI(settings.openaiUrl, settings.openaiKey, settings.openaiModel, systemPrompt, userPrompt, settings.maxTokens, presetSettings, signal));
     }
 
     // ── Default mode: generateRaw through the active connection ──
@@ -490,7 +708,7 @@ export async function sendStateRequest(settings, systemPrompt, userPrompt, signa
         }
 
         logTransaction('Tracker', [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }], text);
-        return text;
+        return finalize(text);
 
     } catch (err) {
         console.error('[RPG Tracker] Request failed:', err);
@@ -557,29 +775,31 @@ export async function sendAgentTurn(settings, messages, tools = null, signal = n
         if (tools?.length) body.tools = tools;
         if (settings.maxTokens > 0) body.max_tokens = settings.maxTokens;
 
-        const isLocal = /^https?:\/\/(localhost|127\.0\.0\.1|192\.168\.\d+|10\.\d|172\.(1[6-9]|2\d|3[01])\.)/i.test(endpoint);
+        // PATCH: always route through ST's server-side CORS proxy (requires enableCorsProxy).
+        // Browser-direct fetches to remote endpoints (e.g. opencode.ai) fail CORS preflight.
         let resp;
-        if (isLocal) {
-            try {
-                resp = await fetch(proxiedUrl(endpoint), { method: 'POST', headers: { ...headers, ...getProxyHeaders() }, body: JSON.stringify(body), signal });
-                if (!resp.ok && resp.status === 404) throw new Error('proxy 404');
-            } catch (_) {
-                resp = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(body), credentials: 'omit', signal });
-            }
-        } else {
+        try {
+            resp = await fetch(proxiedUrl(endpoint), { method: 'POST', headers: { ...headers, ...getProxyHeaders() }, body: JSON.stringify(body), signal });
+            if (!resp.ok && resp.status === 404) throw new Error('proxy 404');
+        } catch (_) {
             resp = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(body), credentials: 'omit', signal });
         }
-        if (!resp.ok) throw new Error(`OpenAI request failed (${resp.status})`);
+        if (!resp.ok) {
+            let _body = '';
+            try { _body = await resp.text(); } catch (_) {}
+            throw new Error(`OpenAI request failed (${resp.status}): ${_body.slice(0, 600)}`);
+        }
         const data = await resp.json();
         const msg = data.choices?.[0]?.message;
+        const _reasoning = msg?.reasoning_content ?? msg?.reasoning ?? null;
         if (msg?.tool_calls?.length) {
             const tc = msg.tool_calls[0];
             let args;
             try { args = JSON.parse(tc.function.arguments); } catch (_) { args = {}; }
-            return { content: msg.content || '', toolCall: { name: tc.function.name, args, id: tc.id } };
+            return { content: msg.content || '', reasoning: _reasoning, toolCall: { name: tc.function.name, args, id: tc.id } };
         }
         const text = msg?.content ?? data.choices?.[0]?.text ?? '';
-        return { content: text, toolCall: null };
+        return { content: text, reasoning: _reasoning, toolCall: null };
     }
 
     // ── Ollama ───────────────────────────────────────────────────────────────

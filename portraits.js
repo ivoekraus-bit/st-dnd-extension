@@ -15,7 +15,11 @@ import {
     resolvePortraitDisplaySrc,
     normalizeEntityName,
     lookupCustomPortraitSrc,
+    snapshotPortraitMapsForChat,
+    portraitWriteMode,
 } from './portrait-storage.js';
+import { buildPortraitStoryContext, portraitStoryLookbackCount } from './src/state/portrait-story-lookback.js';
+import { canCommitPassForChat, createChatCommitGuard, chatCommitResult } from './src/state/pass-affinity.js';
 
 /**
  * Portrait/location AI generation toast — info/success can be hidden via settings.
@@ -56,30 +60,73 @@ export function scaleImageTo512Square(dataUrl) {
 // Re-export portrait key helpers (single source of truth in portrait-storage.js)
 export { normalizeEntityName, lookupCustomPortraitSrc } from './portrait-storage.js';
 
-export async function applyPortraitData(entityName, src) {
+/**
+ * Store a portrait for an entity.
+ * @param {string} entityName
+ * @param {string} src
+ * @param {{ chatId?: string|null }} [opts] Chat that owned the generation. When the
+ *   live chat has switched (common during multi-minute AI Horde waits, or during the
+ *   shorter persistPortraitSrc upload), write into that chat's partition only — never
+ *   the arriving chat's live portrait map.
+ */
+export async function applyPortraitData(entityName, src, opts = {}) {
     const s = getSettings();
-    if (!s.customPortraits) s.customPortraits = {};
     const normName = normalizeEntityName(entityName);
-    const chatId = getActiveChatId();
+    // Pin destination before any await. An explicit passChatId wins; otherwise the chat
+    // that owned this apply at call time (not whatever is live after an upload wait).
+    const liveAtStart = getActiveChatId();
+    const targetChatId = opts.chatId != null && String(opts.chatId).length > 0
+        ? String(opts.chatId)
+        : liveAtStart;
+
+    // Upload/persist BEFORE deciding live vs partition. persistPortraitSrc can take
+    // seconds (AI Horde data URLs); a chat switch during that await used to leave a
+    // stale writeLive===true decision writing into the arriving chat's live maps and
+    // then snapshotting that pollution into the departing chat's partition.
+    let stored = '';
+    if (src) {
+        stored = await persistPortraitSrc(src, targetChatId, normName);
+    }
+
+    const liveNow = getActiveChatId();
+    const writeLive = portraitWriteMode(liveNow, targetChatId) === 'live';
+
+    if (!writeLive) {
+        if (!s.chatStates || typeof s.chatStates !== 'object') s.chatStates = {};
+        // Re-read the partition after the await so concurrent snapshots are not clobbered
+        // from a stale object reference captured before the upload.
+        const partition = s.chatStates[targetChatId] || {};
+        if (!partition.customPortraits || typeof partition.customPortraits !== 'object') {
+            partition.customPortraits = {};
+        }
+        const previous = partition.customPortraits[normName];
+        if (!src) {
+            delete partition.customPortraits[normName];
+        } else {
+            partition.customPortraits[normName] = stored;
+        }
+        s.chatStates[targetChatId] = partition;
+        if (previous && previous !== partition.customPortraits[normName]
+            && isManagedPortraitPath(previous) && countPortraitPathRefs(s, previous) === 0) {
+            await deletePortraitFile(previous);
+        }
+        await saveSettings(true);
+        return;
+    }
+
+    if (!s.customPortraits) s.customPortraits = {};
+    const chatId = targetChatId || liveNow;
     const previous = s.customPortraits[normName];
 
     if (!src) {
         delete s.customPortraits[normName];
-        if (previous && isManagedPortraitPath(previous) && countPortraitPathRefs(s, previous) === 0) {
-            await deletePortraitFile(previous);
-        }
     } else {
-        const stored = await persistPortraitSrc(src, chatId, normName);
         s.customPortraits[normName] = stored;
-
-        // Keep the active chat partition in sync so saveChatState cannot resurrect the old path.
-        if (s.chatLinkEnabled && chatId && s.chatStates?.[chatId]?.customPortraits) {
-            s.chatStates[chatId].customPortraits[normName] = stored;
-        }
-
-        if (previous && previous !== stored && isManagedPortraitPath(previous) && countPortraitPathRefs(s, previous) === 0) {
-            await deletePortraitFile(previous);
-        }
+    }
+    snapshotPortraitMapsForChat(s, chatId);
+    if (previous && previous !== s.customPortraits[normName]
+        && isManagedPortraitPath(previous) && countPortraitPathRefs(s, previous) === 0) {
+        await deletePortraitFile(previous);
     }
     // Portrait sets are infrequent, deliberate actions (not rapid keystrokes like the memo
     // textarea) — force an immediate flush instead of risking the 2s debounce window.
@@ -108,17 +155,7 @@ function migratePortraitMapKey(oldName, newName) {
     const displaced = s.customPortraits[newKey] || null;
     s.customPortraits[newKey] = src;
     delete s.customPortraits[oldKey];
-
-    if (s.chatStates && typeof s.chatStates === 'object') {
-        for (const chatId of Object.keys(s.chatStates)) {
-            const part = s.chatStates[chatId];
-            if (!part?.customPortraits || typeof part.customPortraits !== 'object') continue;
-            if (part.customPortraits[oldKey]) {
-                part.customPortraits[newKey] = part.customPortraits[oldKey];
-                delete part.customPortraits[oldKey];
-            }
-        }
-    }
+    snapshotPortraitMapsForChat(s, getActiveChatId());
 
     return { moved: true, displaced: displaced && displaced !== src ? displaced : null, src };
 }
@@ -127,9 +164,12 @@ function migratePortraitMapKey(oldName, newName) {
  * Move a portrait map entry when an NPC/character is renamed (portraits are keyed by name).
  * @param {string} oldName
  * @param {string} newName
+ * @param {{ canCommit?: () => boolean }} [options]
  * @returns {Promise<boolean>} true if a key was moved
  */
-export async function renamePortraitEntity(oldName, newName) {
+export async function renamePortraitEntity(oldName, newName, options = {}) {
+    const canCommit = createChatCommitGuard(getActiveChatId(), getActiveChatId, options);
+    if (!canCommit()) return false;
     const result = migratePortraitMapKey(oldName, newName);
     if (!result.moved) return false;
 
@@ -138,6 +178,7 @@ export async function renamePortraitEntity(oldName, newName) {
         await deletePortraitFile(result.displaced);
     }
 
+    if (!canCommit()) return false;
     await saveSettings(true);
     return true;
 }
@@ -385,7 +426,180 @@ export const POLLINATIONS_IMAGE_MODELS = [
     { id: 'grok-imagine-pro',      label: 'Grok Imagine Pro',           tier: 'Premium' },
 ];
 
-// ── AI Portrait Prompt Generation ──────────────────────────────────────────────
+// ── AI Horde (aihorde.net) ──
+const HORDE_API_BASE = 'https://aihorde.net/api/v2';
+const HORDE_CLIENT_AGENT = 'SillyTavern-MultihogDnDFramework:1.0:https://github.com/Multihog-DnD-Framework';
+const HORDE_ANONYMOUS_KEY = '0000000000';
+
+let _hordeModelsCache = null;
+let _hordeModelsCacheAt = 0;
+
+/**
+ * Fetches the list of currently active AI Horde image model names (cached for 5 minutes).
+ * @returns {Promise<string[]>}
+ */
+export async function fetchHordeModels() {
+    if (_hordeModelsCache && (Date.now() - _hordeModelsCacheAt) < 5 * 60 * 1000) {
+        return _hordeModelsCache;
+    }
+    const resp = await fetch(`${HORDE_API_BASE}/status/models?type=image`, {
+        headers: { 'Client-Agent': HORDE_CLIENT_AGENT },
+    });
+    if (!resp.ok) throw new Error(`AI Horde model list ${resp.status}`);
+    const models = await resp.json();
+    const names = Array.isArray(models)
+        ? models.map(m => m?.name).filter(Boolean).sort((a, b) => a.localeCompare(b))
+        : [];
+    _hordeModelsCache = names;
+    _hordeModelsCacheAt = Date.now();
+    return names;
+}
+
+/**
+ * Submits an image generation request to the AI Horde, polls until complete, and returns a data URL.
+ * @param {string} prompt
+ * @param {{ signal?: AbortSignal }} [opts]
+ * @returns {Promise<string>} data URL
+ */
+export async function generateWithHordeAsync(prompt, opts = {}) {
+    const s = getSettings();
+    const externalSignal = opts.signal;
+    const apiKey = s.hordeApiKey || HORDE_ANONYMOUS_KEY;
+
+    const throwIfAborted = () => {
+        if (externalSignal?.aborted) {
+            const err = new Error('Image generation was stopped');
+            err.name = 'AbortError';
+            throw err;
+        }
+    };
+
+    const params = {
+        sampler_name: s.hordeSampler || 'er_sde',
+        cfg_scale: Number(s.hordeCfgScale) || 1,
+        height: Number(s.hordeHeight) || 1024,
+        width: Number(s.hordeWidth) || 1024,
+        steps: Number(s.hordeSteps) || 8,
+        n: 1,
+    };
+    if (s.hordeScheduler) params.scheduler = s.hordeScheduler;
+
+    const payload = { prompt, params, r2: false };
+    if (s.hordeModel) payload.models = [s.hordeModel];
+
+    console.log('[RPG Tracker] AI Horde: submitting generation request', { params, models: payload.models || '(any)' });
+
+    const submitResp = await fetch(`${HORDE_API_BASE}/generate/async`, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'apikey': apiKey,
+            'Client-Agent': HORDE_CLIENT_AGENT,
+        },
+        body: JSON.stringify(payload),
+        signal: externalSignal,
+    });
+    if (!submitResp.ok) {
+        const errBody = await submitResp.json().catch(() => null);
+        console.error('[RPG Tracker] AI Horde: submit failed', submitResp.status, errBody);
+        throw new Error(`AI Horde ${submitResp.status}: ${errBody?.message || 'Failed to submit generation request'}`);
+    }
+    const submitData = await submitResp.json();
+    const requestId = submitData?.id;
+    if (!requestId) throw new Error('AI Horde did not return a request ID');
+    console.log(`[RPG Tracker] AI Horde: request ${requestId} queued (est. ${submitData.kudos ?? '?'} kudos)`);
+    if (Array.isArray(submitData.warnings) && submitData.warnings.length) {
+        console.warn('[RPG Tracker] AI Horde: submit warnings (job may never find a worker) —', submitData.warnings);
+        // These codes mean the request itself conflicts with the model's constraints — no amount
+        // of waiting fixes them, so fail fast instead of polling for up to 9 minutes.
+        const fatalCodes = ['SamplerMismatch', 'SchedulerMismatch', 'CfgScaleMismatch', 'CfgScaleTooSmall', 'CfgScaleTooLarge', 'CfgPPScaleTooLarge', 'StepsTooFew', 'StepsTooMany'];
+        const fatal = submitData.warnings.filter(w => fatalCodes.includes(w.code));
+        if (fatal.length) {
+            throw new Error(`AI Horde: ${fatal.map(w => w.message || w.code).join(' | ')}`);
+        }
+    }
+
+    // Poll /generate/check/ until done. Requests expire after 10 minutes on the horde side.
+    const deadline = Date.now() + 9 * 60 * 1000;
+    let waitMs = 4000;
+    while (Date.now() < deadline) {
+        throwIfAborted();
+        await new Promise(resolve => setTimeout(resolve, waitMs));
+        throwIfAborted();
+        waitMs = Math.min(waitMs + 1000, 8000);
+
+        const checkResp = await fetch(`${HORDE_API_BASE}/generate/check/${requestId}`, {
+            headers: { 'Client-Agent': HORDE_CLIENT_AGENT },
+            signal: externalSignal,
+        });
+        if (!checkResp.ok) {
+            console.warn(`[RPG Tracker] AI Horde: check request failed with ${checkResp.status}, retrying...`);
+            continue;
+        }
+        const checkData = await checkResp.json();
+        console.log(`[RPG Tracker] AI Horde: waiting=${checkData.waiting} processing=${checkData.processing} finished=${checkData.finished} queue_position=${checkData.queue_position} wait_time=${checkData.wait_time}s is_possible=${checkData.is_possible}`);
+        if (checkData.is_possible === false) {
+            console.warn('[RPG Tracker] AI Horde: no eligible workers currently available for this request (is_possible=false) — will keep waiting until timeout.');
+        }
+        if (checkData.faulted) {
+            console.error('[RPG Tracker] AI Horde: generation faulted', checkData);
+            throw new Error('AI Horde generation faulted (the worker reported an internal error)');
+        }
+        if (checkData.done) {
+            console.log(`[RPG Tracker] AI Horde: request ${requestId} done, fetching result...`);
+            break;
+        }
+    }
+
+    const statusResp = await fetch(`${HORDE_API_BASE}/generate/status/${requestId}`, {
+        headers: { 'Client-Agent': HORDE_CLIENT_AGENT },
+        signal: externalSignal,
+    });
+    if (!statusResp.ok) throw new Error(`AI Horde ${statusResp.status}: Failed to retrieve generation result`);
+    const statusData = await statusResp.json();
+    const generation = statusData.generations?.[0];
+    if (!generation?.img) {
+        console.error('[RPG Tracker] AI Horde: no image in status response after polling', statusData);
+        throw new Error('AI Horde did not return an image (request may have timed out — try again or check your worker availability at aihorde.net)');
+    }
+    console.log(`[RPG Tracker] AI Horde: image received from worker "${generation.worker_name || generation.worker_id}", decoding...`);
+    if (generation.censored) {
+        throw new Error('AI Horde image was censored by the worker\'s safety filter');
+    }
+
+    // r2:false (SillyTavern's path) returns base64 WebP in the JSON body from
+    // aihorde.net — no second browser fetch to Cloudflare R2. Still accept an
+    // http(s) URL if a worker/proxy ever returns one.
+    return await hordeImageToDataUrl(generation.img, externalSignal);
+}
+
+/**
+ * Convert an AI Horde generation.img payload into a data URL.
+ * @param {string} img Base64 WebP/PNG or an http(s) download URL
+ * @param {AbortSignal} [signal]
+ * @returns {Promise<string>}
+ */
+async function hordeImageToDataUrl(img, signal) {
+    const value = String(img || '').trim();
+    if (!value) throw new Error('AI Horde returned an empty image payload');
+    if (/^https?:\/\//i.test(value)) {
+        const imgResp = await fetch(value, { signal });
+        if (!imgResp.ok) throw new Error(`Failed to download generated image (${imgResp.status})`);
+        const blob = await imgResp.blob();
+        return await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => {
+                if (typeof reader.result === 'string') resolve(reader.result);
+                else reject(new Error('Failed to read image as Base64 string'));
+            };
+            reader.onerror = () => reject(new Error('FileReader error while converting image blob'));
+            reader.readAsDataURL(blob);
+        });
+    }
+    if (value.startsWith('data:image/')) return value;
+    // Bare base64 from r2:false — Horde delivers WebP.
+    return `data:image/webp;base64,${value}`;
+}
 
 /** Connection overlay for portrait / location image prompt LLM calls. */
 export function getPortraitConnectionSettings(baseSettings) {
@@ -410,8 +624,10 @@ export function getPortraitConnectionSettings(baseSettings) {
  * @returns {Promise<string>} The generated image prompt text
  */
 export async function generatePortraitPrompt(entityName) {
+    const ownsOperation = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     const s = getSettings();
     const ctx = SillyTavern.getContext();
+    const useStoryLookback = !!s.portraitUseStoryLookback;
 
     // 1. Entity name
     let contextParts = [`Character Name: ${entityName}`];
@@ -423,121 +639,121 @@ export async function generatePortraitPrompt(entityName) {
         for (const tag of relevantTags) {
             const block = blocks[tag];
             if (!block) continue;
-            // Check if the entity name appears in this block
             if (block.toUpperCase().includes(entityName.toUpperCase())) {
                 contextParts.push(`[${tag}] block (from State Memo):\n${block.trim()}`);
             }
         }
     }
 
-    // 3. Persona — always included, LLM decides if relevant
-    try {
-        const persona = ctx.substituteParams?.('{{persona}}') || '';
-        if (persona.trim()) {
-            contextParts.push(`User Persona:\n${persona.trim()}`);
-        }
-    } catch { /* substituteParams may not exist */ }
-
-    // 4. Character card description
+    // 3. Character card description
     try {
         const charId = ctx.characterId;
         const charData = ctx.characters?.[charId];
         if (charData?.description) {
             contextParts.push(`Character Card Description:\n${charData.description.substring(0, 2000)}`);
         }
-    } catch { /* ignore */ }
+    } catch {
 
-    // 5. Active lorebook entries — scan for keyword matches with entityName
-    try {
-        const worldInfo = ctx.chat_metadata?.world_info;
-        if (worldInfo) {
-            // Try to get entries from context
-            const entries = typeof ctx.getWorldInfoEntries === 'function'
-                ? await ctx.getWorldInfoEntries()
-                : null;
-            if (entries && Array.isArray(entries)) {
-                const matchingEntries = entries.filter(entry => {
-                    const keys = entry.key || [];
-                    const keysArr = Array.isArray(keys) ? keys : [keys];
-                    return keysArr.some(k => k && (
-                        entityName.toLowerCase().includes(k.toLowerCase()) ||
-                        k.toLowerCase().includes(entityName.toLowerCase())
-                    ));
-                });
-                if (matchingEntries.length > 0) {
-                    const loreText = matchingEntries.map(e =>
-                        `[Lorebook: ${e.comment || e.key?.[0] || 'Entry'}]\n${(e.content || '').substring(0, 800)}`
-                    ).join('\n\n');
-                    contextParts.push(`Matching Lorebook Entries:\n${loreText}`);
+         /* ignore */ }
+
+    if (useStoryLookback) {
+        // Persona — always included when using story context, LLM decides if relevant
+        try {
+            const persona = ctx.substituteParams?.('{{persona}}') || '';
+            if (persona.trim()) {
+                contextParts.push(`User Persona:\n${persona.trim()}`);
+            }
+        } catch {
+
+         /* substituteParams may not exist */ }
+
+        // Active lorebook entries — scan for keyword matches with entityName
+        try {
+            const worldInfo = ctx.chat_metadata?.world_info;
+            if (worldInfo) {
+                const entries = typeof ctx.getWorldInfoEntries === 'function'
+                    ? chatCommitResult(ownsOperation, await ctx.getWorldInfoEntries())
+                    : null;
+                if (entries && Array.isArray(entries)) {
+                    const matchingEntries = entries.filter(entry => {
+                        const keys = entry.key || [];
+                        const keysArr = Array.isArray(keys) ? keys : [keys];
+                        return keysArr.some(k => k && (
+                            entityName.toLowerCase().includes(k.toLowerCase()) ||
+                            k.toLowerCase().includes(entityName.toLowerCase())
+                        ));
+                    });
+                    if (matchingEntries.length > 0) {
+                        const loreText = matchingEntries.map(e =>
+                            `[Lorebook: ${e.comment || e.key?.[0] || 'Entry'}]\n${(e.content || '').substring(0, 800)}`
+                        ).join('\n\n');
+                        contextParts.push(`Matching Lorebook Entries:\n${loreText}`);
+                    }
                 }
             }
-        }
-    } catch { /* lorebook access may vary */ }
+        } catch {
+            if (!ownsOperation()) return;
+         /* lorebook access may vary */ }
 
-    // Also check active router keys for lorebook context
-    try {
-        if (s.activeRouterKeys?.length > 0) {
-            const manifest = typeof getLorebookManifest === 'function' ? await getLorebookManifest(true) : null;
-            if (manifest) {
-                const matchingActive = manifest.filter(entry => {
-                    const keys = entry.keys || [];
-                    return keys.some(k => k && (
-                        entityName.toLowerCase().includes(k.toLowerCase()) ||
-                        k.toLowerCase().includes(entityName.toLowerCase())
-                    ));
-                });
-                if (matchingActive.length > 0) {
-                    const activeText = matchingActive.map(e =>
-                        `[Active Lore: ${e.label || e.category || 'Entry'}]\n${(e.content || '').substring(0, 800)}`
-                    ).join('\n\n');
-                    contextParts.push(`Active Lorebook Context:\n${activeText}`);
+        try {
+            if (s.activeRouterKeys?.length > 0) {
+                const manifest = typeof getLorebookManifest === 'function' ? chatCommitResult(ownsOperation, await getLorebookManifest(true)) : null;
+                if (manifest) {
+                    const matchingActive = manifest.filter(entry => {
+                        const keys = entry.keys || [];
+                        return keys.some(k => k && (
+                            entityName.toLowerCase().includes(k.toLowerCase()) ||
+                            k.toLowerCase().includes(entityName.toLowerCase())
+                        ));
+                    });
+                    if (matchingActive.length > 0) {
+                        const activeText = matchingActive.map(e =>
+                            `[Active Lore: ${e.label || e.category || 'Entry'}]\n${(e.content || '').substring(0, 800)}`
+                        ).join('\n\n');
+                        contextParts.push(`Active Lorebook Context:\n${activeText}`);
+                    }
                 }
             }
-        }
-    } catch { /* lorebook manifest may not be available */ }
+        } catch {
+            if (!ownsOperation()) return;
+         /* lorebook manifest may not be available */ }
 
-    // 6. Full Lorebook Agent context — ALL active keys with keywords and content
-    try {
-        if (s.activeRouterKeys?.length > 0) {
-            const agentBooks = {};
-            for (const k of s.activeRouterKeys) {
-                const [bookName] = k.split('::');
-                if (!agentBooks[bookName]) agentBooks[bookName] = await ctx.loadWorldInfo(bookName);
-            }
-            const agentEntries = [];
-            for (const k of s.activeRouterKeys) {
-                const [bookName, uid] = k.split('::');
-                const entry = agentBooks[bookName]?.entries?.[uid];
-                if (entry && entry.content) {
-                    const keywords = (entry.key || []).filter(Boolean).join(', ');
-                    const label = entry.comment || entry.key?.[0] || uid;
-                    agentEntries.push(`[Agent Entry: "${label}" | Keywords: ${keywords || 'none'}]\n${(entry.content || '').substring(0, 600)}`);
+        try {
+            if (s.activeRouterKeys?.length > 0) {
+                const agentBooks = {};
+                for (const k of s.activeRouterKeys) {
+                    const [bookName] = k.split('::');
+                    if (!agentBooks[bookName]) agentBooks[bookName] = chatCommitResult(ownsOperation, await ctx.loadWorldInfo(bookName));
+                }
+                const agentEntries = [];
+                for (const k of s.activeRouterKeys) {
+                    const [bookName, uid] = k.split('::');
+                    const entry = agentBooks[bookName]?.entries?.[uid];
+                    if (entry && entry.content) {
+                        const keywords = (entry.key || []).filter(Boolean).join(', ');
+                        const label = entry.comment || entry.key?.[0] || uid;
+                        agentEntries.push(`[Agent Entry: "${label}" | Keywords: ${keywords || 'none'}]\n${(entry.content || '').substring(0, 600)}`);
+                    }
+                }
+                if (agentEntries.length > 0) {
+                    contextParts.push(`Current Lorebook Agent (All Active Entries):\n${agentEntries.join('\n\n')}`);
                 }
             }
-            if (agentEntries.length > 0) {
-                contextParts.push(`Current Lorebook Agent (All Active Entries):\n${agentEntries.join('\n\n')}`);
-            }
-        }
-    } catch { /* lorebook agent entries may not be loadable */ }
+        } catch {
+            if (!ownsOperation()) return;
+         /* lorebook agent entries may not be loadable */ }
 
-    // 7. Current game state (memo) — full state for rich context
-    try {
-        if (s.currentMemo) {
-            contextParts.push(`Current Game State:\n${memoForGmContext(s.currentMemo).substring(0, 2000)}`);
-        }
-    } catch { /* ignore */ }
-
-    // 8. Last 5 messages from chat
-    try {
-        if (ctx.chat && Array.isArray(ctx.chat)) {
-            const filteredMsgs = ctx.chat.filter(m => !m.is_system && m.mes && m.mes.trim());
-            const lastMsgs = filteredMsgs.slice(-5);
-            if (lastMsgs.length > 0) {
-                const msgText = lastMsgs.map(m => `${m.name || (m.is_user ? 'User' : 'Character')}: ${m.mes}`).join('\n\n');
-                contextParts.push(`Recent Chat Context (Last 5 Messages):\n${msgText.substring(0, 12000)}`);
+        try {
+            if (s.currentMemo) {
+                contextParts.push(`Current Game State:\n${memoForGmContext(s.currentMemo).substring(0, 2000)}`);
             }
-        }
-    } catch { /* ignore */ }
+        } catch {
+
+         /* ignore */ }
+
+        const storyContext = buildPortraitStoryContext(ctx, portraitStoryLookbackCount(s));
+        if (storyContext) contextParts.push(storyContext);
+    }
 
     const systemPrompt = (s.portraitCharacterSystemPrompt || '')
         .replace(/\{\{name\}\}/g, entityName)
@@ -545,7 +761,7 @@ export async function generatePortraitPrompt(entityName) {
 
     const userPrompt = contextParts.join('\n\n---\n\n');
 
-    const result = await sendStateRequest(getPortraitConnectionSettings(s), systemPrompt, userPrompt);
+    const result = chatCommitResult(ownsOperation, await sendStateRequest(getPortraitConnectionSettings(s), systemPrompt, userPrompt));
     return (result || '').trim();
 }
 
@@ -560,42 +776,36 @@ export async function generatePortraitPrompt(entityName) {
 export async function generateNpcPortraitPrompt(entityName, npcContent) {
     const s = getSettings();
     const ctx = SillyTavern.getContext();
+    const useStoryLookback = !!s.portraitUseStoryLookback;
 
     let contextParts = [`NPC Name: ${entityName}`];
 
-    // 1. NPC lorebook entry content (primary source)
     if (npcContent && npcContent.trim()) {
         contextParts.push(`NPC Lorebook Entry:\n${npcContent.trim()}`);
     }
 
-    // 2. Persona — for art style context
-    try {
-        const persona = ctx.substituteParams?.('{{persona}}') || '';
-        if (persona.trim()) {
-            contextParts.push(`User Persona (for art style context):\n${persona.trim()}`);
-        }
-    } catch { /* substituteParams may not exist */ }
-
-    // 3. Character card description — for setting/world context
-    try {
-        const charId = ctx.characterId;
-        const charData = ctx.characters?.[charId];
-        if (charData?.description) {
-            contextParts.push(`Narrator Card Description (for world context):\n${charData.description.substring(0, 1500)}`);
-        }
-    } catch { /* ignore */ }
-
-    // 4. Last 3 chat messages for scene context
-    try {
-        if (ctx.chat && Array.isArray(ctx.chat)) {
-            const filteredMsgs = ctx.chat.filter(m => !m.is_system && m.mes && m.mes.trim());
-            const lastMsgs = filteredMsgs.slice(-3);
-            if (lastMsgs.length > 0) {
-                const msgText = lastMsgs.map(m => `${m.name || (m.is_user ? 'User' : 'Character')}: ${m.mes}`).join('\n\n');
-                contextParts.push(`Recent Scene Context:\n${msgText.substring(0, 4000)}`);
+    if (useStoryLookback) {
+        try {
+            const persona = ctx.substituteParams?.('{{persona}}') || '';
+            if (persona.trim()) {
+                contextParts.push(`User Persona (for art style context):\n${persona.trim()}`);
             }
-        }
-    } catch { /* ignore */ }
+        } catch { /* substituteParams may not exist */ }
+
+        try {
+            const charId = ctx.characterId;
+            const charData = ctx.characters?.[charId];
+            if (charData?.description) {
+                contextParts.push(`Narrator Card Description (for world context):\n${charData.description.substring(0, 1500)}`);
+            }
+        } catch { /* ignore */ }
+
+        const storyContext = buildPortraitStoryContext(ctx, portraitStoryLookbackCount(s), {
+            maxChars: 4000,
+            label: 'Recent Scene Context',
+        });
+        if (storyContext) contextParts.push(storyContext);
+    }
 
     const systemPrompt = (s.portraitNpcSystemPrompt || '')
         .replace(/\{\{name\}\}/g, entityName)
@@ -621,9 +831,12 @@ export async function showPortraitPromptPopup(prompt, entityName, localApply, re
     if (!ctx.callGenericPopup) return;
 
     const isNative = s.portraitGeneratorSource === 'native';
+    const isHorde = s.portraitGeneratorSource === 'horde';
     const subText = isNative
         ? 'Edit the prompt below, then copy it or generate directly with the ST Image Generation extension'
-        : 'Edit the prompt below, then copy it or generate directly with Pollinations.ai';
+        : isHorde
+            ? 'Edit the prompt below, then copy it or generate directly with the AI Horde'
+            : 'Edit the prompt below, then copy it or generate directly with Pollinations.ai';
 
     const textareaId = `rt-ai-prompt-${Date.now()}`;
     const skipCheckboxId = `rt-skip-prompt-${Date.now()}`;
@@ -638,7 +851,7 @@ export async function showPortraitPromptPopup(prompt, entityName, localApply, re
     </div>`;
 
     const popupOpts = {
-        okButton: isNative ? '🎨 Generate with ST Image Gen' : '🎨 Generate with Pollinations',
+        okButton: isNative ? '🎨 Generate with ST Image Gen' : isHorde ? '🎨 Generate with AI Horde' : '🎨 Generate with Pollinations',
         cancelButton: 'Cancel',
         wide: false,
         customButtons: [
@@ -679,6 +892,8 @@ export async function showPortraitPromptPopup(prompt, entityName, localApply, re
         }
         if (isNative) {
             await generateWithNativeExtension(finalPrompt, entityName, localApply, refresh);
+        } else if (isHorde) {
+            await generateWithHorde(finalPrompt, entityName, localApply, refresh);
         } else {
             // Generate with Pollinations
             await generateWithPollinations(finalPrompt, entityName, localApply, refresh);
@@ -696,8 +911,13 @@ export async function showPortraitPromptPopup(prompt, entityName, localApply, re
 export async function generatePortraitDirect(prompt, entityName, opts = {}) {
     const s = getSettings();
     const isNative = s.portraitGeneratorSource === 'native';
+    const isHorde = s.portraitGeneratorSource === 'horde';
     const externalSignal = opts.signal;
     const allowFallback = opts.allowFallback !== false;
+
+    if (isHorde) {
+        return await generateWithHordeAsync(prompt, { signal: externalSignal });
+    }
 
     if (isNative) {
         const { SlashCommandParser } = SillyTavern.getContext();
@@ -733,6 +953,7 @@ export async function generatePortraitDirect(prompt, entityName, opts = {}) {
         }
         return imageUrl;
     } else {
+        // Pollinations.ai
         const apiKey = await ensurePollinationsKey();
         if (!apiKey) throw new Error('Pollinations API key is required');
 
@@ -1063,6 +1284,101 @@ export async function generateWithNativeExtension(prompt, entityName, localApply
 }
 
 /**
+ * Generates an image via the AI Horde and shows a preview/approve popup.
+ * @param {string} prompt
+ * @param {string} entityName
+ * @param {function} localApply
+ * @param {function} refresh
+ */
+export async function generateWithHorde(prompt, entityName, localApply, refresh) {
+    const ctx = SillyTavern.getContext();
+    if (!ctx.callGenericPopup) return;
+
+    // Chat affinity must be pinned by the localApply the caller supplied (portrait
+    // map, location map, or NPC library). Never bypass into applyPortraitData —
+    // location/NPC-library Apply would land in the wrong store after a chat switch.
+
+    const showPreview = async (preGeneratedUrl = null) => {
+        const imgId = `rt-horde-img-${Date.now()}`;
+        const spinnerId = `rt-horde-spinner-${Date.now()}`;
+        const errorId = `rt-horde-error-${Date.now()}`;
+
+        // Fire generation immediately or use pre-generated/cropped URL
+        const genPromise = preGeneratedUrl ? Promise.resolve(preGeneratedUrl) : generatePortraitDirect(prompt, entityName);
+        genPromise.then(dataUrl => {
+            const img = document.getElementById(imgId);
+            const spinner = document.getElementById(spinnerId);
+            if (img) { img.src = dataUrl; img.style.display = 'block'; }
+            if (spinner) spinner.style.display = 'none';
+        }).catch(err => {
+            console.error('[RPG Tracker] AI Horde: generation failed', err);
+            const spinner = document.getElementById(spinnerId);
+            const errEl = document.getElementById(errorId);
+            if (spinner) spinner.style.display = 'none';
+            if (errEl) { errEl.textContent = `⚠ ${err.message}`; errEl.style.display = 'block'; }
+        });
+
+        const popupContent = `<div style="padding:10px;min-width:320px;max-width:460px;">
+            <b style="display:block;margin-bottom:8px;">🖼️ Generated Portrait — ${escapeHtml(entityName)}</b>
+            <div style="position:relative;text-align:center;margin-bottom:10px;min-height:200px;">
+                <div id="${spinnerId}" style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:0.9em;opacity:0.6;">
+                    <i class="fa-solid fa-spinner fa-spin" style="margin-right:6px;"></i>Generating image with AI Horde (this can take a minute)…
+                </div>
+                <img id="${imgId}" style="max-width:100%;max-height:400px;border-radius:8px;display:none;margin:0 auto;" />
+                <div id="${errorId}" style="display:none;color:#ff6b6b;font-size:0.9em;margin-top:10px;"></div>
+            </div>
+            <div style="font-size:0.72em;opacity:0.45;margin-top:2px;">Prompt: ${escapeHtml(prompt.substring(0, 100))}${prompt.length > 100 ? '…' : ''}</div>
+        </div>`;
+
+        const popupOpts = {
+            okButton: '✅ Apply Portrait', cancelButton: 'Cancel', wide: false,
+            customButtons: [
+                { text: '🔄 Regenerate', result: 3, classes: ['menu_button'] },
+                { text: '✂️ Crop', result: 4, classes: ['menu_button'] }
+            ],
+        };
+
+        const result = await ctx.callGenericPopup(popupContent, ctx.POPUP_TYPE?.CONFIRM ?? 1, '', popupOpts);
+
+        if (result === 3) {
+            await showPreview(); // Regenerate
+        } else if (result === 4) {
+            // Crop button clicked
+            try {
+                const dataUrl = await genPromise;
+                const cropped = await ctx.callGenericPopup(
+                    'Set the crop position of the portrait',
+                    ctx.POPUP_TYPE?.CROP ?? 4,
+                    '',
+                    { cropImage: dataUrl, cropAspect: 1 }
+                );
+                if (cropped) {
+                    await showPreview(cropped);
+                } else {
+                    await showPreview(dataUrl);
+                }
+            } catch (err) {
+                toastr['error']('Cannot crop — generation failed: ' + err.message, 'RPG Tracker');
+                await showPreview();
+            }
+        } else if (result) {
+            // Wait for generation to finish, then scale and apply directly
+            try {
+                const dataUrl = await genPromise;
+                const finalUrl = dataUrl.startsWith('data:') ? await scaleImageTo512Square(dataUrl) : dataUrl;
+                await localApply(finalUrl);
+                if (typeof refresh === 'function') refresh();
+                imageGenToast('success', `Portrait applied for ${entityName}!`, 'RPG Tracker');
+            } catch (err) {
+                toastr['error']('Cannot apply — generation failed: ' + err.message, 'RPG Tracker');
+            }
+        }
+    };
+
+    await showPreview();
+}
+
+/**
  * Scans the current [CHARACTER] block in state memo for character names.
  * Uses the same HP-line and plain-name parsing as party/enemy scanners.
  * @param {object} [settings]
@@ -1174,7 +1490,7 @@ function triggerPlayerPortraitAutoGenIfNeeded(settings, refresh, opts = {}) {
         return;
     }
     seedPlayerCharacterKnownEntities(settings);
-    triggerBackgroundPortraitGeneration(charName, refresh);
+    triggerBackgroundPortraitGeneration(charName, refresh, null, opts);
 }
 
 /**
@@ -1183,6 +1499,7 @@ function triggerPlayerPortraitAutoGenIfNeeded(settings, refresh, opts = {}) {
  * @param {function} refresh - callback to refresh the UI
  */
 export async function autoGeneratePartyPortraits(refresh) {
+    const ownsOperation = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     const s = getSettings();
     if (!s.currentMemo) {
         toastr['warning']('No live state memo found.', 'RPG Tracker');
@@ -1223,17 +1540,22 @@ export async function autoGeneratePartyPortraits(refresh) {
 
     imageGenToast('info', `Starting auto-generation for ${toGenerate.length} party members...`, 'RPG Tracker');
     let successCount = 0;
+    // AI Horde can take minutes; pin so a mid-flight chat switch cannot land
+    // these portraits in the arriving chat's map.
+    const passChatId = getActiveChatId();
 
     for (const name of toGenerate) {
         imageGenToast('info', `Generating for ${name}...`, 'RPG Tracker');
         try {
-            const prompt = await generatePortraitPrompt(name);
-            const dataUrl = await generatePortraitDirect(prompt, name);
-            const scaled = await scaleImageTo512Square(dataUrl);
-            await applyPortraitData(name, scaled);
+            const prompt = chatCommitResult(ownsOperation, await generatePortraitPrompt(name));
+            const dataUrl = chatCommitResult(ownsOperation, await generatePortraitDirect(prompt, name));
+            const scaled = chatCommitResult(ownsOperation, await scaleImageTo512Square(dataUrl));
+            chatCommitResult(ownsOperation, await applyPortraitData(name, scaled, { chatId: passChatId }));
             successCount++;
             if (typeof refresh === 'function') refresh();
         } catch (err) {
+            if (!ownsOperation()) return;
+
             toastr['error'](`Failed for ${name}: ${err.message}`, 'RPG Tracker');
         }
     }
@@ -1249,6 +1571,7 @@ export async function autoGeneratePartyPortraits(refresh) {
  * @param {function} refresh - callback to refresh the UI
  */
 export async function autoGenerateEnemyPortraits(refresh) {
+    const ownsOperation = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     const enemies = getEnemyEntities();
     if (enemies.length === 0) {
         toastr['warning']('No enemies found in the current COMBAT block.', 'RPG Tracker');
@@ -1264,17 +1587,20 @@ export async function autoGenerateEnemyPortraits(refresh) {
 
     imageGenToast('info', `Starting auto-generation for ${toGenerate.length} enemies...`, 'RPG Tracker');
     let successCount = 0;
+    const passChatId = getActiveChatId();
 
     for (const name of toGenerate) {
         imageGenToast('info', `Generating for enemy ${name}...`, 'RPG Tracker');
         try {
-            const prompt = await generatePortraitPrompt(name);
-            const dataUrl = await generatePortraitDirect(prompt, name);
-            const scaled = await scaleImageTo512Square(dataUrl);
-            await applyPortraitData(name, scaled);
+            const prompt = chatCommitResult(ownsOperation, await generatePortraitPrompt(name));
+            const dataUrl = chatCommitResult(ownsOperation, await generatePortraitDirect(prompt, name));
+            const scaled = chatCommitResult(ownsOperation, await scaleImageTo512Square(dataUrl));
+            chatCommitResult(ownsOperation, await applyPortraitData(name, scaled, { chatId: passChatId }));
             successCount++;
             if (typeof refresh === 'function') refresh();
         } catch (err) {
+            if (!ownsOperation()) return;
+
             toastr['error'](`Failed for enemy ${name}: ${err.message}`, 'RPG Tracker');
         }
     }
@@ -1389,8 +1715,17 @@ export function getEnemyEntities() {
  * Does not block the main execution flow; jobs share a global ComfyUI-safe queue.
  * @param {string} name
  * @param {function} refresh - callback to refresh the UI on success
+ * @param {string|null} [npcContent]
+ * @param {{ chatId?: string|null }} [opts] Chat that owned the kickoff. Callers that
+ *   awaited lorebook/network work before enqueueing must pass the pre-await pin —
+ *   otherwise a mid-await chat switch would bind the arriving chat.
  */
-export function triggerBackgroundPortraitGeneration(name, refresh, npcContent = null) {
+export function triggerBackgroundPortraitGeneration(name, refresh, npcContent = null, opts = {}) {
+    const ownsOperation = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+    const passChatId = opts.chatId != null && String(opts.chatId).length > 0
+        ? String(opts.chatId)
+        : getActiveChatId();
+    if (!(ownsOperation() && canCommitPassForChat(passChatId, getActiveChatId()))) return;
     const alreadyHas = hasPortrait(name);
     const alreadyGenerating = activeGenerations.has(name);
     console.log(`[RPG Tracker] triggerBackgroundPortraitGeneration for "${name}". alreadyHasPortrait:`, alreadyHas, `alreadyGenerating:`, alreadyGenerating);
@@ -1407,11 +1742,13 @@ export function triggerBackgroundPortraitGeneration(name, refresh, npcContent = 
 
     enqueueImageGen(async () => {
         try {
+            if (!(ownsOperation() && canCommitPassForChat(passChatId, getActiveChatId()))) return;
             console.log(`[RPG Tracker] Generating prompt for "${name}" (NPC content provided: ${!!npcContent})`);
             const prompt = npcContent
                 ? await generateNpcPortraitPrompt(name, npcContent)
                 : await generatePortraitPrompt(name);
             console.log(`[RPG Tracker] Generated prompt for "${name}":`, prompt);
+            if (!(ownsOperation() && canCommitPassForChat(passChatId, getActiveChatId()))) return;
             if (!prompt) {
                 console.warn(`[RPG Tracker] Could not generate prompt for ${name} - no context found.`);
                 return;
@@ -1421,13 +1758,14 @@ export function triggerBackgroundPortraitGeneration(name, refresh, npcContent = 
             console.log(`[RPG Tracker] Successfully received portrait dataUrl for "${name}". Scaling...`);
             const scaled = await scaleImageTo512Square(dataUrl);
             console.log(`[RPG Tracker] Applying portrait data for "${name}"...`);
-            await applyPortraitData(name, scaled);
+            await applyPortraitData(name, scaled, { chatId: passChatId });
             imageGenToast('success', `Portrait auto-generated and applied for ${name}!`, 'RPG Tracker');
-            if (typeof refresh === 'function') {
+            if ((ownsOperation() && canCommitPassForChat(passChatId, getActiveChatId())) && typeof refresh === 'function') {
                 console.log(`[RPG Tracker] Triggering UI refresh callback...`);
                 refresh();
             }
         } catch (err) {
+            if (!(ownsOperation() && canCommitPassForChat(passChatId, getActiveChatId()))) return;
             console.error(`[RPG Tracker] Background portrait generation failed for ${name}:`, err);
             const errMsg = String(err.message || err);
             const is524 = errMsg.includes('524') || errMsg.includes('timeout') || errMsg.includes('Upstream');
@@ -1468,43 +1806,52 @@ export function resetAutoGenerationTracking() {
  * @param {function} refresh - callback to refresh the UI
  */
 export async function forceCheckAutoGenerations(refresh) {
+    const ownsOperation = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     const s = getSettings();
     console.log('[RPG Tracker] forceCheckAutoGenerations called. Settings enablePortraits:', s.enablePortraits);
     if (s.enablePortraits === false) return;
+    // Pin before lorebook awaits — NPC/location paths load World Info before enqueueing.
+    const passChatId = getActiveChatId();
+    const pinnedOpts = { chatId: passChatId };
 
     if (s.portraitAutoGenerateParty) {
         const party = getPartyMembers();
         console.log('[RPG Tracker] forceCheckAutoGenerations: checking party:', party);
         for (const name of party) {
             knownEntities.add(name.toUpperCase());
-            triggerBackgroundPortraitGeneration(name, refresh);
+            triggerBackgroundPortraitGeneration(name, refresh, null, pinnedOpts);
         }
     }
 
-    triggerPlayerPortraitAutoGenIfNeeded(s, refresh);
+    triggerPlayerPortraitAutoGenIfNeeded(s, refresh, pinnedOpts);
 
     if (s.portraitAutoGenerateEnemies) {
         const enemies = getEnemyEntities();
         console.log('[RPG Tracker] forceCheckAutoGenerations: checking enemies:', enemies);
         for (const name of enemies) {
             knownEntities.add(name.toUpperCase());
-            triggerBackgroundPortraitGeneration(name, refresh);
+            triggerBackgroundPortraitGeneration(name, refresh, null, pinnedOpts);
         }
     }
 
     if (s.portraitAutoGenerateNpcs && s.npcPortraits !== false) {
         const ctx = SillyTavern.getContext();
-        console.log('[RPG Tracker] forceCheckAutoGenerations: checking NPCs. chatId:', ctx.chatId);
-        if (ctx.chatId) {
-            const prefix = getEffectiveRouterCampaignPrefix(ctx.chatId);
+        // Prefer the pinned pass id — ctx.chatId can lag behind runtimeState during
+        // CHAT_CHANGED / MESSAGE_SWIPED, which would load another campaign's NPCs
+        // and enqueue them into this chat's portrait store.
+        console.log('[RPG Tracker] forceCheckAutoGenerations: checking NPCs. chatId:', passChatId, 'ctx.chatId:', ctx.chatId);
+        if (passChatId) {
+            const prefix = getEffectiveRouterCampaignPrefix(passChatId);
             const bookName = prefix ? `${prefix}_NPCs` : 'NPCs';
             console.log('[RPG Tracker] forceCheckAutoGenerations: bookName:', bookName);
             try {
                 if (typeof ctx.updateWorldInfoList === 'function') {
                     console.log('[RPG Tracker] forceCheckAutoGenerations: updating world info list...');
-                    await ctx.updateWorldInfoList();
+                    chatCommitResult(ownsOperation, await ctx.updateWorldInfoList());
                 }
-                const book = await ctx.loadWorldInfo(bookName);
+                if (!canCommitPassForChat(passChatId, getActiveChatId())) return;
+                const book = chatCommitResult(ownsOperation, await ctx.loadWorldInfo(bookName));
+                if (!canCommitPassForChat(passChatId, getActiveChatId())) return;
                 if (book && book.entries) {
                     const entries = Object.values(book.entries);
                     console.log('[RPG Tracker] forceCheckAutoGenerations: loaded book entries count:', entries.length);
@@ -1513,24 +1860,28 @@ export async function forceCheckAutoGenerations(refresh) {
                         if (name) {
                             console.log('[RPG Tracker] forceCheckAutoGenerations: forcing NPC:', name);
                             knownEntities.add(name.toUpperCase());
-                            triggerBackgroundPortraitGeneration(name, refresh, entry.content || '');
+                            triggerBackgroundPortraitGeneration(name, refresh, entry.content || '', pinnedOpts);
                         }
                     }
                 } else {
                     console.log('[RPG Tracker] forceCheckAutoGenerations: book not found or empty:', bookName);
                 }
             } catch (e) {
+                if (!ownsOperation()) return;
+
                 console.error('[RPG Tracker] forceCheckAutoGenerations NPC check error:', e);
             }
         }
     }
 
+    if (!canCommitPassForChat(passChatId, getActiveChatId())) return;
     if (s.portraitAutoGenerateLocations && !s.portraitAutoGenerateSceneView && s.locationImages) {
-        const locEntries = await loadLocationLorebookEntries();
+        const locEntries = chatCommitResult(ownsOperation, await loadLocationLorebookEntries(passChatId));
+        if (!canCommitPassForChat(passChatId, getActiveChatId())) return;
         for (const entry of locEntries) {
             const path = normalizeLocationPath(entry.label);
             knownEntities.add(`LOC::${path.toUpperCase()}`);
-            triggerBackgroundLocationGeneration(path, refresh, entry.content);
+            triggerBackgroundLocationGeneration(path, refresh, entry.content, pinnedOpts);
         }
     }
 }
@@ -1540,12 +1891,17 @@ export async function forceCheckAutoGenerations(refresh) {
  * @param {function} refresh - callback to refresh the UI when done
  */
 export async function checkAndTriggerAutoGenerations(refresh) {
+    const ownsOperation = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     const s = getSettings();
     console.log('[RPG Tracker] checkAndTriggerAutoGenerations invoked. enablePortraits:', s.enablePortraits, 'isFirstCheck:', isFirstCheck);
     if (s.enablePortraits === false) {
         console.log('[RPG Tracker] checkAndTriggerAutoGenerations: enablePortraits is false. Exiting.');
         return;
     }
+    // Pin before lorebook awaits — NPC fetch can outlive a chat switch; pinning only
+    // inside triggerBackground* would bind the arriving chat.
+    const passChatId = getActiveChatId();
+    const pinnedOpts = { chatId: passChatId };
 
     // Move portrait keys for in-place memo renames before treating names as "new".
     reconcileMemoPortraitRenames();
@@ -1559,13 +1915,17 @@ export async function checkAndTriggerAutoGenerations(refresh) {
     console.log('[RPG Tracker] checkAndTriggerAutoGenerations: portraitAutoGenerateNpcs settings:', s.portraitAutoGenerateNpcs);
     if (s.portraitAutoGenerateNpcs && s.npcPortraits !== false) {
         const ctx = SillyTavern.getContext();
-        console.log('[RPG Tracker] checkAndTriggerAutoGenerations: ctx.chatId:', ctx.chatId);
-        if (ctx.chatId) {
-            const prefix = getEffectiveRouterCampaignPrefix(ctx.chatId);
+        // Prefer the pinned pass id — ctx.chatId can lag behind runtimeState during
+        // CHAT_CHANGED / MESSAGE_SWIPED, which would load another campaign's NPCs
+        // and enqueue them into this chat's portrait store.
+        console.log('[RPG Tracker] checkAndTriggerAutoGenerations: chatId:', passChatId, 'ctx.chatId:', ctx.chatId);
+        if (passChatId) {
+            const prefix = getEffectiveRouterCampaignPrefix(passChatId);
             const bookName = prefix ? `${prefix}_NPCs` : 'NPCs';
             console.log('[RPG Tracker] checkAndTriggerAutoGenerations: resolving bookName:', bookName);
             try {
-                const book = await ctx.loadWorldInfo(bookName);
+                const book = chatCommitResult(ownsOperation, await ctx.loadWorldInfo(bookName));
+                if (!canCommitPassForChat(passChatId, getActiveChatId())) return;
                 if (book && book.entries) {
                     npcEntries = Object.values(book.entries).filter(e => (e.comment || '').trim());
                     console.log('[RPG Tracker] checkAndTriggerAutoGenerations: loaded npcEntries count:', npcEntries.length, npcEntries.map(e => e.comment));
@@ -1573,10 +1933,14 @@ export async function checkAndTriggerAutoGenerations(refresh) {
                     console.log('[RPG Tracker] checkAndTriggerAutoGenerations: no book or entries found for', bookName);
                 }
             } catch (e) {
+                if (!ownsOperation()) return;
+
                 console.error('[RPG Tracker] checkAndTriggerAutoGenerations NPC fetch error:', e);
             }
         }
     }
+
+    if (!canCommitPassForChat(passChatId, getActiveChatId())) return;
 
     // On initial startup/F5, record all existing entities as already known without generating anything
     if (isFirstCheck) {
@@ -1592,7 +1956,7 @@ export async function checkAndTriggerAutoGenerations(refresh) {
         for (const entry of npcEntries) {
             knownEntities.add(entry.comment.trim().toUpperCase());
         }
-        await checkAndTriggerLocationAutoGenerations(refresh, { isFirstCheck: true });
+        chatCommitResult(ownsOperation, await checkAndTriggerLocationAutoGenerations(refresh, { isFirstCheck: true, chatId: passChatId }));
         console.log('[RPG Tracker] checkAndTriggerAutoGenerations: knownEntities after first check:', Array.from(knownEntities));
         return;
     }
@@ -1605,7 +1969,7 @@ export async function checkAndTriggerAutoGenerations(refresh) {
             if (!knownEntities.has(key)) {
                 console.log('[RPG Tracker] checkAndTriggerAutoGenerations: New party member detected:', name);
                 knownEntities.add(key);
-                triggerBackgroundPortraitGeneration(name, refresh);
+                triggerBackgroundPortraitGeneration(name, refresh, null, pinnedOpts);
             } else {
                 console.log('[RPG Tracker] checkAndTriggerAutoGenerations: Party member already known:', name);
             }
@@ -1623,7 +1987,7 @@ export async function checkAndTriggerAutoGenerations(refresh) {
             if (!knownEntities.has(key)) {
                 console.log('[RPG Tracker] checkAndTriggerAutoGenerations: [CHARACTER] block name detected:', charName);
                 seedPlayerCharacterKnownEntities(s);
-                triggerBackgroundPortraitGeneration(charName, refresh);
+                triggerBackgroundPortraitGeneration(charName, refresh, null, pinnedOpts);
             }
         }
     } else {
@@ -1636,7 +2000,7 @@ export async function checkAndTriggerAutoGenerations(refresh) {
             if (!knownEntities.has(key)) {
                 console.log('[RPG Tracker] checkAndTriggerAutoGenerations: New enemy detected:', name);
                 knownEntities.add(key);
-                triggerBackgroundPortraitGeneration(name, refresh);
+                triggerBackgroundPortraitGeneration(name, refresh, null, pinnedOpts);
             } else {
                 console.log('[RPG Tracker] checkAndTriggerAutoGenerations: Enemy already known:', name);
             }
@@ -1652,7 +2016,7 @@ export async function checkAndTriggerAutoGenerations(refresh) {
             const name = entry.comment.trim();
             if (!hasPortrait(name)) {
                 console.log('[RPG Tracker] checkAndTriggerAutoGenerations: NPC has no portrait, triggering generation:', name);
-                triggerBackgroundPortraitGeneration(name, refresh, entry.content || '');
+                triggerBackgroundPortraitGeneration(name, refresh, entry.content || '', pinnedOpts);
             } else {
                 console.log('[RPG Tracker] checkAndTriggerAutoGenerations: NPC already has portrait, skipping:', name);
             }
@@ -1663,7 +2027,7 @@ export async function checkAndTriggerAutoGenerations(refresh) {
         }
     }
 
-    await checkAndTriggerLocationAutoGenerations(refresh, { isFirstCheck: false });
+    chatCommitResult(ownsOperation, await checkAndTriggerLocationAutoGenerations(refresh, { isFirstCheck: false, chatId: passChatId }));
 }
 
 // ── Location images (hierarchical lore paths) ─────────────────────────────────
@@ -1717,36 +2081,85 @@ export function hasLocationImage(path) {
     return !!(s.customLocationImages && s.customLocationImages[norm]);
 }
 
+/** Apply a location image to SillyTavern's live chat background without changing its saved background selection. */
+export function applyLocationImageToChatBackground(src) {
+    if (!src || typeof document === 'undefined') return;
+    const background = document.getElementById('bg1');
+    if (!background) return;
+    const escapedSrc = String(src).replace(/["\\\r\n]/g, '\\$&');
+    background.style.backgroundImage = `url("${escapedSrc}")`;
+}
+
 /**
  * @param {string} locationPath Full hierarchical path
  * @param {string|null} src Image URL, data URL, managed path, or null to clear
  */
-export async function applyLocationImageData(locationPath, src) {
+/**
+ * Store a location image.
+ * @param {string} locationPath
+ * @param {string} src
+ * @param {{ chatId?: string|null }} [opts] Chat that owned the generation. When the
+ *   live chat has switched, write into that chat's partition only.
+ */
+export async function applyLocationImageData(locationPath, src, opts = {}) {
     const s = getSettings();
-    if (!s.customLocationImages) s.customLocationImages = {};
     const normPath = normalizeLocationPath(locationPath);
-    const chatId = getActiveChatId();
-    const previous = s.customLocationImages[normPath];
     const storageKey = `loc__${normPath}`;
+    // Pin destination before any await — same TOCTOU as applyPortraitData.
+    const liveAtStart = getActiveChatId();
+    const targetChatId = opts.chatId != null && String(opts.chatId).length > 0
+        ? String(opts.chatId)
+        : liveAtStart;
+
+    let stored = '';
+    if (src) {
+        stored = await persistPortraitSrc(src, targetChatId, storageKey);
+    }
+
+    const liveNow = getActiveChatId();
+    const writeLive = portraitWriteMode(liveNow, targetChatId) === 'live';
+
+    if (!writeLive) {
+        if (!s.chatStates || typeof s.chatStates !== 'object') s.chatStates = {};
+        const partition = s.chatStates[targetChatId] || {};
+        if (!partition.customLocationImages || typeof partition.customLocationImages !== 'object') {
+            partition.customLocationImages = {};
+        }
+        const previous = partition.customLocationImages[normPath];
+        if (!src) {
+            delete partition.customLocationImages[normPath];
+        } else {
+            partition.customLocationImages[normPath] = stored;
+        }
+        s.chatStates[targetChatId] = partition;
+        if (previous && previous !== partition.customLocationImages[normPath]
+            && isManagedPortraitPath(previous) && countPortraitPathRefs(s, previous) === 0) {
+            await deletePortraitFile(previous);
+        }
+        await saveSettings(true);
+        return;
+    }
+
+    if (!s.customLocationImages) s.customLocationImages = {};
+    const chatId = targetChatId || liveNow;
+    const previous = s.customLocationImages[normPath];
 
     if (!src) {
         delete s.customLocationImages[normPath];
-        if (previous && isManagedPortraitPath(previous) && countPortraitPathRefs(s, previous) === 0) {
-            await deletePortraitFile(previous);
-        }
     } else {
-        const stored = await persistPortraitSrc(src, chatId, storageKey);
         s.customLocationImages[normPath] = stored;
-
-        if (s.chatLinkEnabled && chatId && s.chatStates?.[chatId]?.customLocationImages) {
-            s.chatStates[chatId].customLocationImages[normPath] = stored;
-        }
-
-        if (previous && previous !== stored && isManagedPortraitPath(previous) && countPortraitPathRefs(s, previous) === 0) {
-            await deletePortraitFile(previous);
-        }
+    }
+    snapshotPortraitMapsForChat(s, chatId);
+    if (previous && previous !== s.customLocationImages[normPath]
+        && isManagedPortraitPath(previous) && countPortraitPathRefs(s, previous) === 0) {
+        await deletePortraitFile(previous);
     }
     await saveSettings(true);
+    // Saving/deleting can also outlive a chat switch. Only refresh the background
+    // if the chat that owns this image is still active after those awaits.
+    if (src && portraitWriteMode(getActiveChatId(), targetChatId) === 'live') {
+        void globalThis._rpgSyncCurrentLocationBackground?.(normPath);
+    }
 }
 
 /**
@@ -1760,14 +2173,16 @@ export function scaleImageToLandscape(dataUrl) {
 }
 
 /**
+ * @param {string|null|undefined} [chatId] Originating chat — never re-read live ctx.chatId.
  * @returns {Promise<Map<string, { content: string }>>}
  */
-async function loadLocationLorebookMap() {
+async function loadLocationLorebookMap(chatId = getActiveChatId()) {
     const ctx = SillyTavern.getContext();
     const map = new Map();
-    if (!ctx.chatId) return map;
+    const id = chatId != null && String(chatId).length > 0 ? String(chatId) : null;
+    if (!id) return map;
 
-    const prefix = getEffectiveRouterCampaignPrefix(ctx.chatId);
+    const prefix = getEffectiveRouterCampaignPrefix(id);
     const bookName = prefix ? `${prefix}_Locations` : 'Locations';
     try {
         if (typeof ctx.updateWorldInfoList === 'function') {
@@ -1817,8 +2232,7 @@ function formatRecentNarratorOutputs(ctx, count = 2) {
  */
 export function getLinkedPlayerCharacter(settings, ctx) {
     const s = settings || getSettings();
-    const c = ctx || SillyTavern.getContext();
-    const chatId = c.chatId || (typeof globalThis._rpgCurrentChatId === 'function' ? globalThis._rpgCurrentChatId() : null);
+    const chatId = getActiveChatId();
     if (!chatId || !s.chatStates?.[chatId]?.playerCharacter) return null;
     const pc = s.chatStates[chatId].playerCharacter;
     const name = String(pc.name || '').trim();
@@ -1880,11 +2294,15 @@ async function loadPresentCharactersForLocationPrompt(settings, ctx) {
 /**
  * Generates an image prompt for a location lorebook entry.
  * Parent locations in the hierarchy are included as visual continuity guides, not substitutes.
+ * Always includes recent narrator/story context — location scene art cannot be
+ * generated from a location card alone, so this path is not gated by portraitUseStoryLookback.
  * @param {string} locationPath
  * @param {string} locContent
  * @returns {Promise<string>}
  */
 export async function generateLocationImagePrompt(locationPath, locContent) {
+    const passChatId = getActiveChatId();
+    const ownsOperation = createChatCommitGuard(passChatId, getActiveChatId);
     const s = getSettings();
     const ctx = SillyTavern.getContext();
     const normPath = normalizeLocationPath(locationPath);
@@ -1894,7 +2312,7 @@ export async function generateLocationImagePrompt(locationPath, locContent) {
         contextParts.push(`Location Lorebook Entry (PRIMARY — depict this specific place):\n${locContent.trim()}`);
     }
 
-    const loreMap = await loadLocationLorebookMap();
+    const loreMap = chatCommitResult(ownsOperation, await loadLocationLorebookMap(passChatId));
     const ancestors = getAncestorLocationPaths(normPath);
     if (ancestors.length > 0) {
         const parentBlocks = [];
@@ -1925,13 +2343,15 @@ export async function generateLocationImagePrompt(locationPath, locContent) {
         if (narratorBlock) {
             contextParts.push(`Recent Narrator Output (last 2 replies — use for mood, staging, and moment):\n${narratorBlock.substring(0, 6000)}`);
         }
-    } catch { /* ignore */ }
+    } catch {
+
+         /* ignore */ }
 
     try {
         // Present-Now name scan of the latest narrator output — runs here so Characters Present Now
         // is fresh immediately before the image-generation prompt is sent (not after).
         // Matches NPC names only (first/last), not lorebook key[] keywords.
-        const presentCharacters = await loadPresentCharactersForLocationPrompt(s, ctx);
+        const presentCharacters = chatCommitResult(ownsOperation, await loadPresentCharactersForLocationPrompt(s, ctx));
         if (presentCharacters.length > 0) {
             const charBlocks = presentCharacters.map(ch =>
                 `### ${ch.label}\n${ch.content || '(No lore content — infer appearance from name and scene context.)'}`,
@@ -1940,14 +2360,18 @@ export async function generateLocationImagePrompt(locationPath, locContent) {
                 `Characters Present Now (include in the scene):\n${charBlocks.join('\n\n')}`,
             );
         }
-    } catch { /* ignore */ }
+    } catch {
+        if (!ownsOperation()) return;
+         /* ignore */ }
 
     try {
         const persona = ctx.substituteParams?.('{{persona}}') || '';
         if (persona.trim()) {
             contextParts.push(`User Persona (for art style context):\n${persona.trim()}`);
         }
-    } catch { /* ignore */ }
+    } catch {
+
+         /* ignore */ }
 
     try {
         const charId = ctx.characterId;
@@ -1955,7 +2379,9 @@ export async function generateLocationImagePrompt(locationPath, locContent) {
         if (charData?.description) {
             contextParts.push(`Narrator Card Description (for world context):\n${charData.description.substring(0, 1500)}`);
         }
-    } catch { /* ignore */ }
+    } catch {
+
+         /* ignore */ }
 
     const leafName = normPath.split(' :: ').pop() || normPath;
     const systemPrompt = (s.portraitLocationSystemPrompt || '')
@@ -1965,7 +2391,7 @@ export async function generateLocationImagePrompt(locationPath, locContent) {
 
     const userPrompt = contextParts.join('\n\n---\n\n');
 
-    const result = await sendStateRequest(getPortraitConnectionSettings(s), systemPrompt, userPrompt);
+    const result = chatCommitResult(ownsOperation, await sendStateRequest(getPortraitConnectionSettings(s), systemPrompt, userPrompt));
     return (result || '').trim();
 }
 
@@ -1982,10 +2408,12 @@ export function resetRealtimeLocationGenerationFailure() {
     setRealtimeVisualizationDisabled(false);
 }
 
-/** Stop an active/queued Real-Time request and prevent another attempt. */
-export function stopRealtimeLocationGeneration() {
-    realtimeLocationGenerationFailed = true;
-    setRealtimeVisualizationDisabled(true);
+/** Cancel active work; explicit stops/failures also disable future attempts. */
+export function stopRealtimeLocationGeneration({ disable = true } = {}) {
+    if (disable) {
+        realtimeLocationGenerationFailed = true;
+        setRealtimeVisualizationDisabled(true);
+    }
     activeRealtimeLocationAbortController?.abort();
     activeRealtimeLocationAbortController = null;
 }
@@ -2015,9 +2443,14 @@ export function isLocationImageGenerating(locationPath) {
  * @param {string} locationPath
  * @param {function} refresh
  * @param {string} [locContent]
- * @param {{ forceReplace?: boolean, realtimeArrival?: boolean }} [opts]
+ * @param {{ forceReplace?: boolean, realtimeArrival?: boolean, chatId?: string|null }} [opts]
  */
 export function triggerBackgroundLocationGeneration(locationPath, refresh, locContent = '', opts = {}) {
+    const ownsOperation = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+    const passChatId = opts.chatId != null && String(opts.chatId).length > 0
+        ? String(opts.chatId)
+        : getActiveChatId();
+    if (!(ownsOperation() && canCommitPassForChat(passChatId, getActiveChatId()))) return;
     const s = getSettings();
     const isRealtimeArrival = !!opts.realtimeArrival;
     // Real-Time Mode: only Scene View arrival may auto-generate; block Lorebook Agent paths.
@@ -2041,7 +2474,7 @@ export function triggerBackgroundLocationGeneration(locationPath, refresh, locCo
         } else {
             imageGenToast('info', `Queued location image for ${leaf} (${queuePos} ahead)...`, 'RPG Tracker');
         }
-    } else if (typeof refresh === 'function') {
+    } else if ((ownsOperation() && canCommitPassForChat(passChatId, getActiveChatId())) && typeof refresh === 'function') {
         refresh();
     }
 
@@ -2049,6 +2482,7 @@ export function triggerBackgroundLocationGeneration(locationPath, refresh, locCo
         const realtimeAbortController = isRealtimeArrival ? new AbortController() : null;
         if (realtimeAbortController) activeRealtimeLocationAbortController = realtimeAbortController;
         try {
+            if (!(ownsOperation() && canCommitPassForChat(passChatId, getActiveChatId()))) return;
             // The user may have disabled Real-Time Mode while this job waited in
             // the shared queue. Abandon it before touching either endpoint.
             if (isRealtimeArrival && (!getSettings().portraitAutoGenerateSceneView || realtimeLocationGenerationFailed)) {
@@ -2057,6 +2491,7 @@ export function triggerBackgroundLocationGeneration(locationPath, refresh, locCo
             // generateLocationImagePrompt runs the Present-Now keyword scanner (latest
             // output only) before building the image prompt — must stay ahead of generatePortraitDirect.
             const prompt = await generateLocationImagePrompt(normPath, locContent);
+            if (!(ownsOperation() && canCommitPassForChat(passChatId, getActiveChatId()))) return;
             if (!prompt) {
                 if (isRealtimeArrival) {
                     await disableRealtimeLocationGenerationAfterFailure(new Error('No image prompt was returned'));
@@ -2069,12 +2504,13 @@ export function triggerBackgroundLocationGeneration(locationPath, refresh, locCo
                 allowFallback: !isRealtimeArrival,
             });
             const scaled = await scaleImageToLandscape(dataUrl);
-            await applyLocationImageData(normPath, scaled);
+            await applyLocationImageData(normPath, scaled, { chatId: passChatId });
             if (!isRealtimeArrival) {
                 imageGenToast('success', `${forceReplace ? 'Location image regenerated' : 'Location image auto-generated'} for ${leaf}!`, 'RPG Tracker');
             }
-            if (!isRealtimeArrival && typeof refresh === 'function') refresh();
+            if (!isRealtimeArrival && (ownsOperation() && canCommitPassForChat(passChatId, getActiveChatId())) && typeof refresh === 'function') refresh();
         } catch (err) {
+            if (!(ownsOperation() && canCommitPassForChat(passChatId, getActiveChatId()))) return;
             console.error(`[RPG Tracker] Background location image generation failed for ${normPath}:`, err);
             const errMsg = String(err.message || err);
             if (isRealtimeArrival) {
@@ -2094,35 +2530,42 @@ export function triggerBackgroundLocationGeneration(locationPath, refresh, locCo
             activeLocationGenerations.delete(normPath);
             // Refresh only after clearing the active marker. The failure latch
             // makes this final UI refresh incapable of scheduling a retry.
-            if (isRealtimeArrival && typeof refresh === 'function') refresh();
+            if (isRealtimeArrival && (ownsOperation() && canCommitPassForChat(passChatId, getActiveChatId())) && typeof refresh === 'function') refresh();
         }
     });
 }
 
 /**
  * Load location lorebook entries for auto-generation.
+ * @param {string|null|undefined} [chatId] Originating chat for campaign prefix.
  * @returns {Promise<Array<{label: string, content: string}>>}
  */
-async function loadLocationLorebookEntries() {
+async function loadLocationLorebookEntries(chatId = getActiveChatId()) {
     const s = getSettings();
     // Real-Time Mode owns location art; skip Lorebook Agent batch generation.
     if (!s.portraitAutoGenerateLocations || s.portraitAutoGenerateSceneView || !s.locationImages) return [];
 
-    const map = await loadLocationLorebookMap();
+    const map = await loadLocationLorebookMap(chatId);
     return [...map.entries()].map(([label, { content }]) => ({ label, content }));
 }
 
 /**
  * @param {function} refresh
- * @param {{ isFirstCheck?: boolean }} [opts]
+ * @param {{ isFirstCheck?: boolean, chatId?: string|null }} [opts]
  */
 export async function checkAndTriggerLocationAutoGenerations(refresh, opts = {}) {
+    const ownsOperation = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+    try {
     const s = getSettings();
     if (s.enablePortraits === false) return;
     // Real-Time Mode: location images are created on Scene View arrival only.
     if (!s.portraitAutoGenerateLocations || s.portraitAutoGenerateSceneView || !s.locationImages) return;
 
-    const locEntries = await loadLocationLorebookEntries();
+    const passChatId = opts.chatId != null && String(opts.chatId).length > 0
+        ? String(opts.chatId)
+        : getActiveChatId();
+    const locEntries = chatCommitResult(ownsOperation, await loadLocationLorebookEntries(passChatId));
+    if (!canCommitPassForChat(passChatId, getActiveChatId())) return;
     if (opts.isFirstCheck) {
         for (const entry of locEntries) {
             knownEntities.add(`LOC::${normalizeLocationPath(entry.label).toUpperCase()}`);
@@ -2130,10 +2573,16 @@ export async function checkAndTriggerLocationAutoGenerations(refresh, opts = {})
         return;
     }
 
+    const pinnedOpts = { chatId: passChatId };
     for (const entry of locEntries) {
         const path = normalizeLocationPath(entry.label);
         if (!hasLocationImage(path)) {
-            triggerBackgroundLocationGeneration(path, refresh, entry.content);
+            triggerBackgroundLocationGeneration(path, refresh, entry.content, pinnedOpts);
         }
+        }
+
+    } catch (error) {
+        if (!ownsOperation()) return;
+        throw error;
     }
 }

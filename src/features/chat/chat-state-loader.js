@@ -1,5 +1,9 @@
 import { runtimeState } from '../../app/runtime-state.js';
 import { applyChatSetup, resetChatSetupToStock } from '../../state/chat-setup.js';
+import { ensureDungeonMapHistory, trimMemoAndMapHistory } from '../../state/dungeon-map-history.js';
+import { repairChatLinkMemoHistory } from './chat-link-conflict.js';
+import { summarizeMapEvolutionSchedule } from '../../../map-evolution-lib.js';
+import { isLorebookAgentRuntimeActive } from '../../state/section-enabled.js';
 
 /** Restores one chat-linked tracker snapshot and synchronizes dependent UI. */
 export function createChatStateLoader({
@@ -33,6 +37,12 @@ export function createChatStateLoader({
     const s = getSettings();
     const saved = s.chatStates?.[chatId];
     if (!saved) return false;
+    repairChatLinkMemoHistory(saved);
+    trimMemoAndMapHistory(saved);
+
+    // Every successful projection records its owner before any later extension
+    // can ask SillyTavern to save the shared extensionSettings object.
+    s.chatStateProjectionOwner = chatId;
 
     if (s.chatSetupLinkEnabled) {
         if (!applyChatSetup(s, saved.setup)) resetChatSetupToStock(s);
@@ -44,6 +54,8 @@ export function createChatStateLoader({
         s.combatDefeatedUi = [];
     }
     s.memoHistory = saved.memoHistory ?? [];
+    s.dungeonMapHistory = saved.dungeonMapHistory ?? [];
+    ensureDungeonMapHistory(s);
     s.lastDelta = saved.lastDelta ?? '';
     // Legacy Chat Link keeps these presentation fields at the partition root.
     // Under setup lock the dedicated setup snapshot is authoritative, including
@@ -69,30 +81,50 @@ export function createChatStateLoader({
     s.routerLookback = saved.routerLookback || 4;
     s.routerLastRunChatLength = saved.routerLastRunChatLength ?? 0;
     s.routerLastRunAt = saved.routerLastRunAt ?? 0;
+    s.mapUpdaterLastRunChatLength = saved.mapUpdaterLastRunChatLength ?? 0;
+    s.mapUpdaterLastRunAt = saved.mapUpdaterLastRunAt ?? 0;
+    s.mapUpdaterLastSiteRoot = saved.mapUpdaterLastSiteRoot || '';
+    s.mapUpdaterPendingExitRoot = saved.mapUpdaterPendingExitRoot || '';
+    s.mapEvolutionLastFiredBySite = JSON.parse(JSON.stringify(saved.mapEvolutionLastFiredBySite || {}));
+    s.mapEvolutionBacklogBySite = JSON.parse(JSON.stringify(saved.mapEvolutionBacklogBySite || {}));
+    s.mapEvolutionThreadsBySite = JSON.parse(JSON.stringify(saved.mapEvolutionThreadsBySite || {}));
+    s.dungeonMapRevealAll = !!saved.dungeonMapRevealAll;
+    s.mapEvolutionLastSiteRoot = saved.mapEvolutionLastSiteRoot || '';
+    s.mapEvolutionPendingExitRoot = saved.mapEvolutionPendingExitRoot || '';
+    s.mapEvolutionTickScope = saved.mapEvolutionTickScope || 'all';
+    s.mapEvolutionTickCount = saved.mapEvolutionTickCount ?? 2;
+    s.mapEvolutionTickRandomize = saved.mapEvolutionTickRandomize !== false;
+    s.mapEvolutionSelectedRoots = JSON.parse(JSON.stringify(saved.mapEvolutionSelectedRoots || []));
+    s.mapEvolutionIntervalHoursBySite = JSON.parse(JSON.stringify(saved.mapEvolutionIntervalHoursBySite || {}));
+    s.mapEvolutionWorldReportLookback = saved.mapEvolutionWorldReportLookback ?? 5;
+    s.mapEvolutionWorldReportApplications = JSON.parse(JSON.stringify(saved.mapEvolutionWorldReportApplications || {}));
+    s.pcCharacterBlockSeeded = !!saved.pcCharacterBlockSeeded;
     s.routerDirectPrompt = saved.routerDirectPrompt || '';
+    s.stateTrackerDirectPrompt = saved.stateTrackerDirectPrompt || '';
+    s.mapUpdaterDirectPrompt = saved.mapUpdaterDirectPrompt || '';
+    s.mapUpdaterDirectLookback = saved.mapUpdaterDirectLookback ?? saved.routerLookback ?? 10;
+    s.mapUpdaterDirectPromptOpen = !!saved.mapUpdaterDirectPromptOpen;
+    s.mapEvolutionDirectPrompt = saved.mapEvolutionDirectPrompt || '';
+    s.mapEvolutionDirectLookback = saved.mapEvolutionDirectLookback ?? 10;
+    s.mapArchitectDirectPrompt = saved.mapArchitectDirectPrompt || '';
+    s.mapArchitectDirectLookback = saved.mapArchitectDirectLookback ?? 10;
     s.worldProgressionLookback = saved.worldProgressionLookback ?? 20;
     s.worldProgressionHistoryLookback = saved.worldProgressionHistoryLookback ?? 0;
     s.worldProgressionInjectionPosition = saved.worldProgressionInjectionPosition ?? 4;
     s.worldProgressionInjectionDepth = saved.worldProgressionInjectionDepth ?? 4;
     s.worldProgressionInjectionRole = saved.worldProgressionInjectionRole ?? 0;
-    s.worldProgressionRandomizeNPCs = saved.worldProgressionRandomizeNPCs ?? false;
-    s.worldProgressionRandomSkeletonNPCCount = saved.worldProgressionRandomSkeletonNPCCount ?? 2;
-    s.worldProgressionRandomNarrativeNPCCount = saved.worldProgressionRandomNarrativeNPCCount ?? 3;
-    s.worldProgressionRandomizeLocations = saved.worldProgressionRandomizeLocations ?? false;
-    s.worldProgressionRandomSkeletonLocationCount = saved.worldProgressionRandomSkeletonLocationCount ?? 2;
-    s.worldProgressionRandomNarrativeLocationCount = saved.worldProgressionRandomNarrativeLocationCount ?? 2;
-    s.worldProgressionRandomizeFactions = saved.worldProgressionRandomizeFactions ?? false;
-    s.worldProgressionRandomSkeletonFactionCount = saved.worldProgressionRandomSkeletonFactionCount ?? 2;
-    s.worldProgressionRandomNarrativeFactionCount = saved.worldProgressionRandomNarrativeFactionCount ?? 2;
-    s.worldProgressionRandomizeConflicts = saved.worldProgressionRandomizeConflicts ?? false;
-    s.worldProgressionRandomConflictCount = saved.worldProgressionRandomConflictCount ?? 3;
+    s.worldProgressionLocationsPerReport = saved.worldProgressionLocationsPerReport ?? 3;
+    s.worldProgressionLocationRandomize = saved.worldProgressionLocationRandomize !== false;
+    s.worldProgressionLocationLastAdvanced = JSON.parse(JSON.stringify(saved.worldProgressionLocationLastAdvanced || {}));
     s.worldProgressionSkeletonFactions = saved.worldProgressionSkeletonFactions ?? 4;
     s.worldProgressionSkeletonLocations = saved.worldProgressionSkeletonLocations ?? 4;
-    s.worldProgressionSkeletonNPCs = saved.worldProgressionSkeletonNPCs ?? 0;
     s.worldProgressionSkeletonConflicts = saved.worldProgressionSkeletonConflicts ?? 3;
     s.worldProgressionSkeletonAtmosphereSummary = saved.worldProgressionSkeletonAtmosphereSummary ?? '';
     s.worldProgressionSkeletonAtmosphereLookback = saved.worldProgressionSkeletonAtmosphereLookback ?? 30;
     s.worldProgressionSkeletonUseExisting = saved.worldProgressionSkeletonUseExisting ?? true;
+    s.worldProgressionSkeletonUseLorebooks = saved.worldProgressionSkeletonUseLorebooks ?? false;
+    s.worldProgressionSkeletonLorebookFilter = JSON.parse(JSON.stringify(saved.worldProgressionSkeletonLorebookFilter || []));
+    s.worldProgressionSkeletonLorebookOnly = saved.worldProgressionSkeletonLorebookOnly ?? false;
     s.worldProgressionExclusionList = saved.worldProgressionExclusionList ?? '';
     s.worldProgressionLastFiredAtMinutes = saved.worldProgressionLastFiredAtMinutes ?? -1;
     s.worldProgressionLastFiredPeriodLabel = saved.worldProgressionLastFiredPeriodLabel || '';
@@ -105,29 +137,51 @@ export function createChatStateLoader({
     applyChatTimeFormatSettings(saved);
     applyChatNpcRelMaxSettings(saved);
 
-    // Update settings UI inputs if rendered
-    $('#rpg_world_progression_randomize_npcs').prop('checked', !!s.worldProgressionRandomizeNPCs);
-    $('#rpg_world_progression_random_skeleton_npc_count').val(s.worldProgressionRandomSkeletonNPCCount ?? 2);
-    $('#rpg_world_progression_random_narrative_npc_count').val(s.worldProgressionRandomNarrativeNPCCount ?? 3);
-    $('#rpg_world_progression_randomize_locations').prop('checked', !!s.worldProgressionRandomizeLocations);
-    $('#rpg_world_progression_random_skeleton_location_count').val(s.worldProgressionRandomSkeletonLocationCount ?? 2);
-    $('#rpg_world_progression_random_narrative_location_count').val(s.worldProgressionRandomNarrativeLocationCount ?? 2);
-    $('#rpg_world_progression_randomize_factions').prop('checked', !!s.worldProgressionRandomizeFactions);
-    $('#rpg_world_progression_random_skeleton_faction_count').val(s.worldProgressionRandomSkeletonFactionCount ?? 2);
-    $('#rpg_world_progression_random_narrative_faction_count').val(s.worldProgressionRandomNarrativeFactionCount ?? 2);
+    // Legacy partitions predate per-chat relationship maps. Leave live values
+    // alone so the next saveChatState can adopt them instead of wiping to 0.
+    if (Object.prototype.hasOwnProperty.call(saved, 'npcRelationshipValues')) {
+        s.npcRelationshipValues = JSON.parse(JSON.stringify(saved.npcRelationshipValues || {}));
+    }
+    if (Object.prototype.hasOwnProperty.call(saved, 'npcRelationshipLog')) {
+        s.npcRelationshipLog = JSON.parse(JSON.stringify(saved.npcRelationshipLog || {}));
+    }
 
+    // Update settings UI inputs if rendered
     $('#rpg_world_progression_skeleton_factions').val(s.worldProgressionSkeletonFactions ?? 4);
     $('#rpg_world_progression_skeleton_locations').val(s.worldProgressionSkeletonLocations ?? 4);
-    $('#rpg_world_progression_skeleton_npcs').val(s.worldProgressionSkeletonNPCs ?? 0);
     $('#rpg_world_progression_skeleton_conflicts').val(s.worldProgressionSkeletonConflicts ?? 3);
     $('#rpg_world_progression_skeleton_atmosphere').val(s.worldProgressionSkeletonAtmosphereSummary);
     $('#rpg_world_progression_skeleton_atmosphere_lookback').val(s.worldProgressionSkeletonAtmosphereLookback);
     $('#rpg_world_progression_skeleton_use_existing').prop('checked', !!s.worldProgressionSkeletonUseExisting);
+    $('#rpg_world_progression_skeleton_use_lorebooks').prop('checked', !!s.worldProgressionSkeletonUseLorebooks);
+    $('#rpg_world_progression_skeleton_lorebook_filter_group').toggle(!!s.worldProgressionSkeletonUseLorebooks);
+    $('#rpg_world_progression_skeleton_lorebook_only').prop('checked', !!s.worldProgressionSkeletonLorebookOnly);
+    $('#rpg_world_progression_skeleton_lorebook_only').prop('disabled', !s.worldProgressionSkeletonUseLorebooks);
+    $('#rpg_world_progression_skeleton_lorebook_only_row').css({
+        opacity: s.worldProgressionSkeletonUseLorebooks ? '1' : '0.45',
+        pointerEvents: s.worldProgressionSkeletonUseLorebooks ? 'auto' : 'none',
+    });
+    const lorebookOnlyActive = !!s.worldProgressionSkeletonUseLorebooks && !!s.worldProgressionSkeletonLorebookOnly;
+    $('#rpg_world_progression_skeleton_counts').css({
+        opacity: lorebookOnlyActive ? '0.4' : '1',
+        pointerEvents: lorebookOnlyActive ? 'none' : 'auto',
+    }).find('input').prop('disabled', lorebookOnlyActive);
+    if (s.worldProgressionSkeletonUseLorebooks && typeof globalThis._rpgRefreshSkeletonLorebookList === 'function') {
+        void globalThis._rpgRefreshSkeletonLorebookList();
+    }
     $('#rpg_world_progression_exclusion_list').val(s.worldProgressionExclusionList);
+    $('#rpg_world_progression_locations_per_report').val(s.worldProgressionLocationsPerReport ?? 3);
+    $('#rt-agent-world-locations').val(s.worldProgressionLocationsPerReport ?? 3);
+    $('#rpg_world_progression_location_randomize').prop('checked', s.worldProgressionLocationRandomize !== false);
+    $('#rpg_map_evolution_world_report_lookback').val(s.mapEvolutionWorldReportLookback ?? 5);
+    if (typeof runtimeState.updateAgentMapEvolutionStatusRef === 'function') {
+        runtimeState.updateAgentMapEvolutionStatusRef();
+    }
 
     // Sync portrait connection settings UI
     $('#rpg_portrait_generator_source').val(s.portraitGeneratorSource || 'native');
     $('#rpg_tracker_pollinations_group').toggle((s.portraitGeneratorSource || 'native') === 'pollinations');
+    $('#rpg_tracker_horde_group').toggle((s.portraitGeneratorSource || 'native') === 'horde');
     $('#rpg_tracker_portrait_skip_prompt').prop('checked', !!s.portraitSkipPromptDialog);
     $('#rpg_tracker_hide_image_gen_toasts').prop('checked', !!s.hideImageGenToasts);
     $('#rpg_tracker_portrait_auto_party').prop('checked', !!s.portraitAutoGenerateParty);
@@ -198,14 +252,6 @@ export function createChatStateLoader({
     }
 
     // Toggle container visibilities
-    if (s.worldProgressionRandomizeNPCs) $('#rpg_world_progression_random_npc_count_container').show();
-    else $('#rpg_world_progression_random_npc_count_container').hide();
-    if (s.worldProgressionRandomizeLocations) $('#rpg_world_progression_random_location_count_container').show();
-    else $('#rpg_world_progression_random_location_count_container').hide();
-    if (s.worldProgressionRandomizeFactions) $('#rpg_world_progression_random_faction_count_container').show();
-    else $('#rpg_world_progression_random_faction_count_container').hide();
-
-
     // Sync World Progression timing readouts for this chat
     {
         function _fmtWpMins(totalMins) {
@@ -227,6 +273,19 @@ export function createChatStateLoader({
             if (tMins >= 0) nextMins = tMins + intervalMinutes;
         }
         $('#rpg_world_progression_next_report_val').text(nextMins >= 0 ? _fmtWpMins(nextMins) : '—');
+
+        const evoSchedule = summarizeMapEvolutionSchedule(s.mapEvolutionLastFiredBySite, {
+            intervalHours: s.mapEvolutionIntervalHours,
+            currentMinutes: (() => {
+                const tMatch = (s.currentMemo || '').match(/\[TIME\]([\s\S]*?)\[\/TIME\]/i);
+                const tStr = tMatch ? extractCurrentTimeStr(tMatch[1]) : '';
+                return tStr ? (parseInWorldTime(tStr) ?? -1) : -1;
+            })(),
+        });
+        const evoLast = evoSchedule.lastMins >= 0 ? formatInWorldTime(evoSchedule.lastMins) : 'Never';
+        $('#rpg_map_evolution_last_fired').text(evoLast);
+        $('#rpg_map_evolution_last_report_val').text(evoLast);
+        $('#rpg_map_evolution_next_report_val').text(evoSchedule.nextMins >= 0 ? formatInWorldTime(evoSchedule.nextMins) : '—');
 
         // Sync consolidation fields
         $('#rpg_world_progression_consolidate_enabled').prop('checked', !!s.worldProgressionConsolidateEnabled);
@@ -264,6 +323,9 @@ export function createChatStateLoader({
     }
     scheduleAgentManifestRefresh();
 
+    if (typeof runtimeState.refreshImmersionView === 'function') {
+        void runtimeState.refreshImmersionView().catch(() => {});
+    }
     if (typeof globalThis._rpgSyncAgentImmersionUi === 'function') {
         globalThis._rpgSyncAgentImmersionUi();
     }
@@ -273,7 +335,7 @@ export function createChatStateLoader({
 
     // Patch any managed entries that don't yet have disable:true so ST's
     // native keyword scanner cannot inject them on user-message send.
-    if (s.routerEnabled) {
+    if (isLorebookAgentRuntimeActive(s)) {
         scheduleDeferred(() => {
             disableManagedEntries().catch(e => console.warn('[RPG Tracker] disableManagedEntries on chat change failed:', e));
         });

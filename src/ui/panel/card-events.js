@@ -1,14 +1,30 @@
 import { getRuntimeActions, sectionPages } from '../../app/runtime-bridge.js';
+import { runtimeState } from '../../app/runtime-state.js';
 import { pickGenreCharacterName } from '../../state/character-names.js';
+import { getActiveChatId } from '../../state/chat-persistence.js';
+import { createChatCommitGuard } from '../../state/pass-affinity.js';
+import { setLocationMappingEnabled, LOCATION_MAPPING_SECTION_TAG } from '../../state/section-enabled.js';
+import { applyMapArchitectOpenerToUi, normalizeMapArchitectOpener, syncMapArchitectOpenerNestedVisibility } from '../../../map-architect-opener.js';
 
 export function bindRenderedCardEvents(el, memo, isDetachedContext = false, onRefresh = null) {
     const runtime = getRuntimeActions();
-    const { applyPortraitData, autoApplySysprompt, bindQuickStartEvents, blockToItems, buildCombatAndSkillScalingHint, buildNpcInstruction, buildOnboardingActiveBlocks, buildOnboardingTimeHint, buildOnboardingXpHint, buildStartingGearHint, createDetachedPanel, extractCharNameFromMemo, fileToDataUrl, generatePersonaBio, getPageSize, getSettings, handleCategorySettings, handleCharacterCreatorGenerate, handleRecolor, loadBenchedExpanded, loadCollapsed, loadDetached, maybeCreateOnboardingPersona, parseMemoBlocks, refreshAgentManifest, refreshNpcManifest, refreshRenderedView, registerDiceFunctionTool, removeArchivedQuest, resolveActivePersonaDescription, saveActiveTab, saveBenchedExpanded, saveCollapsed, saveDetached, saveSettings, scaleImageTo512Square, scheduleAutoApply, sendDirectPrompt, setInitialDateValue, setUse24hTime, setUseDdMmYyFormat, showCharacterRollPanel, showLorebookAgentDocumentation, showNarrativePacingExplanation, showPcImportPanel, showPersonaConfirmOverlay, showPortraitSettingsMenu, showQuestsHardcoreExplanation, showRngExplanation, showSettingsHelpPopup, syncOnboardingPersonaPrefsFromDom, syncOnboardingUI } = runtime;
+    const { applyPortraitData, autoApplySysprompt, bindCharacterCreationConnectionSettings, bindQuickStartEvents, blockToItems, buildCombatAndSkillScalingHint, buildNpcInstruction, buildOnboardingActiveBlocks, buildOnboardingTimeHint, buildOnboardingXpHint, buildStartingGearHint, createDetachedPanel, createOrSelectGameMasterCard, extractCharNameFromMemo, fileToDataUrl, generatePersonaBio, getCharacterCreationConnectionSettings, getPageSize, getSettings, handleCategorySettings, handleCharacterCreatorGenerate, handleRecolor, loadBenchedExpanded, loadCollapsed, loadDetached, loadPartyCompact, maybeCreateOnboardingPersona, openAdventureCompanion, openConnectionsModelsSettings, parseMemoBlocks, refreshAgentManifest, refreshNpcManifest, refreshRenderedView, registerDiceFunctionTool, removeArchivedQuest, resolveActivePersonaDescription, saveActiveTab, saveBenchedExpanded, saveCollapsed, saveDetached, savePartyCompact, saveSettings, scaleImageTo512Square, scheduleAutoApply, sendDirectPrompt, setInitialDateValue, setInitialTimeValue, setUse24hTime, setUseDdMmYyFormat, showCharacterRollPanel, showLorebookAgentDocumentation, showNarrativePacingExplanation, showPcImportPanel, showPersonaConfirmOverlay, showPortraitSettingsMenu, showQuestsHardcoreExplanation, showRngExplanation, showSettingsHelpPopup, syncOnboardingPersonaPrefsFromDom, syncOnboardingUI } = runtime;
     const _sectionPages = sectionPages;
 
     const refresh = onRefresh || refreshRenderedView;
 
     bindQuickStartEvents(el);
+    bindCharacterCreationConnectionSettings(el);
+
+    const characterConnectionShortcut = el.querySelector('#rt-open-character-creation-connection-settings');
+    if (characterConnectionShortcut && !characterConnectionShortcut._bound) {
+        characterConnectionShortcut._bound = true;
+        characterConnectionShortcut.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            openConnectionsModelsSettings('character_creation');
+        });
+    }
 
     const otherWaysDrawer = el.querySelector('.rt-onboarding-other-drawer');
     const narratorDrawer = el.querySelector('.rt-onboarding-narrator-drawer');
@@ -24,6 +40,33 @@ export function bindRenderedCardEvents(el, memo, isDetachedContext = false, onRe
             onboardingDrawerToggle.setAttribute('aria-expanded', isOpen ? 'true' : 'false');
         });
     });
+
+    const openChatBtn = el.querySelector('#rt-onboarding-open-chat');
+    if (openChatBtn && !openChatBtn._bound) {
+        openChatBtn._bound = true;
+        openChatBtn.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            openAdventureCompanion();
+        });
+    }
+
+    const createGmBtn = el.querySelector('#rt-onboarding-create-gm');
+    if (createGmBtn && !createGmBtn._bound) {
+        createGmBtn._bound = true;
+        createGmBtn.addEventListener('click', async (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            const nameInput = /** @type {HTMLInputElement|null} */ (el.querySelector('#rt-onboarding-gm-name'));
+            const name = nameInput?.value;
+            createGmBtn.disabled = true;
+            try {
+                await createOrSelectGameMasterCard({ name });
+            } finally {
+                createGmBtn.disabled = false;
+            }
+        });
+    }
 
     // The onboarding panel is rendered dynamically, after the static settings
     // controls have been bound. Route its CYOA cog through the popup hook instead.
@@ -92,14 +135,33 @@ export function bindRenderedCardEvents(el, memo, isDetachedContext = false, onRe
         setNameRequiredButtonsEnabled(!!selectedOnboardingName);
     });
 
-    // Starting Level change & persistent preference save
-    const levelSelect = el.querySelector('#rt-starting-level');
-    if (levelSelect) {
-        levelSelect.addEventListener('change', () => {
-            getSettings().onboardingLevel = parseInt(levelSelect.value) || 1;
+    // Starting Level change & persistent preference save (including "none").
+    const bindLevelSelect = (selectEl) => {
+        if (!selectEl || selectEl._levelBound) return;
+        selectEl._levelBound = true;
+        selectEl.addEventListener('change', () => {
+            getSettings().onboardingLevel = selectEl.value === 'none'
+                ? 'none'
+                : (parseInt(selectEl.value, 10) || 1);
             saveSettings();
+            syncOnboardingUI();
         });
-    }
+    };
+    bindLevelSelect(el.querySelector('#rt-starting-level'));
+    bindLevelSelect(el.querySelector('#rt-cr-level'));
+
+    // Combat & Skill Scaling Guide toggle (shared across onboarding + Character Creator)
+    const bindCombatGuideCb = (cb) => {
+        if (!cb || cb._bound) return;
+        cb._bound = true;
+        cb.addEventListener('change', () => {
+            getSettings().onboardingUseCombatScalingGuide = !!cb.checked;
+            saveSettings();
+            syncOnboardingUI();
+        });
+    };
+    bindCombatGuideCb(/** @type {HTMLInputElement|null} */ (el.querySelector('#rt-onboarding-combat-guide-cb')));
+    bindCombatGuideCb(/** @type {HTMLInputElement|null} */ (el.querySelector('#rt-cr-combat-guide-cb')));
 
     const bindGearTierSelect = (selectEl) => {
         if (!selectEl || selectEl._gearTierBound) return;
@@ -183,6 +245,14 @@ export function bindRenderedCardEvents(el, memo, isDetachedContext = false, onRe
     const drawerStartDateInput = /** @type {HTMLInputElement|null} */ (el.querySelector('#rt-onboarding-start-date'));
     if (drawerStartDateInput) syncStartDateInput(drawerStartDateInput);
 
+    const syncStartTimeInput = (input) => {
+        input.addEventListener('input', () => setInitialTimeValue(input.value.trim(), input));
+    };
+    const crStartTimeInput = /** @type {HTMLInputElement|null} */ (el.querySelector('#rt-cr-start-time'));
+    if (crStartTimeInput) syncStartTimeInput(crStartTimeInput);
+    const drawerStartTimeInput = /** @type {HTMLInputElement|null} */ (el.querySelector('#rt-onboarding-start-time'));
+    if (drawerStartTimeInput) syncStartTimeInput(drawerStartTimeInput);
+
 
     // Character Creator / onboarding ? help icons — tap opens popup (hover title still works on desktop)
     if (!el._crHelpDelegated) {
@@ -229,10 +299,14 @@ export function bindRenderedCardEvents(el, memo, isDetachedContext = false, onRe
 
     el.querySelectorAll('.rt-random-char-btn').forEach(btn => {
         btn.addEventListener('click', async () => {
+            const passChatId = getActiveChatId();
+            const ownsChat = createChatCommitGuard(passChatId, getActiveChatId);
             const archetype = btn.dataset.archetype;
             const levelSelectEl = el.querySelector('#rt-starting-level');
-            const level = parseInt(String(levelSelectEl?.value ?? getSettings().onboardingLevel ?? 1), 10) || 1;
-            getSettings().onboardingLevel = level;
+            const levelRawVal = String(levelSelectEl?.value ?? getSettings().onboardingLevel ?? 1);
+            const noLevel = levelRawVal === 'none';
+            const level = noLevel ? null : (parseInt(levelRawVal, 10) || 1);
+            getSettings().onboardingLevel = noLevel ? 'none' : level;
             const gearTierEl = /** @type {HTMLSelectElement|null} */ (el.querySelector('#rt-onboarding-gear-tier'));
             const gearTier = gearTierEl?.value || getSettings().onboardingGearTier || 'auto';
             getSettings().onboardingGearTier = gearTier;
@@ -273,14 +347,21 @@ export function bindRenderedCardEvents(el, memo, isDetachedContext = false, onRe
             const _hasAbilities = !!_mods['abilities'];
             const _hasSpells    = !!_mods['spells'];
 
-            const levelPrefix = _hasXp
-                ? `STARTING LEVEL: ${level} (mandatory — the character MUST be exactly Level ${level}).`
-                : `STARTING LEVEL: ${level} (mandatory — the character MUST be exactly Level ${level}; scale/adjust HP, stats, saves, capabilities, and gear (everything a character of that level might have) to Level ${level} accordingly, but do NOT output an [XP] block as it is disabled).`;
+            const levelPrefix = noLevel
+                ? `LEVEL SYSTEM: This character creation system does not use numeric character levels. Do NOT invent, assign, or output a level number, an [XP] block, or any D&D-style level indicator — balance the character using the setting's own internal logic instead.`
+                : _hasXp
+                    ? `STARTING LEVEL: ${level} (mandatory — the character MUST be exactly Level ${level}).`
+                    : `STARTING LEVEL: ${level} (mandatory — the character MUST be exactly Level ${level}; scale/adjust HP, stats, saves, capabilities, and gear (everything a character of that level might have) to Level ${level} accordingly, but do NOT output an [XP] block as it is disabled).`;
 
-            const xpHint = _hasXp ? buildOnboardingXpHint(level) : '';
-            const TIME_FORMAT_HINT = _hasTime ? buildOnboardingTimeHint(startDateVal) : '';
-            const magicGearHint = buildStartingGearHint(level, getSettings().onboardingGenre || 'fantasy', _hasInventory, gearTier);
-            const combatSkillHint = buildCombatAndSkillScalingHint();
+            const xpHint = (_hasXp && !noLevel) ? buildOnboardingXpHint(level) : '';
+            const TIME_FORMAT_HINT = _hasTime ? buildOnboardingTimeHint(startDateVal, getSettings().initialTime || '08:00 AM') : '';
+            const magicGearHint = buildStartingGearHint(noLevel ? 1 : level, getSettings().onboardingGenre || 'fantasy', _hasInventory, gearTier);
+            const combatSkillHint = getSettings().onboardingUseCombatScalingGuide !== false ? buildCombatAndSkillScalingHint() : '';
+            // Fixed quick-roll archetype templates (magic/melee/rogue/etc.) below hardcode
+            // "Level N" in their own copy — substitute a neutral filler level for them when
+            // "no levels" was chosen so they don't render "Level null". Custom and Persona
+            // (the freeform, user-directed paths) fully honor noLevel further below instead.
+            const templateLevel = noLevel ? 1 : level;
 
             const _activeBlocks = buildOnboardingActiveBlocks(getSettings());
             const _blockListStr  = _activeBlocks.join(', ');
@@ -304,25 +385,12 @@ export function bindRenderedCardEvents(el, memo, isDetachedContext = false, onRe
                 char_roll: '🎲 Rolling...'
             };
 
-            const CHARACTER_FORMAT_HINT = `\n\nCRITICAL TAG WRAPPING RULE: Every block you output MUST be enclosed in matching opening and closing tags. You must output the closing tag for every block (${_closingTags}).\nCRITICAL PARTY RULE: Do NOT output a [PARTY] block under any circumstances unless explicitly instructed.\nCRITICAL QUESTS RULE: Do NOT add quests or output a [QUESTS] block under any circumstances unless explicitly instructed.
-
-Use this exact style:
-[CHARACTER]
-Barnaby "Salt-Eye" Finch (Pirate): 36/36 HP
-Combat: BAB: +4 | Ranged (1 attack): +6 | Melee (1 attack): +5
-Gear: Cutlass (1d6+2 Slashing) [E], AC: 14 (Leather Jerkin)
-Attr: STR 14 (+2), DEX 15 (+2), CON 14 (+2), INT 12 (+1), WIS 10 (+0), CHA 14 (+2)
-Saves: Fort +6 | Ref +6 | Will +1
-[/CHARACTER]${_hasInventory ? `
-
-[INVENTORY]
-Gear:
-- 🗡️ [Common] [E] Cutlass (1d6+2 Slashing)
-[/INVENTORY]` : ''}${_hasAbilities ? `
-
-[ABILITIES]
-- Dirty Fighting
-[/ABILITIES]` : ''}`;
+            // CRITICAL: Do NOT hardcode an example [CHARACTER] stat block here. The real,
+            // possibly user-customized field format for every active module (including
+            // [CHARACTER]) is already present in the system prompt via buildModulesInstructionText().
+            // A hardcoded example would compete with — and can override — that real format
+            // (e.g. forcing BAB/Attr/Saves onto a homebrew system that doesn't use them).
+            const CHARACTER_FORMAT_HINT = `\n\nCRITICAL TAG WRAPPING RULE: Every block you output MUST be enclosed in matching opening and closing tags. You must output the closing tag for every block (${_closingTags}).\nCRITICAL PARTY RULE: Do NOT output a [PARTY] block under any circumstances unless explicitly instructed.\nCRITICAL QUESTS RULE: Do NOT add quests or output a [QUESTS] block under any circumstances unless explicitly instructed.\nCRITICAL FORMAT RULE: Follow the exact [CHARACTER]${_hasInventory ? '/[INVENTORY]' : ''}${_hasAbilities ? '/[ABILITIES]' : ''} field format, structure, and terminology defined in the module instructions provided in this system prompt — do not invent, omit, rename, or substitute fields, and do not fall back to a generic D&D template if the defined format differs from one.`;
 
 
             const REALISTIC_HINT = `\n\nCRITICAL REALISM RULE: This is a realistic/non-fantasy setting.
@@ -346,18 +414,18 @@ Gear:
 - Firearms (if any): when writing new gear/NPC/loot stats (not mid-scene conversion), damage ~2–3× D&D/PF firearm tables; common sense by type/caliber. Attack bonuses normal — only damage scales.`;
 
             const prompts = {
-                magic:            `${levelPrefix} Generate a random Level ${level} D&D Magic User (Wizard, Sorcerer, or Warlock). Give them a random fantasy name (do NOT use {{user}}). Output ${_blockListStr} blocks${_hasSpells ? " (using 'Cantrips:' for level 0 spells)" : ''}. Include appropriate${_hasSpells ? ' spells,' : ''} items, and attributes consistent with Level ${level}.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${magicGearHint}`,
-                melee:            `${levelPrefix} Generate a random Level ${level} D&D Melee Fighter (Fighter, Barbarian, or Paladin). Give them a random fantasy name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on high physical attributes, heavy armor, and signature weapons consistent with Level ${level}.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${magicGearHint}`,
-                rogue:            `${levelPrefix} Generate a random Level ${level} D&D Rogue or Thief-style character. Give them a random fantasy name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on high Dexterity, stealth-related equipment, and class features consistent with Level ${level}.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${magicGearHint}`,
-                professional:     `${levelPrefix} Generate a random Level ${level} modern professional/specialist character. Give them a realistic name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on specialized professional skills, modern gear, and attributes consistent with a Level ${level} specialist.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${REALISTIC_HINT}`,
-                survivor:         `${levelPrefix} Generate a random Level ${level} survivor character. Give them a realistic name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on physical resilience, survival/scavenged gear, and attributes consistent with a Level ${level} survivor.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${REALISTIC_HINT}`,
-                scholar:          `${levelPrefix} Generate a random Level ${level} intellectual/scholar character. Give them a realistic name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on intelligence, knowledge-based traits, research tools/gear, and attributes consistent with an intellectual Level ${level} scholar.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${REALISTIC_HINT}`,
-                scifi_pilot:      `${levelPrefix} Generate a random Level ${level} sci-fi pilot/ace character. Give them a realistic or sci-fi-style name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on piloting skills, a signature ship/vehicle callsign, and sidearm/survival gear consistent with Level ${level}.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${SCIFI_HINT}`,
-                scifi_engineer:   `${levelPrefix} Generate a random Level ${level} sci-fi engineer/technician character. Give them a realistic or sci-fi-style name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on technical skills, tools/gadgets, and gear consistent with a Level ${level} engineer.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${SCIFI_HINT}`,
-                scifi_marine:     `${levelPrefix} Generate a random Level ${level} sci-fi combat marine/soldier character. Give them a realistic or sci-fi-style name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on combat training, powered armor or tactical gear, and weaponry consistent with a Level ${level} marine.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${SCIFI_HINT}`,
-                horror_investigator: `${levelPrefix} Generate a random Level ${level} horror investigator character. Give them a realistic name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on investigative skills, mundane gear, and a fraying grip on sanity consistent with Level ${level}.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${HORROR_HINT}`,
-                horror_occultist: `${levelPrefix} Generate a random Level ${level} occultist character with forbidden knowledge. Give them a realistic name (do NOT use {{user}}). Output ${_blockListStr} blocks.${_hasAbilities ? ' Represent any ritual or occult knowledge as entries in [ABILITIES] rather than spells,' : ''} consistent with Level ${level}.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${HORROR_HINT}`,
-                horror_survivor:  `${levelPrefix} Generate a random Level ${level} horror survivor character. Give them a realistic name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on resourcefulness, improvised weapons/tools, and fragile but resilient stats consistent with Level ${level}.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${HORROR_HINT}`
+                magic:            `${levelPrefix} Generate a random Level ${templateLevel} D&D Magic User (Wizard, Sorcerer, or Warlock). Give them a random fantasy name (do NOT use {{user}}). Output ${_blockListStr} blocks${_hasSpells ? " (using 'Cantrips:' for level 0 spells)" : ''}. Include appropriate${_hasSpells ? ' spells,' : ''} items, and attributes consistent with Level ${templateLevel}.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${magicGearHint}`,
+                melee:            `${levelPrefix} Generate a random Level ${templateLevel} D&D Melee Fighter (Fighter, Barbarian, or Paladin). Give them a random fantasy name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on high physical attributes, heavy armor, and signature weapons consistent with Level ${templateLevel}.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${magicGearHint}`,
+                rogue:            `${levelPrefix} Generate a random Level ${templateLevel} D&D Rogue or Thief-style character. Give them a random fantasy name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on high Dexterity, stealth-related equipment, and class features consistent with Level ${templateLevel}.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${magicGearHint}`,
+                professional:     `${levelPrefix} Generate a random Level ${templateLevel} modern professional/specialist character. Give them a realistic name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on specialized professional skills, modern gear, and attributes consistent with a Level ${templateLevel} specialist.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${REALISTIC_HINT}`,
+                survivor:         `${levelPrefix} Generate a random Level ${templateLevel} survivor character. Give them a realistic name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on physical resilience, survival/scavenged gear, and attributes consistent with a Level ${templateLevel} survivor.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${REALISTIC_HINT}`,
+                scholar:          `${levelPrefix} Generate a random Level ${templateLevel} intellectual/scholar character. Give them a realistic name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on intelligence, knowledge-based traits, research tools/gear, and attributes consistent with an intellectual Level ${templateLevel} scholar.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${REALISTIC_HINT}`,
+                scifi_pilot:      `${levelPrefix} Generate a random Level ${templateLevel} sci-fi pilot/ace character. Give them a realistic or sci-fi-style name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on piloting skills, a signature ship/vehicle callsign, and sidearm/survival gear consistent with Level ${templateLevel}.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${SCIFI_HINT}`,
+                scifi_engineer:   `${levelPrefix} Generate a random Level ${templateLevel} sci-fi engineer/technician character. Give them a realistic or sci-fi-style name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on technical skills, tools/gadgets, and gear consistent with a Level ${templateLevel} engineer.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${SCIFI_HINT}`,
+                scifi_marine:     `${levelPrefix} Generate a random Level ${templateLevel} sci-fi combat marine/soldier character. Give them a realistic or sci-fi-style name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on combat training, powered armor or tactical gear, and weaponry consistent with a Level ${templateLevel} marine.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${SCIFI_HINT}`,
+                horror_investigator: `${levelPrefix} Generate a random Level ${templateLevel} horror investigator character. Give them a realistic name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on investigative skills, mundane gear, and a fraying grip on sanity consistent with Level ${templateLevel}.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${HORROR_HINT}`,
+                horror_occultist: `${levelPrefix} Generate a random Level ${templateLevel} occultist character with forbidden knowledge. Give them a realistic name (do NOT use {{user}}). Output ${_blockListStr} blocks.${_hasAbilities ? ' Represent any ritual or occult knowledge as entries in [ABILITIES] rather than spells,' : ''} consistent with Level ${templateLevel}.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${HORROR_HINT}`,
+                horror_survivor:  `${levelPrefix} Generate a random Level ${templateLevel} horror survivor character. Give them a realistic name (do NOT use {{user}}). Output ${_blockListStr} blocks. Focus on resourcefulness, improvised weapons/tools, and fragile but resilient stats consistent with Level ${templateLevel}.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${HORROR_HINT}`
             };
 
             // ── Custom archetype: freeform character based entirely on custom instructions ──
@@ -368,15 +436,27 @@ Gear:
                 }
                 el.querySelectorAll('.rt-random-char-btn').forEach(b => b.disabled = true);
                 btn.textContent = labels.custom;
-                let customPrompt = `${levelPrefix} Generate a random Level ${level} character based entirely on these custom instructions: "${customInstructions}".${selectedNameInstruction} Output ${_blockListStr} blocks${_hasSpells ? " (and [SPELLS] if appropriate for the class, using 'Cantrips:' for level 0 spells)" : ''}. Adapt all attributes, skills, saves, descriptions, and gear to match the setting and instructions perfectly.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${magicGearHint}`;
+                let customPrompt = noLevel
+                    ? `${levelPrefix} Generate a character based entirely on these custom instructions: "${customInstructions}".${selectedNameInstruction} Output ${_blockListStr} blocks${_hasSpells ? " (and [SPELLS] if appropriate for the class, using 'Cantrips:' for level 0 spells)" : ''}. Adapt all attributes, skills, saves, descriptions, and gear to match the setting and instructions perfectly — do not invent a numeric level.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${magicGearHint}`
+                    : `${levelPrefix} Generate a random Level ${level} character based entirely on these custom instructions: "${customInstructions}".${selectedNameInstruction} Output ${_blockListStr} blocks${_hasSpells ? " (and [SPELLS] if appropriate for the class, using 'Cantrips:' for level 0 spells)" : ''}. Adapt all attributes, skills, saves, descriptions, and gear to match the setting and instructions perfectly.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${magicGearHint}`;
                 if (isCalendar) {
                     customPrompt += `\n\nCRITICAL REALISM RULE: This is a realistic/non-fantasy setting. Do NOT output a [SPELLS] block. Use realistic modern/historical currencies instead of GP/SP/CP. Firearms on new gear/NPCs/loot: damage ~2–3× D&D/PF norms by common sense; attack bonuses unchanged (not mid-scene conversion).`;
                 }
                 try {
                     syncOnboardingPersonaPrefsFromDom(el);
-                    await sendDirectPrompt(customPrompt + combatSkillHint, { systemPromptMode: 'modules_only' });
+                    const result = await sendDirectPrompt(customPrompt + combatSkillHint, {
+                        systemPromptMode: 'modules_only',
+                        connectionSettings: getCharacterCreationConnectionSettings(getSettings()),
+                    });
+                    if (!result?.success) {
+                        if (result?.status !== 'busy') {
+                            toastr['warning'](result?.message || 'Character generation did not complete.', 'RPG Tracker');
+                        }
+                        return;
+                    }
                     const personaHints = `\n\n--- PLAYER PREFERENCES & HINTS ---\nAdditional: ${customInstructions}\n`;
-                    await maybeCreateOnboardingPersona(personaHints);
+                    if (!ownsChat()) return;
+                    await maybeCreateOnboardingPersona(personaHints, { chatId: passChatId, canCommit: ownsChat });
                 } finally {
                     el.querySelectorAll('.rt-random-char-btn').forEach(b => b.disabled = false);
                     btn.textContent = '⚙️ Custom';
@@ -387,6 +467,7 @@ Gear:
             // ── Persona archetype: derive character from the active SillyTavern persona ──
             if (archetype === 'persona') {
                 const persona = await resolveActivePersonaDescription();
+                if (!ownsChat()) return;
                 if (!persona) {
                     toastr['warning'](
                         'No persona is set. Set a persona in SillyTavern (User Settings → Personas) and try again.',
@@ -400,17 +481,34 @@ Gear:
                 const nameClause = personaName
                     ? ` The character's name MUST be "${personaName}" (the active persona name).`
                     : '';
-                let personaPrompt = `${levelPrefix} Using the following persona description as the basis for the player character, create a Level ${level} character that faithfully embodies this persona.${nameClause} Translate the personality, background, and traits into appropriate stats, class, race, and equipment. Output ${_blockListStr} blocks${_hasSpells ? " (and [SPELLS] if the class is a spellcaster, using 'Cantrips:' for level 0 spells)" : ''}. All attributes and gear should be consistent with Level ${level}.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${magicGearHint}\n\nPersona${personaName ? ` — ${personaName}` : ''}:\n${resolvedPersona}`;
+                let personaPrompt = noLevel
+                    ? `${levelPrefix} Using the following persona description as the basis for the player character, create a character that faithfully embodies this persona.${nameClause} Translate the personality, background, and traits into appropriate stats, class, race, and equipment. Output ${_blockListStr} blocks${_hasSpells ? " (and [SPELLS] if the class is a spellcaster, using 'Cantrips:' for level 0 spells)" : ''}. Do not invent a numeric level — balance using the setting's own logic.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${magicGearHint}\n\nPersona${personaName ? ` — ${personaName}` : ''}:\n${resolvedPersona}`
+                    : `${levelPrefix} Using the following persona description as the basis for the player character, create a Level ${level} character that faithfully embodies this persona.${nameClause} Translate the personality, background, and traits into appropriate stats, class, race, and equipment. Output ${_blockListStr} blocks${_hasSpells ? " (and [SPELLS] if the class is a spellcaster, using 'Cantrips:' for level 0 spells)" : ''}. All attributes and gear should be consistent with Level ${level}.${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${magicGearHint}\n\nPersona${personaName ? ` — ${personaName}` : ''}:\n${resolvedPersona}`;
                 if (customInstructions) {
                     personaPrompt += `\n\nAdditional setting/instruction constraints: ${customInstructions}. Adapt the name, attributes, description, gear, and spells (if any) to match this setting/instruction perfectly.`;
                 }
-                syncOnboardingPersonaPrefsFromDom(el);
-                await sendDirectPrompt(personaPrompt + combatSkillHint, { systemPromptMode: 'modules_only' });
-                const personaHints = `\n\n--- PLAYER PREFERENCES & HINTS ---\nSource: the previously active SillyTavern persona.${customInstructions ? `\nAdditional: ${customInstructions}` : ''}\n`;
-                await maybeCreateOnboardingPersona(personaHints, {
-                    preserveActivePersona: true,
-                    preferredName: personaName,
-                });
+                try {
+                    syncOnboardingPersonaPrefsFromDom(el);
+                    const result = await sendDirectPrompt(personaPrompt + combatSkillHint, {
+                        systemPromptMode: 'modules_only',
+                        connectionSettings: getCharacterCreationConnectionSettings(getSettings()),
+                    });
+                    if (!result?.success) {
+                        if (result?.status !== 'busy') {
+                            toastr['warning'](result?.message || 'Character generation did not complete.', 'RPG Tracker');
+                        }
+                        return;
+                    }
+                    const personaHints = `\n\n--- PLAYER PREFERENCES & HINTS ---\nSource: the previously active SillyTavern persona.${customInstructions ? `\nAdditional: ${customInstructions}` : ''}\n`;
+                    await maybeCreateOnboardingPersona(personaHints, {
+                        chatId: passChatId, canCommit: ownsChat,
+                        preserveActivePersona: true,
+                        preferredName: personaName,
+                    });
+                } finally {
+                    el.querySelectorAll('.rt-random-char-btn').forEach(b => b.disabled = false);
+                    btn.textContent = '🎭 Persona';
+                }
                 return;
             }
 
@@ -422,11 +520,21 @@ Gear:
             }
             try {
                 syncOnboardingPersonaPrefsFromDom(el);
-                await sendDirectPrompt(promptText + combatSkillHint, { systemPromptMode: 'modules_only' });
+                const result = await sendDirectPrompt(promptText + combatSkillHint, {
+                    systemPromptMode: 'modules_only',
+                    connectionSettings: getCharacterCreationConnectionSettings(getSettings()),
+                });
+                if (!result?.success) {
+                    if (result?.status !== 'busy') {
+                        toastr['warning'](result?.message || 'Character generation did not complete.', 'RPG Tracker');
+                    }
+                    return;
+                }
                 const personaHints = customInstructions
                     ? `\n\n--- PLAYER PREFERENCES & HINTS ---\nAdditional: ${customInstructions}\n`
                     : '';
-                await maybeCreateOnboardingPersona(personaHints);
+                if (!ownsChat()) return;
+                await maybeCreateOnboardingPersona(personaHints, { chatId: passChatId, canCommit: ownsChat });
             } finally {
                 el.querySelectorAll('.rt-random-char-btn').forEach(b => b.disabled = false);
             }
@@ -600,17 +708,31 @@ Gear:
     const syncOptionalMod = (onboardingId, settingKey) => {
         const cb = el.querySelector(onboardingId);
         if (cb) {
-            cb.checked = !!s.syspromptModules?.[settingKey];
+            cb.checked = settingKey === 'CYOA_mode'
+                ? s.syspromptModules?.CYOA_mode === true
+                : (s.syspromptModules?.[settingKey] ?? true);
             cb.addEventListener('change', () => {
                 syncSettingsAndUI(settings => {
-                    if (!settings.syspromptModules) settings.syspromptModules = {};
-                    settings.syspromptModules[settingKey] = !!cb.checked;
+                    if (settingKey === LOCATION_MAPPING_SECTION_TAG) {
+                        setLocationMappingEnabled(!!cb.checked, settings);
+                    } else {
+                        if (!settings.syspromptModules) settings.syspromptModules = {};
+                        settings.syspromptModules[settingKey] = !!cb.checked;
+                    }
                     if (settingKey === 'party_bench') {
                         if (!settings.modules) settings.modules = {};
                         settings.modules['benched party'] = !!cb.checked;
                         if (cb.checked) settings.modules.party = true;
                     }
                 });
+                if (settingKey === LOCATION_MAPPING_SECTION_TAG) {
+                    // Keep the optional Components toggle authoritative for
+                    // the live Scene View and any detached map window.
+                    syncMapArchitectOpenerNestedVisibility(!!cb.checked);
+                    runtimeState.hasActiveDungeonMap = false;
+                    globalThis._rpgSyncAgentImmersionUi?.();
+                    void globalThis._rpgRefreshImmersionView?.();
+                }
             });
         }
     };
@@ -618,7 +740,19 @@ Gear:
     syncOptionalMod('#rt_onboarding_mod_random_events', 'random_events');
     syncOptionalMod('#rt_onboarding_mod_resting', 'resting');
     syncOptionalMod('#rt_onboarding_mod_party_bench', 'party_bench');
+    syncOptionalMod('#rt_onboarding_mod_dungeon_reality_and_hidden_mapping', 'dungeon_reality_and_hidden_mapping');
     syncOptionalMod('#rt_onboarding_mod_cyoa_mode', 'CYOA_mode');
+    applyMapArchitectOpenerToUi(s.mapArchitectOpener);
+    syncMapArchitectOpenerNestedVisibility(s.syspromptModules?.[LOCATION_MAPPING_SECTION_TAG] ?? true);
+    el.querySelectorAll('input[name="rt_onboarding_map_architect_opener"]').forEach((input) => {
+        input.addEventListener('change', () => {
+            if (!input.checked) return;
+            syncSettingsAndUI(settings => {
+                settings.mapArchitectOpener = normalizeMapArchitectOpener(input.value);
+            });
+            applyMapArchitectOpenerToUi(input.value);
+        });
+    });
 
     // Onboarding Relationship System Sync
     const onboardingRelBarsCb = el.querySelector('#rt_onboarding_mod_npc_rel_bars');
@@ -628,7 +762,7 @@ Gear:
             syncSettingsAndUI(settings => {
                 settings.npcRelationshipBars = !!onboardingRelBarsCb.checked;
                 if (settings.routerModules?.npc) {
-                    settings.routerModules.npc.instruction = buildNpcInstruction(settings.npcMajorWords, settings.npcMinorWords, false);
+                    settings.routerModules.npc.instruction = buildNpcInstruction(settings.npcMajorWords, settings.npcMinorWords, false, settings);
                 }
             });
             setTimeout(() => {
@@ -714,6 +848,15 @@ Gear:
         });
     });
 
+    el.querySelectorAll('.rt-party-compact-btn').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            e.preventDefault();
+            savePartyCompact(!loadPartyCompact());
+            refresh();
+        });
+    });
+
     el.querySelectorAll('.rt-char-to-persona-btn').forEach(btn => {
         btn.addEventListener('click', async (e) => {
             e.stopPropagation();
@@ -730,14 +873,18 @@ Gear:
                 ? s.onboardingPersonaWordsCustom
                 : (s.onboardingPersonaWords || '150');
             const wordCount = parseInt(String(wordsRaw || '150'), 10) || 150;
-            const personaOpts = { chatLookback: 3, preferCharacterBlock: true };
+            const passChatId = getActiveChatId();
+            const ownsChat = createChatCommitGuard(passChatId, getActiveChatId);
+            const personaOpts = { chatLookback: 3, preferCharacterBlock: true, chatId: passChatId, canCommit: ownsChat };
             const extraHints = '\n\nSource: existing [CHARACTER] sheet. Match its stats, class, gear, and traits. Use the last 3 story messages only for voice, relationships, and current situation.';
-            const prev = btn.textContent;
+            const prev = btn.dataset.idleLabel || btn.textContent.trim() || 'Create PC Card';
+            btn.dataset.idleLabel = prev;
             btn.disabled = true;
-            btn.textContent = '⏳';
+            btn.textContent = 'Creating…';
             try {
                 toastr['info'](`Generating Lorebook Agent persona for "${charName}"…`, 'RPG Tracker');
                 const bio = await generatePersonaBio(charName, wordCount, extraHints, personaOpts);
+                if (!ownsChat()) return;
                 if (bio) {
                     showPersonaConfirmOverlay(bio, charName, wordCount, extraHints, personaOpts);
                 } else {
@@ -745,7 +892,7 @@ Gear:
                 }
             } finally {
                 btn.disabled = false;
-                btn.textContent = prev || '👤';
+                btn.textContent = prev;
             }
         });
     });
@@ -886,8 +1033,9 @@ Gear:
         const entityName = container.closest('.rt-entity-container')?.dataset?.entityName || '';
         if (!entityName) return;
 
+        const passChatId = getActiveChatId();
         const localApply = async (src) => {
-            await applyPortraitData(entityName, src);
+            await applyPortraitData(entityName, src, { chatId: passChatId });
             refresh();
             void refreshNpcManifest().catch(() => { });
         };

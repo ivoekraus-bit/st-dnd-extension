@@ -12,13 +12,142 @@
  * circular import. This will be cleaned up when index.js is split.
  */
 
-import { getSettings, hydrateWorldProgressionFromChatState, persistWorldProgressionTimer, persistRouterLastRunWatermark, getNpcRelationshipMax, clampRelationshipValue, relationshipBarPct, getFriendshipTier, getAffectionTier, applyRelTierBadgeElement, showRelationshipFloatFeedback, saveChatState, getActiveChatId, getRelationshipUpdateMode, RELATIONSHIP_UPDATE_MODES, shouldProcessRegexRelationshipUpdates } from './state-manager.js';
+import { getSettings, hydrateWorldProgressionFromChatState, persistWorldProgressionTimer, persistRouterLastRunWatermark, persistMapUpdaterLastRunTimestamp, persistMapUpdaterLastRunWatermark, persistMapUpdaterState, getNpcRelationshipMax, clampRelationshipValue, relationshipBarPct, getFriendshipTier, getAffectionTier, applyRelTierBadgeElement, showRelationshipFloatFeedback, saveChatState, getActiveChatId, getRelationshipUpdateMode, RELATIONSHIP_UPDATE_MODES, shouldProcessRegexRelationshipUpdates, stripCoreMarkersForNarrator } from './state-manager.js';
 import { syncCombatProfile, isCombatActive } from './llm-client.js';
-import { parseQuestsFromMemo, extractCurrentTimeStr, cleanMessageContent, formatInWorldTime, memoForGmContext } from './memo-processor.js';
-import { runRouterPass, saveSceneToLorebook, scanAssistantOutputForKeywords, parseInWorldMinutes, runWorldProgressionPass, updateLorebookEntry, getLorebookManifest, rollbackRouterPass, isRouterRunning } from './router.js';
+import { parseQuestsFromMemo, extractCurrentTimeStr, cleanMessageContent, formatInWorldTime, memoForGmContext, stripPromptInjectionsFromUserText, stripCyoaAndPacingInjections, mergeMemo, applyQuestSyncAndStripMemo, computeDelta } from './memo-processor.js';
+import { parseMemoBlocks } from './renderer.js';
+import { runRouterPass, saveSceneToLorebook, scanAssistantOutputForKeywords, parseInWorldMinutes, runWorldProgressionPass, updateLorebookEntry, getLorebookManifest, rollbackRouterPass, isRouterRunning, syncDungeonMapsToLocationLorebook, captureActiveDungeonMapHistory } from './router.js';
+import { getActiveMapUpdaterSiteRoot, maybeRollbackMapUpdaterForSwipe, runMapUpdaterPass, shouldForceBuildingPopulationPass, stopMapUpdaterPass } from './map-updater.js';
+import { maybeRollbackMapEvolutionForSwipe, maybeRunMapEvolution, stopMapEvolutionPass } from './map-evolution.js';
+import { formatNarratorSiteActivity } from './map-evolution-lib.js';
+import { ensureDungeonMapHistory, previousMapForHistoryArchive, sliceMemoAndMapHistory, syncLiveMemoHistoryAfterSwipe, unshiftMemoAndMapHistory } from './src/state/dungeon-map-history.js';
+import { HISTORY_ENTRY_LIMIT } from './src/state/history-retention.js';
+import { canCommitPassForChat, createChatCommitGuard, chatCommitResult } from './src/state/pass-affinity.js';
 import { logTransaction } from './debug-viewer.js';
 import { recordSchedulerEvent } from './swipe-scheduler-debug.js';
 import { saveSettings } from './src/app/runtime-bridge.js';
+import { runtimeState } from './src/app/runtime-state.js';
+import { isPercentFormula, resolveDiceCompare } from './src/state/dice-compare.js';
+import { buildCyoaModeBlock, STATE_MEMO_INJECT_PREAMBLE } from './constants.js';
+import { isCyoaEnabled, isLorebookAgentRuntimeActive, isLocationMappingEnabled } from './src/state/section-enabled.js';
+import { buildNarrativeModeTags, hasInjectableNarrativePacing } from './src/state/narrative-pacing.js';
+import {
+    buildDungeonRealityInjection,
+    buildMappedSitesInjection,
+    findLatestDungeonLocation,
+    getDungeonMessageText,
+    getSiteRootFromLocation,
+    looksLikeDungeonSite,
+    normalizeDungeonLabel,
+    resolveActiveDungeonSite,
+    resolveMentionedDungeonSites,
+    stripCapturedDungeonMapsFromPrompt,
+    stripDungeonRealityBlocksFromPrompt,
+} from './dungeon-reality.js';
+import { runMapArchitect } from './map-architect.js';
+import {
+    applyMapArchitectTextOpenerCyoaCaveat,
+    buildMapArchitectContinueBrief,
+    clearAssistantReasoning,
+    createAreaMapCommandIsComplete,
+    isMapArchitectTextOpener,
+    seedMapArchitectContinueText,
+    stripCreateAreaMapCommand,
+} from './map-architect-opener.js';
+export { isPercentFormula, resolveDiceCompare };
+
+const dungeonMissingMapWarnings = new Set();
+let _pendingMapArchitectResult = null;
+let _mapArchitectTextOpenerBusy = false;
+let _mapArchitectNarrationContinue = false;
+
+/** Keep mapped root lore visible while its root is active or named exactly this turn. */
+function syncDungeonLoreAgentActivation(settings, dungeonState, currentLocation, mentionedSites = []) {
+    const mappedIds = new Set(Object.values(dungeonState?.sites || {}).map(site => site?.entryId).filter(Boolean));
+    const activeSite = resolveActiveDungeonSite(dungeonState, currentLocation);
+    const wantedIds = new Set([
+        activeSite?.entryId,
+        ...mentionedSites.map(site => site?.entryId),
+    ].filter(Boolean));
+    const pinned = new Set(settings.pinnedRouterKeys || []);
+    const before = JSON.stringify({
+        active: settings.activeRouterKeys || [],
+        keyword: settings.keywordActivatedKeys || [],
+    });
+    settings.activeRouterKeys = (settings.activeRouterKeys || [])
+        .filter(id => !mappedIds.has(id) || wantedIds.has(id) || pinned.has(id));
+    for (const wantedId of wantedIds) {
+        if (!settings.activeRouterKeys.includes(wantedId)) settings.activeRouterKeys.push(wantedId);
+    }
+    // Exact map-name mentions are owned by this turn's map layer, not the
+    // general keyword pool (which supports aliases and substring hits).
+    if (Array.isArray(settings.keywordActivatedKeys)) {
+        settings.keywordActivatedKeys = settings.keywordActivatedKeys.filter(id => !mappedIds.has(id));
+    }
+    const after = JSON.stringify({
+        active: settings.activeRouterKeys || [],
+        keyword: settings.keywordActivatedKeys || [],
+    });
+    if (before !== after) void saveSettings();
+    return activeSite;
+}
+
+/** Write plain text back onto a chat message (string or multimodal content). */
+function setChatMessageText(msg, text) {
+    if (!msg) return;
+    if (typeof msg.content === 'string') {
+        msg.content = text;
+    } else if (Array.isArray(msg.content)) {
+        const nonText = msg.content.filter(p => p && p.type !== 'text');
+        msg.content = [{ type: 'text', text }, ...nonText];
+    }
+    if (typeof msg.mes === 'string' || msg.mes == null) {
+        msg.mes = text;
+    }
+}
+
+/**
+ * Strip prior CYOA/pacing from older user turns; recover raw typed text on the
+ * current user turn so pacing + CYOA + RNG can be freshly re-injected.
+ * @param {object[]} chat
+ * @param {number} currentUserIdx
+ */
+function prepareUserMessagesForContextInject(chat, currentUserIdx) {
+    if (!Array.isArray(chat)) return;
+    for (let i = 0; i < chat.length; i++) {
+        const m = chat[i];
+        if (!m) continue;
+        const role = String(m.role || '').toLowerCase();
+        const isUser = m.is_user || role === 'user' || role === 'human' || role === 'player';
+        if (!isUser) continue;
+
+        const raw = extractTextContent(m);
+        if (i === currentUserIdx) {
+            setChatMessageText(m, stripPromptInjectionsFromUserText(raw));
+        } else {
+            const cleaned = stripCyoaAndPacingInjections(raw);
+            if (cleaned !== raw) setChatMessageText(m, cleaned);
+        }
+    }
+}
+
+/**
+ * Remove leftover CYOA / narrative-pacing tags from the outgoing prompt copy
+ * when the State Tracker master toggle is off (do not mutate persisted chat).
+ * @param {object[]} chat
+ */
+function stripLeftoverCyoaAndPacingFromPrompt(chat) {
+    if (!Array.isArray(chat)) return;
+    for (const m of chat) {
+        if (!m) continue;
+        const role = String(m.role || '').toLowerCase();
+        const isUser = m.is_user || role === 'user' || role === 'human' || role === 'player';
+        if (!isUser) continue;
+        const raw = extractTextContent(m);
+        const cleaned = stripCyoaAndPacingInjections(raw);
+        if (cleaned !== raw) setChatMessageText(m, cleaned);
+    }
+}
 
 /** Resolve ST macros (e.g. {{user}}) in lore text at injection time — storage keeps macros verbatim. */
 function substituteLoreMacros(content) {
@@ -62,7 +191,11 @@ function resolveEndOfOutputFooterSection(settings) {
     let inner = `ALWAYS end every output (even after tool chains) with:
 *(Status: [HP]) | (XP: [current]/[next level]) | (Location: [Main, Sub, Sub-sub, etc])*
 *Level [X] | [HH:MM AM/PM], Day [X]*
-Footer shows ONLY {{user}}'s HP/XP/level/location — never party/NPC status or names.`;
+Footer shows ONLY {{user}}'s HP/XP/level/location — never party/NPC status or names.
+Location is coarse-to-fine and may be four or more tiers.
+
+- For an unmapped settlement building use Settlement, District, Building.
+- Never refer to unmapped BUILDINGs positionally in the footer (e.g. "Main Street, General Store rear loading dock".) Either "Main Street" or "Main Street, General Store" if actually inside.`;
     if (settings.use24hTime) {
         inner = inner.replace(/\[HH:MM AM\/PM\]/g, '[HH:MM] (24-hour clock, NO AM/PM)');
     }
@@ -379,6 +512,108 @@ export async function doDiceRoll(customDiceFormula, quiet = false) {
 
 // ── Tool & slash command registration ─────────────────────────────────────────
 
+/**
+ * Shared RollTheDice / RollTheDiceD100 action body.
+ * @param {object} args
+ * @param {{ defaultFormula?: string, forceLte?: boolean, isLegacy?: boolean }} [opts]
+ */
+async function executeDiceToolAction(args, opts = {}) {
+    const isLegacy = !!opts.isLegacy;
+    const requestedFormula = args?.formula || opts.defaultFormula || (isLegacy ? '1d6' : '1d20');
+    const roll = await doDiceRoll(requestedFormula, true);
+    const total = parseInt(roll.total) || 0;
+    const formula = roll.formula || requestedFormula;
+    const invalidNote = roll.invalidFormula
+        ? ` (requested formula "${roll.invalidFormula}" was invalid, defaulted to ${formula})`
+        : '';
+
+    if (isLegacy) {
+        return (args.who
+            ? `${args.who} rolls a ${formula}. The result is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`
+            : `The result of a ${formula} roll is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`) + invalidNote;
+    }
+
+    const dc = Number(args?.dc) || 0;
+    const compare = opts.forceLte ? 'lte' : resolveDiceCompare(args?.compare, formula);
+    const forStr = args.for ? ` (${args.for})` : ''
+    let result = (args.who
+        ? `${args.who}${forStr} rolls a ${formula} against DC ${dc}. The result is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`
+        : `The result${forStr} of a ${formula} roll against DC ${dc} is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`) + invalidNote;
+
+    if (dc > 0) {
+        if (compare === 'lte') {
+            const success = total <= dc;
+            result += ` (Result: ${total} ≤ ${dc}% → ${success ? 'HIT' : 'MISS'})`;
+        } else {
+            const success = total >= dc;
+            result += ` (Result: ${success ? 'SUCCESS' : 'FAILURE'})`;
+        }
+    }
+    return result;
+}
+
+export function registerMapArchitectTool() {
+    try {
+        const ctx = SillyTavern.getContext();
+        const { registerFunctionTool, unregisterFunctionTool } = ctx;
+        if (!registerFunctionTool || !unregisterFunctionTool) return;
+        unregisterFunctionTool('CreateDungeonMap');
+        unregisterFunctionTool('CreateAreaMap');
+
+        const settings = getSettings();
+        if (!isLocationMappingEnabled(settings)) return;
+        if (isMapArchitectTextOpener(settings)) return;
+        registerFunctionTool({
+            name: 'CreateAreaMap',
+            displayName: 'Map Architect',
+            description: 'Create and save one private objective map. You are also a soft map editor: a map may be created and attached from anywhere, without moving the player and without first creating a BUILDING. For a standalone map, omit attachTo. For a nested map, set attachTo.site to the exact existing parent map and attachTo.cell to the exact parent AREA that receives the gateway. site names the new child map; attachTo.cell names where it belongs, so similar names such as Cellar Crypt and Cellar Crypt Dungeon remain different. Example: site="Cellar Crypt Dungeon", attachTo={site:"Malarkey Monument", cell:"Cellar Crypt"}. Request only DUNGEON, INTERIOR, or SETTLEMENT; runtime creates/promotes the appropriate SUB* gateway, canonical path, host metadata, and inactive-parent edit. Explicit attachTo never changes the Location footer or implies entry. Nesting is limited to three mapped levels. If attachTo is omitted while a mapped site is active, runtime may use the active cell as shorthand. Never create placeholder structures, move the party merely to authorize creation, map OBJECT props/wilderness/roads/districts, or call again after success. include[] remains creation-only for a new SETTLEMENT that absorbs exact standalone DUNGEON/INTERIOR peers.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    site: { type: 'string', description: 'Name of the map being created. For a new dungeon/interior you are about to enter, invent this name now — it does not need to match the current Location footer. After the map is saved, copy this exact name into the footer. Never translate an already-mapped name.' },
+                    entrance: { type: 'string', description: 'Exact first area inside the new map: a gate, threshold, landing, door, square, or docks. Never translate it. Explicit offsite attachment leaves it UNREVEALED; active-location creation marks it VISITED.' },
+                    kind: { type: 'string', enum: ['DUNGEON', 'SETTLEMENT', 'INTERIOR'], description: 'DUNGEON = high-risk room-scale site. INTERIOR = significant lower-risk multi-room site. SETTLEMENT = city/town/village district-scale graph.' },
+                    scale: { type: 'string', enum: ['SMALL', 'MEDIUM', 'LARGE'], description: 'Geographic size, not danger. DUNGEON: SMALL 4-7 rooms, MEDIUM 7-12, LARGE 12-20. SETTLEMENT: SMALL 4-7 districts, MEDIUM 6-10, LARGE 8-14.' },
+                    threat: { type: 'string', enum: ['NONE', 'LOW', 'MODERATE', 'HIGH', 'DEADLY'], description: 'Site danger for occupancy and trap density. NONE forbids invented active danger. Independent of party level and scale.' },
+                    prompt: { type: 'string', description: 'Complete private map-generation guidance: purpose/history, topology, expected inhabitants or danger, tone, and anything that must not be contradicted. This can be detailed. Prompt facts do not by themselves grant player knowledge.' },
+                    brief_description: { type: 'string', description: 'Brief current description of the site (1–2 sentences: what it is, notable features, typical atmosphere). Stored as the Location CORE General field, and as parent SUBDUNGEON/SUBINTERIOR gateway detail. Do not copy the full prompt.' },
+                    attachTo: {
+                        type: 'object',
+                        additionalProperties: false,
+                        description: 'Optional structural address for a nested map. Use it from any player location. Omit it only for a standalone map or when deliberately using the active-cell shorthand.',
+                        properties: {
+                            site: { type: 'string', description: 'Exact canonical name/path of the existing parent map being edited.' },
+                            cell: { type: 'string', description: 'Exact existing AREA name on the parent map that receives the new map gateway. No BUILDING or asset is required.' },
+                        },
+                        required: ['site', 'cell'],
+                    },
+                    include: { type: 'array', items: { type: 'string' }, description: 'Optional only for first creation of a SETTLEMENT. Exact existing mapped DUNGEON/INTERIOR names to absorb as SUBDUNGEON/SUBINTERIOR peers.' },
+                },
+                required: ['site', 'entrance', 'kind', 'scale', 'threat', 'prompt', 'brief_description'],
+            },
+            action: async args => runMapArchitect(args),
+            // Map Architect owns one persistent lifecycle toast. Returning no
+            // tool-call message prevents SillyTavern from showing a duplicate.
+            formatMessage: () => '',
+        });
+    } catch (error) {
+        console.warn('[RPG Tracker] Could not register Map Architect tool:', error);
+    }
+}
+
+/** Unregister CreateAreaMap and abort Map Updater / Map Evolution when Persistent Maps is off. */
+export function syncLocationMappingRuntime() {
+    registerMapArchitectTool();
+    if (isLocationMappingEnabled(getSettings())) return;
+    stopMapUpdaterPass();
+    stopMapEvolutionPass();
+    if (runtimeState.hasActiveDungeonMap) {
+        runtimeState.hasActiveDungeonMap = false;
+        globalThis._rpgSyncAgentImmersionUi?.();
+        void globalThis._rpgRefreshImmersionView?.();
+    }
+}
+
 export function registerDiceFunctionTool() {
     try {
         const ctx = SillyTavern.getContext();
@@ -393,10 +628,11 @@ export function registerDiceFunctionTool() {
         const settings = getSettings();
         const isLegacy = settings.legacyDiceNaming;
 
-        // Register d20 tool if enabled
+        // Unified roller: skill/attack DCs (gte) and percentage/existence checks (lte / 1d100).
+        // Global d100 Mode still uses RollTheDiceD100 below; it is not removed.
         if (settings.rngToolD20) {
             const baseFormula = '1d20';
-            const formulaDescription = `A SINGLE dice formula to roll per invocation, e.g. "${baseFormula}", "2d6+3", "${baseFormula}+5". Supports one or more die groups joined by + or - (e.g. "${baseFormula}+1d4+2"), and keep/drop modifiers (e.g. "2d20kh1" for advantage, "2d20kl1" for disadvantage). Provide EXACTLY ONE formula string per call — do NOT comma-separate multiple formulas in one invocation. When several independent rolls are needed, issue multiple parallel RollTheDice invocations in the same turn (e.g. initiative for each combatant, or random-event occurrence + type).`;
+            const formulaDescription = `A SINGLE dice formula to roll per invocation, e.g. "${baseFormula}", "1d100", "2d6+3", "${baseFormula}+5". Supports one or more die groups joined by + or - (e.g. "${baseFormula}+1d4+2"), and keep/drop modifiers (e.g. "2d20kh1" for advantage, "2d20kl1" for disadvantage). Provide EXACTLY ONE formula string per call — do NOT comma-separate multiple formulas in one invocation. When several independent rolls are needed, issue multiple parallel RollTheDice invocations in the same turn (e.g. initiative for each combatant, existence check then detection, or random-event occurrence + type). Use formula "1d100" with compare "lte" for percentage / existence checks.`;
 
             const rollDiceSchema = isLegacy ? {
                 type: 'object',
@@ -409,46 +645,29 @@ export function registerDiceFunctionTool() {
                 type: 'object',
                 properties: {
                     who: { type: 'string', description: 'The name of the persona rolling the dice' },
+                    for: { type: 'string', description: 'What is being rolled for, 1-3 words' },
                     formula: { type: 'string', description: formulaDescription },
-                    dc: { type: 'number', description: 'The Difficulty Class (DC) for this roll. Anchors the difficulty before the roll is made. A roll ≥ dc = SUCCESS.' },
+                    dc: { type: 'number', description: 'For skill/attack checks (compare=gte): Difficulty Class — roll ≥ dc = SUCCESS. For percentage / existence checks (compare=lte or formula 1d100): the trigger % chance — roll ≤ dc = HIT. Always pass the probability directly (e.g. 35 for Dangerous-tier existence). Anchors difficulty BEFORE the roll is made.' },
+                    compare: { type: 'string', description: 'Optional. "gte" (default for non-d100 formulas): roll ≥ dc = SUCCESS. "lte" (default for 1d100 / percentage formulas): roll ≤ dc% = HIT. Use lte for existence checks and other percentage odds.' },
                 },
-                required: ['who', 'formula', 'dc'],
+                required: ['who', 'for', 'formula', 'dc'],
             };
 
             registerFunctionTool({
                 name: 'RollTheDice',
                 displayName: isLegacy ? 'Dice Roll' : 'Dice Roll (with DC)',
-                description: 'Rolls the dice using the provided formula and returns the numeric result. Use when it is necessary to roll the dice to determine the outcome of an action or when the user requests it. Each invocation takes one formula (e.g. "1d20+3"). For multiple independent rolls, issue parallel invocations in the same turn — never comma-join formulas into one call.',
+                description: 'Rolls dice using the provided formula and returns the numeric result. Use for skill/attack checks (1d20+mod vs DC, compare gte) and percentage / existence checks (1d100 vs %, compare lte). Each invocation takes one formula. For multiple independent rolls, issue parallel invocations in the same turn — never comma-join formulas into one call.',
                 parameters: rollDiceSchema,
-                action: async (args) => {
-                    const requestedFormula = args?.formula || (isLegacy ? '1d6' : '1d20');
-                    const roll = await doDiceRoll(requestedFormula, true);
-                    const total = parseInt(roll.total) || 0;
-                    const formula = roll.formula || requestedFormula;
-                    const invalidNote = roll.invalidFormula ? ` (requested formula "${roll.invalidFormula}" was invalid, defaulted to ${formula})` : '';
-
-                    if (isLegacy) {
-                        return (args.who
-                            ? `${args.who} rolls a ${formula}. The result is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`
-                            : `The result of a ${formula} roll is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`) + invalidNote;
-                    }
-
-                    const dc = Number(args?.dc) || 0;
-                    let result = (args.who
-                        ? `${args.who} rolls a ${formula} against DC ${dc}. The result is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`
-                        : `The result of a ${formula} roll against DC ${dc} is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`) + invalidNote;
-
-                    if (dc > 0) {
-                        const success = (total >= dc);
-                        result += ` (Result: ${success ? 'SUCCESS' : 'FAILURE'})`;
-                    }
-                    return result;
-                },
+                action: async (args) => executeDiceToolAction(args, {
+                    defaultFormula: isLegacy ? '1d6' : '1d20',
+                    isLegacy,
+                }),
                 formatMessage: () => '',
             });
         }
 
-        // Register d100 tool if enabled
+        // Explicit global d100 Mode / dedicated d100 tool — kept for percentage-based rulesets.
+        // Thin alias of the unified roller with forced 1d100 + lte semantics.
         if (settings.rngToolD100) {
             const baseFormula = '1d100';
             const formulaDescription = `A SINGLE dice formula to roll per invocation, e.g. "${baseFormula}", "2d6+3", "${baseFormula}+5". Supports one or more die groups joined by + or - (e.g. "${baseFormula}+1d4+2"), and keep/drop modifiers. Provide EXACTLY ONE formula string per call — do NOT comma-separate multiple formulas in one invocation. When several independent rolls are needed, issue multiple parallel RollTheDiceD100 invocations in the same turn.`;
@@ -457,35 +676,22 @@ export function registerDiceFunctionTool() {
                 type: 'object',
                 properties: {
                     who: { type: 'string', description: 'The name of the persona rolling the dice' },
+                    for: { type: 'string', description: 'What is being rolled for, 1-3 words' },
                     formula: { type: 'string', description: formulaDescription },
                     dc: { type: 'number', description: 'The success/trigger percentage chance for this roll (roll-under system). Set this to the actual % probability of success or occurrence (e.g. 83 for an 83% chance to hit/succeed, or 25 for a 25% hazard failure chance). A roll ≤ dc = HIT/SUCCESS/TRIGGER, a roll > dc = MISS/FAILURE/NO-TRIGGER. Do NOT invert the percentage — always pass the probability directly.' },
                 },
-                required: ['who', 'formula', 'dc'],
+                required: ['who', 'for', 'formula', 'dc'],
             };
 
             registerFunctionTool({
                 name: 'RollTheDiceD100',
                 displayName: 'Dice Roll d100 (with DC)',
-                description: 'Rolls a d100 (1-100) using the provided formula and returns the numeric result. Use for percentage probability checks. Each invocation takes one formula (e.g. "1d100"). For multiple independent rolls, issue parallel invocations in the same turn. The dc parameter is the direct success/trigger percentage (roll ≤ dc = success).',
+                description: 'Rolls a d100 (1-100) using the provided formula and returns the numeric result. Use for percentage-based rulesets (global d100 Mode) and percentage probability checks. Each invocation takes one formula (e.g. "1d100"). For multiple independent rolls, issue parallel invocations in the same turn. The dc parameter is the direct success/trigger percentage (roll ≤ dc = success). In a normal d20 game, prefer RollTheDice with formula "1d100" and compare "lte" instead.',
                 parameters: rollDiceSchema,
-                action: async (args) => {
-                    const requestedFormula = args?.formula || '1d100';
-                    const roll = await doDiceRoll(requestedFormula, true);
-                    const total = parseInt(roll.total) || 0;
-                    const formula = roll.formula || requestedFormula;
-                    const invalidNote = roll.invalidFormula ? ` (requested formula "${roll.invalidFormula}" was invalid, defaulted to ${formula})` : '';
-
-                    const dc = Number(args?.dc) || 0;
-                    let result = (args.who
-                        ? `${args.who} rolls a ${formula} against DC ${dc}. The result is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`
-                        : `The result of a ${formula} roll against DC ${dc} is: ${total}. Individual rolls: ${roll.rolls.join(', ')}`) + invalidNote;
-
-                    if (dc > 0) {
-                        const success = (total <= dc);
-                        result += ` (Result: ${total} ≤ ${dc}% → ${success ? 'HIT' : 'MISS'})`;
-                    }
-                    return result;
-                },
+                action: async (args) => executeDiceToolAction(args, {
+                    defaultFormula: '1d100',
+                    forceLte: true,
+                }),
                 formatMessage: () => '',
             });
         }
@@ -566,7 +772,7 @@ export function registerDiceSlashCommand() {
                 return 'Scene save requested.';
             }
 
-            if (!settings.routerEnabled) {
+            if (!isLorebookAgentRuntimeActive(settings)) {
                 return 'Lorebook Agent is disabled.';
             }
             if (isRouterRunning()) {
@@ -730,6 +936,125 @@ export function registerDiceSlashCommand() {
     }));
 
     SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'get-state-memo',
+        callback: async (args, value) => {
+            const settings = getSettings();
+            const memo = String(settings.currentMemo || '').trim();
+            const isNamed = args.block !== undefined && args.block !== null;
+            const blockId = String(args.block ?? value ?? '').trim();
+            if (!blockId) return memo;
+
+            const tag = blockId.toUpperCase();
+            const content = parseMemoBlocks(memo)[tag];
+            if (content === undefined) return '';
+            // Named argument: return just content; positional: wrap in block
+            return isNamed ? content : `[${tag}]\n${content}\n[/${tag}]`;
+        },
+        helpString: 'Get the current State Tracker memo, or a single [BLOCK] from it. '
+            + 'Usage: /get-state-memo | /get-state-memo block=&lt;BLOCK&gt;',
+        returns: 'the memo text, or the requested block only',
+        namedArgumentList: [
+            SlashCommandNamedArgument.fromProps({
+                name: 'block',
+                description: 'block id to return (e.g. CHARACTER, TIME) — omit to return the entire memo',
+                isRequired: false,
+                typeList: [ARGUMENT_TYPE.STRING],
+            }),
+        ],
+        unnamedArgumentList: [
+            SlashCommandArgument.fromProps({
+                description: 'block id to return (alternative to block=) — omit to return the entire memo',
+                isRequired: false,
+                typeList: [ARGUMENT_TYPE.STRING],
+            }),
+        ],
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+        name: 'set-state-memo',
+        callback: async (args, value) => {
+            const settings = getSettings();
+            const passChatId = getActiveChatId();
+            const currentMemo = String(settings.currentMemo || '');
+            const ownsMemo = createChatCommitGuard(passChatId, getActiveChatId);
+            const historyIndexAtStart = settings.historyIndex;
+            const blockId = String(args.block ?? '').trim();
+            // Use unnamedArgumentList to preserve multiline and special chars like |
+            const unnamedArgs = args.unnamedArgumentList ?? [];
+            const content = unnamedArgs.length > 0 
+                ? unnamedArgs.join(' ').trim()
+                : String(value ?? '').trim();
+
+            let updatedMemo;
+            if (blockId) {
+                // Block form: /set-state-memo block=<BLOCK> <content>
+                if (!content) return 'Usage: /set-state-memo block=<BLOCK> <content>';
+                const tag = blockId.toUpperCase();
+                updatedMemo = mergeMemo(currentMemo, `[${tag}]\n${content}\n[/${tag}]`);
+            } else {
+                // Full memo form: /set-state-memo <full memo>
+                if (!content) return 'Usage: /set-state-memo <full memo> | /set-state-memo block=<BLOCK> <content>';
+                updatedMemo = content;
+            }
+
+            // Capture maps before mutating quests, history, or the live memo.
+            // A chat switch or another editor may finish during this lorebook read.
+            const mapSnapshot = await captureActiveDungeonMapHistory();
+            if (!ownsMemo()) return 'State memo not updated: active chat changed.';
+            if (String(settings.currentMemo || '') !== currentMemo || settings.historyIndex !== historyIndexAtStart) {
+                return 'State memo not updated: memo or history changed while preparing the update.';
+            }
+            updatedMemo = applyQuestSyncAndStripMemo(updatedMemo);
+            if (updatedMemo === currentMemo) return 'No changes were made.';
+
+            // Linear Stone History: same versioning stones as a normal narrative/direct-prompt update.
+            const delta = computeDelta(currentMemo, updatedMemo);
+            settings.lastDelta = delta;
+            if (settings.historyIndex !== undefined && settings.historyIndex !== -1) {
+                sliceMemoAndMapHistory(settings, settings.historyIndex);
+            }
+            ensureDungeonMapHistory(settings);
+            if (settings.memoHistory?.[0] !== currentMemo) {
+                unshiftMemoAndMapHistory(settings, currentMemo, previousMapForHistoryArchive(settings, mapSnapshot));
+            }
+            unshiftMemoAndMapHistory(settings, updatedMemo, mapSnapshot);
+            settings.historyIndex = 0;
+            runtimeState.historyViewIndex = -1;
+            runtimeState.dungeonMapHistoryOverlay = null;
+
+            const deltaPanel = document.getElementById('rpg-tracker-delta-content');
+            if (deltaPanel) deltaPanel.innerHTML = delta;
+
+            settings.prevMemo2 = settings.prevMemo1;
+            settings.prevMemo1 = currentMemo;
+            settings.currentMemo = updatedMemo;
+            saveSettings();
+            if (settings.chatLinkEnabled) saveChatState(passChatId);
+            if (typeof globalThis._rpgUpdateUIMemo === 'function') globalThis._rpgUpdateUIMemo(updatedMemo);
+
+            return 'State memo updated.';
+        },
+        helpString: 'Set the entire State Tracker memo, or one [BLOCK] within it. Please escape pipe characters (|) in the content.'
+            + 'Usage: /set-state-memo &lt;full memo text&gt; | /set-state-memo block=&lt;BLOCK&gt; &lt;content&gt;',
+        returns: 'status message',
+        namedArgumentList: [
+            SlashCommandNamedArgument.fromProps({
+                name: 'block',
+                description: 'block id (e.g. TIME) to set — omit to replace the entire memo with the unnamed argument',
+                isRequired: false,
+                typeList: [ARGUMENT_TYPE.STRING],
+            }),
+        ],
+        unnamedArgumentList: [
+            SlashCommandArgument.fromProps({
+                description: 'content to set for block= (or the full memo text when block= is omitted)',
+                isRequired: true,
+                typeList: [ARGUMENT_TYPE.STRING],
+            }),
+        ],
+    }));
+
+    SlashCommandParser.addCommandObject(SlashCommand.fromProps({
         name: 'multihogresetui',
         aliases: ['rpgresetui', 'rtresetui'],
         callback: async (args) => {
@@ -778,12 +1103,25 @@ function extractTextContent(msg) {
     return String(raw);
 }
 
+/** Latest explicit player text from the outgoing prompt copy. */
+function findLatestPlayerInputText(chat) {
+    if (!Array.isArray(chat)) return '';
+    for (let index = chat.length - 1; index >= 0; index--) {
+        const message = chat[index];
+        const role = String(message?.role || message?.Role || '').toLowerCase().trim();
+        if (message?.is_user || role === 'user' || role === 'human' || role === 'player') {
+            return extractTextContent(message);
+        }
+    }
+    return '';
+}
+
 /**
  * Formats a lorebook entry block for injection into the GM/narrator prompt.
  * Automatically prepends any active NPC relationship status values if relationship bars are enabled.
  */
 function buildInjectedEntryText(id, entry, settings) {
-    let content = substituteLoreMacros(entry.content || '');
+    let content = stripCoreMarkersForNarrator(substituteLoreMacros(entry.content || ''));
     const rel = settings.npcRelationshipValues?.[id];
     if (rel && settings.npcRelationshipBars) {
         const relMax = getNpcRelationshipMax(settings);
@@ -868,7 +1206,9 @@ export function installInterceptor() {
     // authoritative source of tracker and player-character prompt injection.
     delete globalThis._rpgPromptManagerInterceptorActive;
     globalThis.rpgTrackerInterceptor = async function (chat, contextSize, abort, type) {
+        const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
         const settings = getSettings();
+        const dungeonEnabled = isLocationMappingEnabled(settings);
 
         // The manifest interceptor is the sole injection path.
         const skipInjection = false;
@@ -876,6 +1216,86 @@ export function installInterceptor() {
         // ── Swipe rollback: memo, then relationships, then lorebook agent ─────────────
         const _rbCtx = SillyTavern.getContext();
         const _rbChat = _rbCtx?.chat;
+        const dungeonChatId = getActiveChatId();
+        const replacingLatestNarratorMessage = ['swipe', 'regenerate']
+            .includes(String(type || '').toLowerCase());
+        let dungeonState = null;
+        let dungeonInjection = '';
+
+        // A disabled component must also neutralize hidden map/delta blocks
+        // already present in the current prompt copy. Do not mutate the
+        // persisted SillyTavern chat; the sanitizer only touches `chat` below.
+        if (!dungeonEnabled && Array.isArray(chat)) {
+            stripDungeonRealityBlocksFromPrompt(chat);
+        }
+
+        // Master power off: strip any leftover CYOA / pacing from the prompt
+        // copy so prior injections cannot keep firing while powered down.
+        if (!settings.enabled && Array.isArray(chat)) {
+            stripLeftoverCyoaAndPacingFromPrompt(chat);
+        }
+
+        if (dungeonEnabled && dungeonChatId && Array.isArray(_rbChat)) {
+            // A swipe/regeneration rejects the latest selected narrator message,
+            // so read existing attachments but do not persist a map from it.
+            // Pin before lorebook awaits so a mid-flight chat switch cannot stamp
+            // dungeonMapHistory / activeRouterKeys onto the arriving chat.
+            const passChatId = dungeonChatId;
+            const capture = chatCommitResult(ownsChat, await syncDungeonMapsToLocationLorebook(_rbChat, {
+                capture: !replacingLatestNarratorMessage,
+                chatId: passChatId,
+            }));
+            dungeonState = { version: 3, sites: capture.sites || {} };
+            if (capture.changed) {
+                console.info(`[RPG Tracker] Attached ${capture.capturedMaps} dungeon map(s) to root Location lorebook entries.`);
+            }
+            for (const error of capture.errors || []) {
+                console.error(`[RPG Tracker] Dungeon Reality capture failed: ${error}. The map was left in chat context and was not discarded.`);
+            }
+
+            const currentLocation = findLatestDungeonLocation(_rbChat);
+            const mappedSitesInjection = buildMappedSitesInjection(dungeonState.sites);
+            const mentionedSites = resolveMentionedDungeonSites(dungeonState, findLatestPlayerInputText(chat));
+            const ownsCaptureChat = capture.ownsChat !== false
+                && canCommitPassForChat(passChatId, getActiveChatId());
+            const activeSite = ownsCaptureChat
+                ? syncDungeonLoreAgentActivation(settings, dungeonState, currentLocation, mentionedSites)
+                : resolveActiveDungeonSite(dungeonState, currentLocation);
+            const sitesToInject = [activeSite, ...mentionedSites]
+                .filter((site, index, sites) => site && sites.findIndex(candidate =>
+                    (candidate?.entryId || candidate?.siteRoot) === (site.entryId || site.siteRoot)) === index);
+            if (sitesToInject.length) {
+                dungeonInjection = sitesToInject.map(site => buildDungeonRealityInjection(site, currentLocation, {
+                    activityText: formatNarratorSiteActivity(
+                        settings.mapEvolutionThreadsBySite,
+                        settings.mapEvolutionBacklogBySite,
+                        site.siteRoot,
+                        { maxTokens: settings.mapEvolutionNarratorCommitTokens },
+                    ),
+                    referencedByName: site !== activeSite,
+                })).filter(Boolean).join('\n\n');
+            }
+            if (activeSite) {
+                dungeonMissingMapWarnings.delete(`${dungeonChatId}::${getSiteRootFromLocation(currentLocation)}`);
+            } else if (currentLocation && looksLikeDungeonSite(currentLocation)) {
+                const warningKey = `${dungeonChatId}::${getSiteRootFromLocation(currentLocation)}`;
+                if (!dungeonMissingMapWarnings.has(warningKey)) {
+                    dungeonMissingMapWarnings.add(warningKey);
+                    console.error(`[RPG Tracker] Dungeon Reality is enabled and the party appears to be inside "${currentLocation}", but no captured site map is available. Adjudication is missing its objective map until the GM emits a valid <div hidden> map with a footer location.`);
+                }
+            }
+            dungeonInjection = dungeonInjection
+                ? `${mappedSitesInjection}\n${dungeonInjection}`
+                : mappedSitesInjection;
+        }
+        const narrationContinue = _mapArchitectNarrationContinue;
+        if (_pendingMapArchitectResult) {
+            dungeonInjection = dungeonInjection
+                ? `${_pendingMapArchitectResult}\n\n${dungeonInjection}`
+                : _pendingMapArchitectResult;
+            _pendingMapArchitectResult = null;
+        }
+        if (narrationContinue) _mapArchitectNarrationContinue = false;
         const _rbLastAi = _rbChat ? [..._rbChat].reverse().find(m => !m.is_user && !m.is_system) : null;
         if (_rbLastAi) {
             applyMemoSwipeRollback(_rbLastAi, settings);
@@ -883,9 +1303,7 @@ export function installInterceptor() {
                 const _relRb = applyRelationshipSwipeRollback(_rbLastAi, settings);
                 if (_relRb.anyChanged) refreshRelationshipBarsDOM(settings);
             }
-            if (settings.routerEnabled) {
-                await maybeRollbackRouterPassForSwipe(_rbLastAi);
-            }
+            chatCommitResult(ownsChat, await maybeRollbackAgentsForSwipe(_rbLastAi, { lorebook: !!settings.routerEnabled }));
         }
 
         if (settings.debugMode) {
@@ -896,8 +1314,10 @@ export function installInterceptor() {
             console.log("Chat Length:", Array.isArray(chat) ? chat.length : 'N/A');
         }
 
-        const routerActive = !!settings.routerEnabled;
-        if (!settings.enabled && !routerActive) {
+        const routerActive = isLorebookAgentRuntimeActive(settings);
+        const cyoaActive = isCyoaEnabled(settings);
+        const pacingInject = !!settings.enabled && hasInjectableNarrativePacing(settings.narrativePacing);
+        if (!settings.enabled && !routerActive && !cyoaActive && !pacingInject && !dungeonEnabled) {
             if (settings.debugMode) console.groupEnd();
             return;
         }
@@ -927,6 +1347,13 @@ export function installInterceptor() {
             if (typeof m.mes === 'string') {
                 m.mes = m.mes.replace(rtCommentRe, '');
             }
+        }
+
+        // The durable store now owns captured hidden maps. Remove only those
+        // exact blocks from the outgoing prompt so inactive sites cannot leak
+        // into context and active sites have one deterministic source.
+        if (dungeonEnabled && dungeonState) {
+            stripCapturedDungeonMapsFromPrompt(chat, dungeonState);
         }
 
         let idx = -1;
@@ -966,10 +1393,18 @@ export function installInterceptor() {
         }
 
         const msg = chat[idx];
+
+        // Strip prior CYOA/pacing from older turns; unwrap current turn to raw typed text
+        // so pacing + CYOA + RNG can be freshly injected every generation.
+        if (!skipInjection) {
+            prepareUserMessagesForContextInject(chat, idx);
+        }
+
         const content = extractTextContent(msg);
-        let injections = "";     // core: RNG Queue + State Memo + Quests (always → user msg)
+        let injections = "";     // core: pacing + CYOA + RNG + State Memo + Quests → user msg
         let loreInjections = ""; // lore: keyword/agent entries (configurable depth)
         let wpInjections = "";   // world progression reports (configurable depth)
+        const dungeonInjections = dungeonInjection;
         
         if (settings.debugMode) {
             console.log(`Found user message at index ${idx}.`);
@@ -978,226 +1413,239 @@ export function installInterceptor() {
             if (skipInjection) console.log("[RPG Tracker] Path 1 active: skipping user-message injection; keyword scan will still run.");
         }
 
-        // RNG, State Memo, and Quests are only injected into the user message in Path 2.
-        // In Path 1 (addPromptManagerInterceptor), these are built and injected by that interceptor
-        // into a dedicated system message at the configured depth, protecting the prefix cache.
-        if (!skipInjection && settings.enabled) {
-            // [PLAYER_CHARACTER] — always injected at the top of the core block
-            const curChatId = SillyTavern.getContext().chatId || globalThis._rpgCurrentChatId?.();
-            if (curChatId && settings.chatStates?.[curChatId]?.playerCharacter) {
-                const pc = settings.chatStates[curChatId].playerCharacter;
-                if (!content.includes("[PLAYER_CHARACTER]")) {
+        // Core user-message injection every turn: PC / relations / pacing / CYOA / RNG / memo / quests.
+        // CYOA / pacing follow the State Tracker master toggle (same as Persistent Maps).
+        if (!skipInjection && (settings.enabled || cyoaActive || pacingInject)) {
+            if (settings.enabled) {
+                // [PLAYER_CHARACTER] — always injected at the top of the core block
+                const curChatId = SillyTavern.getContext().chatId || globalThis._rpgCurrentChatId?.();
+                if (curChatId && settings.chatStates?.[curChatId]?.playerCharacter) {
+                    const pc = settings.chatStates[curChatId].playerCharacter;
                     injections += `[PLAYER_CHARACTER]\nName: ${pc.name}\n${pc.bio}\n[/PLAYER_CHARACTER]\n\n`;
                     if (settings.debugMode) console.log("Player Character injected.");
                 }
+
+                // [NPC_RELATIONS] — before pacing/CYOA/RNG.
+                const relBlock = chatCommitResult(ownsChat, await buildNpcRelationsBlock(settings));
+                if (relBlock) injections += relBlock;
             }
 
-        // [NPC_RELATIONS] — injected first, before RNG queue, same mechanism as RNG.
-            const relBlock = await buildNpcRelationsBlock(settings);
-            if (relBlock) injections += relBlock;
-
-            // Hybrid mode uses live tool calls outside combat and the queue only
-            // while [COMBAT] is active. Queue-only mode continues to inject it for
-            // every response, preserving its existing behavior.
-            const injectRngQueue = settings.rngEnabled
-                && (!settings.diceFunctionTool || isCombatActive(settings.currentMemo));
-            if (injectRngQueue) {
-                if (settings.rngQueueD20 && !content.includes(RNG_QUEUE_TAG_D20)) {
-                    const queue = makeRngQueue(RNG_QUEUE_LEN, false);
-                    injections += buildRngBlock(queue, false);
-                    if (settings.debugMode) console.log("RNG Queue (d20) generated for injection.");
+            // Every-turn bundle just above RNG: narrative length/pacing → CYOA → (RNG below).
+            const bundleParts = [];
+            const modeTags = buildNarrativeModeTags(settings.narrativePacing);
+            if (modeTags) bundleParts.push(modeTags);
+            if (cyoaActive) {
+                let cyoaBlock = buildCyoaModeBlock(settings.cyoaConfig || {});
+                if (isLocationMappingEnabled(settings) && isMapArchitectTextOpener(settings) && !narrationContinue) {
+                    cyoaBlock = applyMapArchitectTextOpenerCyoaCaveat(cyoaBlock);
                 }
-                if (settings.rngQueueD100 && !content.includes(RNG_QUEUE_TAG_D100)) {
-                    const queue = makeRngQueue(30, true);
-                    injections += buildRngBlock(queue, true);
-                    if (settings.debugMode) console.log("RNG Queue (d100) generated for injection.");
-                }
+                bundleParts.push(cyoaBlock);
             }
-
-            if (settings.currentMemo && !content.includes("### STATE MEMO (DO NOT REPEAT)")) {
-                const memoText = stripMemoHtml(memoForGmContext(settings.currentMemo)).trim();
-                injections += `### STATE MEMO (DO NOT REPEAT)\n${memoText}\n\n`;
-            }
-
-            // Quest deadline check — fires before state model pass, deterministically
-            if (settings.syspromptModules?.quests !== false) {
-                const memoQuests = parseQuestsFromMemo(settings.currentMemo);
-                if (memoQuests.length) {
-                    const { checkQuestDeadlines, renderQuestsAsPlainText } = await import('./quests.js');
-                    checkQuestDeadlines();
-
-                    // Inject active quests as plain text into narrative context
-                    const timeMatch = (settings.currentMemo || '').match(/\[TIME\]([\s\S]*?)\[\/TIME\]/i);
-                    const currentTime = timeMatch ? extractCurrentTimeStr(timeMatch[1]) : '';
-                    // Re-parse after checkQuestDeadlines may have mutated the memo
-                    const freshQuests = parseQuestsFromMemo(settings.currentMemo);
-                    const questText = renderQuestsAsPlainText(freshQuests, currentTime);
-                    if (questText) injections += questText;
+            if (bundleParts.length) {
+                injections += `${bundleParts.join('\n\n')}\n\n`;
+                if (settings.debugMode) {
+                    console.log('[RPG Tracker] CYOA/pacing bundle injected above RNG (every turn).');
                 }
             }
 
-            // Once per chat: reinforce the status footer on the first user turn only
-            // (near the bottom of early context — system prompt alone is often ignored).
-            // Honors Control Room: disabled <end_of_output_footer> → no reminder.
-            if (shouldInjectEndOfOutputFooterReminder(chat, content)) {
-                const footerReminder = buildEndOfOutputFooterReminder(settings);
-                if (footerReminder) {
-                    injections += footerReminder;
-                    if (settings.debugMode) console.log('[RPG Tracker] End-of-output footer reminder injected (first user turn).');
-                } else if (settings.debugMode) {
-                    console.log('[RPG Tracker] End-of-output footer reminder skipped (disabled or empty format).');
+            if (settings.enabled) {
+                // Hybrid mode uses live tool calls outside combat and the queue only
+                // while [COMBAT] is active. Queue-only mode continues to inject it for
+                // every response, preserving its existing behavior.
+                const injectRngQueue = settings.rngEnabled
+                    && (!settings.diceFunctionTool || isCombatActive(settings.currentMemo));
+                if (injectRngQueue) {
+                    if (settings.rngQueueD20) {
+                        const queue = makeRngQueue(RNG_QUEUE_LEN, false);
+                        injections += buildRngBlock(queue, false);
+                        if (settings.debugMode) console.log("RNG Queue (d20) generated for injection.");
+                    }
+                    if (settings.rngQueueD100) {
+                        const queue = makeRngQueue(30, true);
+                        injections += buildRngBlock(queue, true);
+                        if (settings.debugMode) console.log("RNG Queue (d100) generated for injection.");
+                    }
+                }
+
+                if (settings.currentMemo) {
+                    const memoText = stripMemoHtml(memoForGmContext(settings.currentMemo)).trim();
+                    injections += `${STATE_MEMO_INJECT_PREAMBLE}\n\n## TRACKER STATE 0 (Current)\n${memoText}\n\n`;
+                }
+
+                // Quest deadline check — fires before state model pass, deterministically
+                if (settings.syspromptModules?.quests !== false) {
+                    const memoQuests = parseQuestsFromMemo(settings.currentMemo);
+                    if (memoQuests.length) {
+                        const { checkQuestDeadlines, renderQuestsAsPlainText } = chatCommitResult(ownsChat, await import('./quests.js'));
+                        checkQuestDeadlines();
+
+                        // Inject active quests as plain text into narrative context
+                        const timeMatch = (settings.currentMemo || '').match(/\[TIME\]([\s\S]*?)\[\/TIME\]/i);
+                        const currentTime = timeMatch ? extractCurrentTimeStr(timeMatch[1]) : '';
+                        // Re-parse after checkQuestDeadlines may have mutated the memo
+                        const freshQuests = parseQuestsFromMemo(settings.currentMemo);
+                        const questText = renderQuestsAsPlainText(freshQuests, currentTime);
+                        if (questText) injections += questText;
+                    }
+                }
+
+                // Once per chat: reinforce the status footer on the first user turn only
+                // (near the bottom of early context — system prompt alone is often ignored).
+                // Honors Control Room: disabled <end_of_output_footer> → no reminder.
+                if (shouldInjectEndOfOutputFooterReminder(chat, content)) {
+                    const footerReminder = buildEndOfOutputFooterReminder(settings);
+                    if (footerReminder) {
+                        injections += footerReminder;
+                        if (settings.debugMode) console.log('[RPG Tracker] End-of-output footer reminder injected (first user turn).');
+                    } else if (settings.debugMode) {
+                        console.log('[RPG Tracker] End-of-output footer reminder skipped (disabled or empty format).');
+                    }
                 }
             }
         }
 
 
 
-        // Pre-generation keyword scan.
-        // This interceptor (manifest generate_interceptor) fires BEFORE addPromptManagerInterceptor
-        // in the ST pipeline. Running the keyword scan here ensures that any entries activated by
-        // the current user message land in activeRouterKeys before Path 1 reads it.
-        //
-        // In Path 1 (skipInjection=true): scan runs, activeRouterKeys is updated, text building
-        //   is skipped. Path 1 will pick up all activeRouterKeys (including newly triggered ones)
-        //   and inject them as a single system message at the configured depth.
-        //
-        // In Path 2 (skipInjection=false): scan runs and we also build lore text and inject it
-        //   directly into the user message (legacy path for old ST builds).
-        //
-        // Skipped entirely when routerNativeKeywordActivation is enabled (ST handles keywords).
-        if (settings.routerEnabled && !settings.routerNativeKeywordActivation) {
-            if (content) {
-                const t0 = performance.now().toFixed(1);
-                console.group(`[RPG|INTERCEPT] rpgTrackerInterceptor keyword pre-scan @ ${t0}ms`);
-                console.log('skipInjection (Path 1 active):', skipInjection);
-                console.log('activeRouterKeys BEFORE scan:', JSON.stringify(settings.activeRouterKeys || []));
-                const triggered = await scanAssistantOutputForKeywords(content, { sweepEnabled: false }).catch(() => []);
-                console.log('activeRouterKeys AFTER scan:', JSON.stringify(settings.activeRouterKeys || []));
-                console.log('newly triggered this scan:', triggered);
-                console.log(`scan finished @ ${performance.now().toFixed(1) }ms`);
+        // Keyword scan is extension-managed only. Native Keyword Activation leaves
+        // matching to SillyTavern. Agent-owned cards still inject below either way —
+        // otherwise [NPC_RELATIONS] can list an NPC whose card never appears (ST
+        // native WI only injects when the book is selected and keys match).
+        let triggered = [];
+        if (isLorebookAgentRuntimeActive(settings) && !settings.routerNativeKeywordActivation && content) {
+            const t0 = performance.now().toFixed(1);
+            console.group(`[RPG|INTERCEPT] rpgTrackerInterceptor keyword pre-scan @ ${t0}ms`);
+            console.log('skipInjection (Path 1 active):', skipInjection);
+            console.log('activeRouterKeys BEFORE scan:', JSON.stringify(settings.activeRouterKeys || []));
+            triggered = chatCommitResult(ownsChat, await scanAssistantOutputForKeywords(content, { sweepEnabled: false }).catch(() => []));
+            console.log('activeRouterKeys AFTER scan:', JSON.stringify(settings.activeRouterKeys || []));
+            console.log('newly triggered this scan:', triggered);
+            console.log(`scan finished @ ${performance.now().toFixed(1) }ms`);
 
-                // Trigger UI refresh so the Agent Panel updates immediately with yellow pills
-                if (triggered.length > 0 && typeof globalThis._rpgRenderRouterUI === 'function') {
-                    globalThis._rpgRenderRouterUI();
-                }
-
-                // In Path 1, the scan above already updated activeRouterKeys.
-                // Path 1's addPromptManagerInterceptor will read activeRouterKeys and inject
-                // all entries (including the newly triggered ones) at the configured depth.
-                // No text building or user-message mutation needed here.
-                if (!skipInjection) {
-                    // Path 2: build lore text to inject directly into the user message.
-                    if (triggered.length > 0) {
-                        try {
-                            const ctx = SillyTavern.getContext();
-                            let loreBlock = '';
-                            const bookCache = {};
-                            for (const id of triggered) {
-                                const [bookName, uid] = id.split('::');
-                                if (!bookCache[bookName]) bookCache[bookName] = await ctx.loadWorldInfo(bookName);
-                                const entry = bookCache[bookName]?.entries?.[uid];
-                                if (entry?.content) {
-                                    loreBlock += buildInjectedEntryText(id, entry, settings);
-                                }
-                            }
-                            if (loreBlock) {
-                                loreInjections += `\n<font color="#d4a028">## NEWLY ACTIVATED LORE (KEYWORD MATCH)</font>\n${loreBlock.trim()}\n`;
-                                console.log(`[RPG|INTERCEPT] Same-turn lore injected for ${triggered.length} entries.`);
-                            }
-                        } catch (e) {
-                            console.warn('[RPG Tracker] Same-turn lore injection failed:', e);
-                        }
-                    }
-
-                    // Persistent keyword-activated entries
-                    const triggeredSet = new Set(triggered);
-                    const persistent = (settings.keywordActivatedKeys || []).filter(id => !triggeredSet.has(id));
-                    if (persistent.length > 0) {
-                        try {
-                            const ctx = SillyTavern.getContext();
-                            let persistBlock = '';
-                            const bookCache = {};
-                            for (const id of persistent) {
-                                const [bookName, uid] = id.split('::');
-                                if (!bookCache[bookName]) bookCache[bookName] = await ctx.loadWorldInfo(bookName);
-                                const entry = bookCache[bookName]?.entries?.[uid];
-                                if (entry?.content) {
-                                    persistBlock += buildInjectedEntryText(id, entry, settings);
-                                }
-                            }
-                            if (persistBlock) {
-                                loreInjections += `\n<font color="#d4a028">## ACTIVE LORE (KEYWORD)</font>\n${persistBlock.trim()}\n`;
-                            }
-                        } catch (e) {
-                            console.warn('[RPG Tracker] Persistent keyword lore re-injection failed:', e);
-                        }
-                    }
-
-                    // Agent-owned entries (not keyword-triggered)
-                    const alreadyInjected = new Set([...triggered, ...(settings.keywordActivatedKeys || [])]);
-                    const agentOwned = (settings.activeRouterKeys || [])
-                        .filter(id => !alreadyInjected.has(id))
-                        .filter(id => {
-                            const [bookName] = id.split('::');
-                            const isWorld = bookName.toLowerCase().endsWith('_world') || bookName.toLowerCase() === 'world';
-                            return !isWorld;
-                        });
-                    if (agentOwned.length > 0) {
-                        try {
-                            const ctx = SillyTavern.getContext();
-                            let agentBlock = '';
-                            const bookCache = {};
-                            for (const id of agentOwned) {
-                                const [bookName, uid] = id.split('::');
-                                if (!bookCache[bookName]) bookCache[bookName] = await ctx.loadWorldInfo(bookName);
-                                const entry = bookCache[bookName]?.entries?.[uid];
-                                if (entry?.content) {
-                                    agentBlock += buildInjectedEntryText(id, entry, settings);
-                                }
-                            }
-                            if (agentBlock) {
-                                loreInjections += `\n## ACTIVE LORE (AGENT)\n${agentBlock.trim()}\n`;
-                            }
-                        } catch (e) {
-                            console.warn('[RPG Tracker] Agent-owned lore injection failed:', e);
-                        }
-                    }
-
-                // World Progression reports injection
-                if (settings.worldProgressionEnabled && (settings.activeWorldKeys || []).length > 0) {
-                    try {
-                        const ctx = SillyTavern.getContext();
-                        let worldBlock = '';
-                        const bookCache = {};
-                        const sortedKeys = [...settings.activeWorldKeys].sort((a, b) => {
-                            const [, uidA] = a.split('::');
-                            const [, uidB] = b.split('::');
-                            return Number(uidA) - Number(uidB);
-                        });
-                        for (const id of sortedKeys) {
-                            const [bookName, uid] = id.split('::');
-                            if (!bookCache[bookName]) bookCache[bookName] = await ctx.loadWorldInfo(bookName);
-                            const entry = bookCache[bookName]?.entries?.[uid];
-                            if (entry?.content) {
-                                worldBlock += `### [${entry.key?.[0] || entry.comment || 'World Report'}]\n${substituteLoreMacros(entry.content)}\n\n`;
-                            }
-                        }
-                        if (worldBlock) {
-                            wpInjections = `\n## WORLD PROGRESSION REPORTS\n${worldBlock.trim()}\n`;
-                        }
-                    } catch (e) {
-                        console.warn('[RPG Tracker] World progression injection failed:', e);
-                    }
-                }
+            if (triggered.length > 0 && typeof globalThis._rpgRenderRouterUI === 'function') {
+                globalThis._rpgRenderRouterUI();
             }
-
             console.groupEnd();
         }
-    }
+
+        if (isLorebookAgentRuntimeActive(settings) && !skipInjection) {
+            if (!settings.routerNativeKeywordActivation) {
+                if (triggered.length > 0) {
+                    try {
+                        const ctx = SillyTavern.getContext();
+                        let loreBlock = '';
+                        const bookCache = {};
+                        for (const id of triggered) {
+                            const [bookName, uid] = id.split('::');
+                            if (!bookCache[bookName]) bookCache[bookName] = chatCommitResult(ownsChat, await ctx.loadWorldInfo(bookName));
+                            const entry = bookCache[bookName]?.entries?.[uid];
+                            if (entry?.content) {
+                                loreBlock += buildInjectedEntryText(id, entry, settings);
+                            }
+                        }
+                        if (loreBlock) {
+                            loreInjections += `\n<font color="#d4a028">## NEWLY ACTIVATED LORE (KEYWORD MATCH)</font>\n${loreBlock.trim()}\n`;
+                            console.log(`[RPG|INTERCEPT] Same-turn lore injected for ${triggered.length} entries.`);
+                        }
+                    } catch (e) {
+                        if (!ownsChat()) return;
+
+                        console.warn('[RPG Tracker] Same-turn lore injection failed:', e);
+                    }
+                }
+
+                const triggeredSet = new Set(triggered);
+                const persistent = (settings.keywordActivatedKeys || []).filter(id => !triggeredSet.has(id));
+                if (persistent.length > 0) {
+                    try {
+                        const ctx = SillyTavern.getContext();
+                        let persistBlock = '';
+                        const bookCache = {};
+                        for (const id of persistent) {
+                            const [bookName, uid] = id.split('::');
+                            if (!bookCache[bookName]) bookCache[bookName] = chatCommitResult(ownsChat, await ctx.loadWorldInfo(bookName));
+                            const entry = bookCache[bookName]?.entries?.[uid];
+                            if (entry?.content) {
+                                persistBlock += buildInjectedEntryText(id, entry, settings);
+                            }
+                        }
+                        if (persistBlock) {
+                            loreInjections += `\n<font color="#d4a028">## ACTIVE LORE (KEYWORD)</font>\n${persistBlock.trim()}\n`;
+                        }
+                    } catch (e) {
+                        if (!ownsChat()) return;
+
+                        console.warn('[RPG Tracker] Persistent keyword lore re-injection failed:', e);
+                    }
+                }
+            }
+
+            // Agent-owned entries (not keyword-triggered). Always inject when the
+            // router is on — including native keyword mode and empty user messages.
+            const alreadyInjected = settings.routerNativeKeywordActivation
+                ? new Set()
+                : new Set([...triggered, ...(settings.keywordActivatedKeys || [])]);
+            const agentOwned = (settings.activeRouterKeys || [])
+                .filter(id => !alreadyInjected.has(id))
+                .filter(id => {
+                    const [bookName] = id.split('::');
+                    const isWorld = bookName.toLowerCase().endsWith('_world') || bookName.toLowerCase() === 'world';
+                    return !isWorld;
+                });
+            if (agentOwned.length > 0) {
+                try {
+                    const ctx = SillyTavern.getContext();
+                    let agentBlock = '';
+                    const bookCache = {};
+                    for (const id of agentOwned) {
+                        const [bookName, uid] = id.split('::');
+                        if (!bookCache[bookName]) bookCache[bookName] = chatCommitResult(ownsChat, await ctx.loadWorldInfo(bookName));
+                        const entry = bookCache[bookName]?.entries?.[uid];
+                        if (entry?.content) {
+                            agentBlock += buildInjectedEntryText(id, entry, settings);
+                        }
+                    }
+                    if (agentBlock) {
+                        loreInjections += `\n## ACTIVE LORE (AGENT)\n${agentBlock.trim()}\n`;
+                    }
+                } catch (e) {
+                    if (!ownsChat()) return;
+
+                    console.warn('[RPG Tracker] Agent-owned lore injection failed:', e);
+                }
+            }
+
+            if (settings.worldProgressionEnabled && (settings.activeWorldKeys || []).length > 0) {
+                try {
+                    const ctx = SillyTavern.getContext();
+                    let worldBlock = '';
+                    const bookCache = {};
+                    const sortedKeys = [...settings.activeWorldKeys].sort((a, b) => {
+                        const [, uidA] = a.split('::');
+                        const [, uidB] = b.split('::');
+                        return Number(uidA) - Number(uidB);
+                    });
+                    for (const id of sortedKeys) {
+                        const [bookName, uid] = id.split('::');
+                        if (!bookCache[bookName]) bookCache[bookName] = chatCommitResult(ownsChat, await ctx.loadWorldInfo(bookName));
+                        const entry = bookCache[bookName]?.entries?.[uid];
+                        if (entry?.content) {
+                            worldBlock += `### [${entry.key?.[0] || entry.comment || 'World Report'}]\n${substituteLoreMacros(entry.content)}\n\n`;
+                        }
+                    }
+                    if (worldBlock) {
+                        wpInjections = `\n## WORLD PROGRESSION REPORTS\n${worldBlock.trim()}\n`;
+                    }
+                } catch (e) {
+                    if (!ownsChat()) return;
+
+                    console.warn('[RPG Tracker] World progression injection failed:', e);
+                }
+            }
+        }
 
         if (settings.debugMode) console.groupEnd();
 
-        if (skipInjection || (!injections && !loreInjections && !wpInjections)) return;
+        if (skipInjection || (!injections && !loreInjections && !wpInjections && !dungeonInjections)) return;
 
         // ── Injection dispatch ───────────────────────────────────────────────────
         //
@@ -1266,6 +1714,21 @@ export function installInterceptor() {
         // The `chat` array here is SillyTavern's internal format (.mes / .is_user /
         // .name / .extra). Setting extra.type = 'narrator' maps to role:'system'
         // when setOpenAIMessages() converts it to API format.
+        if (dungeonInjections) {
+            const dungeonDepth = settings.loreInjectionDepth ?? 4;
+            const insertIdx = Math.max(0, chat.length - dungeonDepth);
+            chat.splice(insertIdx, 0, {
+                name: 'Dungeon Reality',
+                mes: dungeonInjections,
+                is_user: false,
+                extra: { type: 'narrator' },
+            });
+            if (settings.debugMode) {
+                console.log(`[Multihog Framework] Dungeon Reality depth injection: spliced at index ${insertIdx} (depth ${dungeonDepth}).`);
+                logTransaction('Dungeon Reality (Depth Splice)', [{ role: 'system', content: dungeonInjections }]);
+            }
+        }
+
         if (useDepthInjection && loreInjections) {
             const depth = settings.loreInjectionDepth ?? 4;
             const insertIdx = Math.max(0, chat.length - depth);
@@ -1405,14 +1868,7 @@ function applyMemoSwipeRollback(lastAiMsg, settings) {
 
             if (Array.isArray(settings.memoHistory)) {
                 const baseMemo = lastAiMsg.extra.rpgMemoRollback?.[prevSwipeId] || lastAiMsg.extra.rpgMemoRollback?.[swipeId];
-                if (targetMemo === baseMemo) {
-                    if (settings.memoHistory[0] !== baseMemo) {
-                        settings.memoHistory.shift();
-                        if (settings.historyIndex !== undefined && settings.historyIndex > 0) settings.historyIndex--;
-                    }
-                } else {
-                    settings.memoHistory[0] = targetMemo;
-                }
+                syncLiveMemoHistoryAfterSwipe(settings, targetMemo, baseMemo);
             }
 
             if (lastAiMsg.extra.rpgMemoRollback) delete lastAiMsg.extra.rpgMemoRollback[swipeId];
@@ -1495,7 +1951,7 @@ function applyRelationshipSwipeRollback(lastAiMsg, settings) {
                                 newValue: settings.npcRelationshipValues[rb.npcId][rb.field],
                                 source: 'Swipe restore'
                             });
-                            if (settings.npcRelationshipLog[rb.npcId].length > 50) {
+                            if (settings.npcRelationshipLog[rb.npcId].length > HISTORY_ENTRY_LIMIT) {
                                 settings.npcRelationshipLog[rb.npcId].shift();
                             }
                         }
@@ -1528,6 +1984,9 @@ function applyRelationshipSwipeRollback(lastAiMsg, settings) {
  * @param {any} msg - The last AI message, as resolved by the caller.
  */
 async function maybeRollbackRouterPassForSwipe(msg) {
+    const ownsOperation = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+    try {
+    const passChatId = runtimeState.currentChatId;
     if (!msg?.extra || msg.extra.rpgRouterRanForSwipe === undefined) return;
 
     const currentSwipeId = msg.swipe_id ?? 0;
@@ -1567,7 +2026,8 @@ async function maybeRollbackRouterPassForSwipe(msg) {
 
     console.log(`[RPG Tracker] Lorebook Agent pass was based on abandoned swipe ${msg.extra.rpgRouterRanForSwipe}→${currentSwipeId}; rolling back and re-priming run-every.`);
     recordSchedulerEvent('la_swipe_rollback_attempt', { historyIndex, runId, fromSwipe: msg.extra.rpgRouterRanForSwipe, toSwipe: currentSwipeId });
-    const ok = await rollbackRouterPass(historyIndex);
+    const ok = chatCommitResult(ownsOperation, await rollbackRouterPass(historyIndex));
+    if (!canCommitPassForChat(passChatId, runtimeState.currentChatId)) return;
     if (ok) {
         clearRouterSwipeMarkers(msg);
         const primeTo = Math.max(0, (settings.routerRunEvery || 1) - 1);
@@ -1576,6 +2036,35 @@ async function maybeRollbackRouterPassForSwipe(msg) {
     } else {
         console.warn('[RPG Tracker] Auto-rollback of Lorebook Agent pass failed; markers kept for retry.');
         recordSchedulerEvent('la_swipe_rollback_failed', { historyIndex, runId });
+    }
+
+    } catch (error) {
+        if (!ownsOperation()) return;
+        throw error;
+    }
+}
+
+async function maybeRollbackAgentsForSwipe(msg, { lorebook = true } = {}) {
+    const ownsOperation = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+    try {
+    const passChatId = runtimeState.currentChatId;
+    if (!canCommitPassForChat(passChatId, runtimeState.currentChatId)) return;
+    const mapRolled = chatCommitResult(ownsOperation, await maybeRollbackMapUpdaterForSwipe(msg));
+    if (!canCommitPassForChat(passChatId, runtimeState.currentChatId)) return;
+    if (mapRolled) {
+        const primeTo = Math.max(0, (getSettings().mapUpdaterRunEvery || 1) - 1);
+        setMapUpdaterAutoTick(primeTo, 'swipe_map_updater_rollback_prime');
+    } else {
+        // Occupancy snapshots earlier in the same turn; restoring evolution after
+        // occupancy rollback would undo that occupancy restore.
+        chatCommitResult(ownsOperation, await maybeRollbackMapEvolutionForSwipe(msg));
+        if (!canCommitPassForChat(passChatId, runtimeState.currentChatId)) return;
+    }
+    if (lorebook) chatCommitResult(ownsOperation, await maybeRollbackRouterPassForSwipe(msg));
+
+    } catch (error) {
+        if (!ownsOperation()) return;
+        throw error;
     }
 }
 
@@ -1591,6 +2080,8 @@ function clearRouterSwipeMarkers(msg) {
  * Handles memo, relationship, and Lorebook Agent rollback when a message is edited or swiped.
  */
 export async function handleRelationshipSwipeChange() {
+    const ownsOperation = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+    try {
     if (_rpgIsGenerating) {
         recordSchedulerEvent('rel_tags_skipped', { reason: 'is_generating' });
         return;
@@ -1603,6 +2094,9 @@ export async function handleRelationshipSwipeChange() {
         console.log('[RPG Tracker] Relationship swipe handler: ABORT - No chat found.');
         return;
     }
+
+    // Pin before any await — swipe agent rollback and regex NPC resolve can outlive a chat switch.
+    const passChatId = runtimeState.currentChatId;
 
     // Find the last AI message
     let lastAiMsg = null;
@@ -1618,8 +2112,9 @@ export async function handleRelationshipSwipeChange() {
     }
 
     if (getRelationshipUpdateMode(settings) === RELATIONSHIP_UPDATE_MODES.REGEX) {
-        await applyNarrativeRelationshipRegex(lastAiMsg, settings, ctx);
-        await maybeRollbackRouterPassForSwipe(lastAiMsg);
+        chatCommitResult(ownsOperation, await applyNarrativeRelationshipRegex(lastAiMsg, settings, ctx, { passChatId }));
+        if (!canCommitPassForChat(passChatId, runtimeState.currentChatId)) return;
+        chatCommitResult(ownsOperation, await maybeRollbackAgentsForSwipe(lastAiMsg));
         return;
     }
     
@@ -1628,8 +2123,11 @@ export async function handleRelationshipSwipeChange() {
     const relSwipeResult = settings.npcRelationshipBars
         ? applyRelationshipSwipeRollback(lastAiMsg, settings)
         : { anyChanged: false };
-    await maybeRollbackRouterPassForSwipe(lastAiMsg);
-    if (relSwipeResult.anyChanged) persistRelationshipCommandChanges(ctx, settings);
+    chatCommitResult(ownsOperation, await maybeRollbackAgentsForSwipe(lastAiMsg));
+    if (relSwipeResult.anyChanged
+        && canCommitPassForChat(passChatId, runtimeState.currentChatId)) {
+        persistRelationshipCommandChanges(ctx, settings, passChatId);
+    }
     return;
 
     /*
@@ -1661,7 +2159,7 @@ export async function handleRelationshipSwipeChange() {
     // If Relationship Bars are disabled, we only handle State Tracker swipe updates
     console.log('[RPG Tracker] Relationship swipe handler: bars enabled:', !!settings.npcRelationshipBars);
     if (!settings.npcRelationshipBars) {
-        await maybeRollbackRouterPassForSwipe(lastAiMsg);
+        await maybeRollbackAgentsForSwipe(lastAiMsg);
         if (anyStateChanged) {
             triggerStateOnlyUIUpdate();
         }
@@ -1678,13 +2176,13 @@ export async function handleRelationshipSwipeChange() {
     const relSwipeResult = applyRelationshipSwipeRollback(lastAiMsg, settings);
     anyChanged = relSwipeResult.anyChanged;
     if (relSwipeResult.bailEarly) {
-        await maybeRollbackRouterPassForSwipe(lastAiMsg);
+        await maybeRollbackAgentsForSwipe(lastAiMsg);
         if (anyChanged || anyStateChanged) triggerUIUpdate();
         return;
     }
 
     // --- 2b. LOREBOOK AGENT "RUN EVERY" SWIPE ROLLBACK ---
-    await maybeRollbackRouterPassForSwipe(lastAiMsg);
+    await maybeRollbackAgentsForSwipe(lastAiMsg);
 
     // Relationship deltas are now received from the State Tracker as structured
     // commands. Never inspect narrator prose here.
@@ -1755,8 +2253,8 @@ export async function handleRelationshipSwipeChange() {
             timestamp: logTimestamp, field: m.field, delta: m.delta, newValue: newVal, source: 'narrative' 
         });
         
-        if (settings.npcRelationshipLog[resolvedId].length > 50) {
-            settings.npcRelationshipLog[resolvedId].length = 50;
+        if (settings.npcRelationshipLog[resolvedId].length > HISTORY_ENTRY_LIMIT) {
+            settings.npcRelationshipLog[resolvedId].length = HISTORY_ENTRY_LIMIT;
         }
 
         const sign = m.delta > 0 ? '+' : '';
@@ -1786,17 +2284,33 @@ export async function handleRelationshipSwipeChange() {
         void saveSettings();
     }
     */
-}
 
+    } catch (error) {
+        if (!ownsOperation()) return;
+        throw error;
+    }
+}
 
 /**
  * Original narrator annotation path: parse relationship deltas directly from
  * the newest AI message and apply them to the code-owned NPC relationship data.
+ * @param {object} [options]
+ * @param {string|null} [options.passChatId] Chat id captured when the pass started.
  */
-async function applyNarrativeRelationshipRegex(lastAiMsg, settings, ctx) {
+async function applyNarrativeRelationshipRegex(lastAiMsg, settings, ctx, options = {}) {
+    const ownsOperation = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+    try {
+    const passChatId = options.passChatId ?? runtimeState.currentChatId;
+    if (!canCommitPassForChat(passChatId, runtimeState.currentChatId)) {
+        return;
+    }
+
     const swipeResult = applyRelationshipSwipeRollback(lastAiMsg, settings);
     if (swipeResult.bailEarly) {
-        if (swipeResult.anyChanged) persistRelationshipCommandChanges(ctx, settings);
+        if (swipeResult.anyChanged
+            && canCommitPassForChat(passChatId, runtimeState.currentChatId)) {
+            persistRelationshipCommandChanges(ctx, settings, passChatId);
+        }
         return;
     }
 
@@ -1810,6 +2324,9 @@ async function applyNarrativeRelationshipRegex(lastAiMsg, settings, ctx) {
     let anyChanged = swipeResult.anyChanged;
 
     while ((match = relRegex.exec(text)) !== null) {
+        if (!canCommitPassForChat(passChatId, runtimeState.currentChatId)) {
+            return;
+        }
         const field = match[1].toLowerCase();
         const npc = match[2].trim();
         const delta = parseInt(match[3], 10);
@@ -1817,7 +2334,12 @@ async function applyNarrativeRelationshipRegex(lastAiMsg, settings, ctx) {
         if (!npc || !Number.isFinite(delta) || delta === 0) continue;
         if (lastAiMsg.extra.rpgProcessedTags[swipeId].includes(rawTag)) continue;
 
-        const resolvedId = await fuzzyResolveNpcName(npc);
+        const resolvedId = chatCommitResult(ownsOperation, await fuzzyResolveNpcName(npc));
+        // fuzzyResolve awaits the lorebook manifest — a chat switch can project
+        // another partition into the shared settings object during that gap.
+        if (!canCommitPassForChat(passChatId, runtimeState.currentChatId)) {
+            return;
+        }
         if (!resolvedId) continue;
         if (!settings.npcRelationshipValues) settings.npcRelationshipValues = {};
         if (!settings.npcRelationshipValues[resolvedId]) settings.npcRelationshipValues[resolvedId] = { friendship: 0, affection: 0 };
@@ -1831,7 +2353,7 @@ async function applyNarrativeRelationshipRegex(lastAiMsg, settings, ctx) {
         if (!Array.isArray(settings.npcRelationshipLog[resolvedId])) settings.npcRelationshipLog[resolvedId] = [];
         const logTimestamp = Date.now();
         settings.npcRelationshipLog[resolvedId].unshift({ timestamp: logTimestamp, field, delta, newValue, source: 'narrative' });
-        if (settings.npcRelationshipLog[resolvedId].length > 50) settings.npcRelationshipLog[resolvedId].length = 50;
+        if (settings.npcRelationshipLog[resolvedId].length > HISTORY_ENTRY_LIMIT) settings.npcRelationshipLog[resolvedId].length = HISTORY_ENTRY_LIMIT;
 
         lastAiMsg.extra.rpgRollbackData[swipeId].push({ npcId: resolvedId, field, actualAppliedDelta, expectedValue: newValue, logTimestamp });
         lastAiMsg.extra.rpgProcessedTags[swipeId].push(rawTag);
@@ -1842,7 +2364,17 @@ async function applyNarrativeRelationshipRegex(lastAiMsg, settings, ctx) {
         anyChanged = true;
     }
 
-    if (anyChanged) persistRelationshipCommandChanges(ctx, settings);
+    if (anyChanged) {
+        if (!canCommitPassForChat(passChatId, runtimeState.currentChatId)) {
+            return;
+        }
+        persistRelationshipCommandChanges(ctx, settings, passChatId);
+    }
+
+    } catch (error) {
+        if (!ownsOperation()) return { status: 'chat_changed' };
+        throw error;
+    }
 }
 
 /**
@@ -1850,19 +2382,31 @@ async function applyNarrativeRelationshipRegex(lastAiMsg, settings, ctx) {
  * Commands are not stored; only the existing relationship value rollback record is.
  * @param {Array<{type: string, npc: string, field: 'friendship'|'affection', delta: number}>} commands
  */
-export async function applyStateTrackerRelationshipCommands(commands) {
-    if (!Array.isArray(commands) || !commands.length) return;
+export async function applyStateTrackerRelationshipCommands(commands, options = {}) {
+    const ownsOperation = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+    try {
+    if (!Array.isArray(commands) || !commands.length) return { applied: false, status: 'empty' };
+
+    const passChatId = options.passChatId ?? runtimeState.currentChatId;
+    if (!canCommitPassForChat(passChatId, runtimeState.currentChatId)) {
+        return { applied: false, status: 'chat_changed' };
+    }
 
     const settings = getSettings();
-    if (!settings.npcRelationshipBars) return;
+    if (!settings.npcRelationshipBars) return { applied: false, status: 'disabled' };
     const ctx = SillyTavern.getContext();
     const lastAiMsg = [...(ctx.chat || [])].reverse().find(message => !message.is_user && !message.is_system);
-    if (!lastAiMsg) return;
+    if (!lastAiMsg) return { applied: false, status: 'no_message' };
 
     const swipeResult = applyRelationshipSwipeRollback(lastAiMsg, settings);
     if (swipeResult.bailEarly) {
-        if (swipeResult.anyChanged) persistRelationshipCommandChanges(ctx, settings);
-        return;
+        if (swipeResult.anyChanged) {
+            if (!canCommitPassForChat(passChatId, runtimeState.currentChatId)) {
+                return { applied: false, status: 'chat_changed' };
+            }
+            persistRelationshipCommandChanges(ctx, settings, passChatId);
+        }
+        return { applied: swipeResult.anyChanged, status: swipeResult.anyChanged ? 'ok' : 'bail' };
     }
 
     const swipeId = lastAiMsg.swipe_id ?? 0;
@@ -1870,7 +2414,15 @@ export async function applyStateTrackerRelationshipCommands(commands) {
     let anyChanged = swipeResult.anyChanged;
 
     for (const command of commands) {
-        const resolvedId = command.npc.includes('::') ? command.npc : await fuzzyResolveNpcName(command.npc);
+        if (!canCommitPassForChat(passChatId, runtimeState.currentChatId)) {
+            return { applied: false, status: 'chat_changed' };
+        }
+        const resolvedId = command.npc.includes('::') ? command.npc : chatCommitResult(ownsOperation, await fuzzyResolveNpcName(command.npc));
+        // fuzzyResolve awaits the lorebook manifest — a chat switch can project
+        // another partition into the shared settings object during that gap.
+        if (!canCommitPassForChat(passChatId, runtimeState.currentChatId)) {
+            return { applied: false, status: 'chat_changed' };
+        }
         if (!resolvedId) {
             console.warn(`[RPG Tracker] State Tracker relationship command could not resolve NPC "${command.npc}".`);
             continue;
@@ -1894,8 +2446,13 @@ export async function applyStateTrackerRelationshipCommands(commands) {
             newValue,
             source: 'state_tracker',
         });
-        if (settings.npcRelationshipLog[resolvedId].length > 50) settings.npcRelationshipLog[resolvedId].length = 50;
+        if (settings.npcRelationshipLog[resolvedId].length > HISTORY_ENTRY_LIMIT) settings.npcRelationshipLog[resolvedId].length = HISTORY_ENTRY_LIMIT;
 
+        lastAiMsg.extra = lastAiMsg.extra || {};
+        lastAiMsg.extra.rpgRollbackData = lastAiMsg.extra.rpgRollbackData || {};
+        if (!Array.isArray(lastAiMsg.extra.rpgRollbackData[swipeId])) {
+            lastAiMsg.extra.rpgRollbackData[swipeId] = [];
+        }
         lastAiMsg.extra.rpgRollbackData[swipeId].push({
             npcId: resolvedId,
             field: command.field,
@@ -1909,15 +2466,27 @@ export async function applyStateTrackerRelationshipCommands(commands) {
         anyChanged = true;
     }
 
-    if (anyChanged) persistRelationshipCommandChanges(ctx, settings);
+    if (anyChanged) {
+        if (!canCommitPassForChat(passChatId, runtimeState.currentChatId)) {
+            return { applied: false, status: 'chat_changed' };
+        }
+        persistRelationshipCommandChanges(ctx, settings, passChatId);
+    }
+    return { applied: anyChanged, status: anyChanged ? 'ok' : 'noop' };
+
+    } catch (error) {
+        if (!ownsOperation()) return { status: 'chat_changed' };
+        throw error;
+}
 }
 
-function persistRelationshipCommandChanges(ctx, settings) {
+function persistRelationshipCommandChanges(ctx, settings, passChatId = null) {
     if (typeof ctx.saveChatDebounced === 'function') ctx.saveChatDebounced();
     void saveSettings();
     refreshRelationshipBarsDOM(settings);
     if (settings.chatLinkEnabled) {
-        const chatId = getActiveChatId();
+        // Prefer the originating pass chat when provided — never the post-switch active id.
+        const chatId = passChatId || getActiveChatId();
         if (chatId) saveChatState(chatId);
     }
 }
@@ -2070,6 +2639,184 @@ export let _rpgIsGenerating = false;
  * @param {any[]} chat
  * @returns {any|null}
  */
+function applyAssistantMessageText(ctx, message, text) {
+    message.mes = text;
+    if (typeof message.content === 'string') message.content = text;
+    if (Array.isArray(message.swipes) && message.swipes.length) {
+        const idx = Math.max(0, Math.min(message.swipes.length - 1, Number(message.swipe_id) || 0));
+        message.swipes[idx] = text;
+    }
+    const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
+    const index = chat.indexOf(message);
+    if (index >= 0 && typeof ctx.updateMessageBlock === 'function') {
+        try { ctx.updateMessageBlock(index, message); } catch (_) { /* UI refresh is best effort */ }
+    }
+    if (typeof ctx.saveChat === 'function') {
+        try { void ctx.saveChat(); } catch (_) { /* persistence is best effort */ }
+    }
+}
+
+function logMapArchitectTextOpener(status, extra = {}) {
+    recordSchedulerEvent(`map_architect_text_opener_${status}`, extra);
+    console.log(`[RPG Tracker] Map Architect text opener: ${status}`, extra);
+}
+
+/**
+ * Scan assistant messages after the latest user turn for a [CREATE_AREA_MAP] fence.
+ * Tool-call system rows can sit after the stub, so "latest assistant" is not enough.
+ */
+function findCreateAreaMapCandidate(chat) {
+    if (!Array.isArray(chat)) return null;
+    let lastUser = -1;
+    for (let i = chat.length - 1; i >= 0; i--) {
+        if (chat[i]?.is_user) {
+            lastUser = i;
+            break;
+        }
+    }
+    for (let i = chat.length - 1; i > lastUser; i--) {
+        const message = chat[i];
+        if (!message || message.is_user || message.extra?.rpgMapArchitectTextOpenerRan) continue;
+        const cleaned = cleanMessageContent(message);
+        const raw = getDungeonMessageText(message);
+        const strippedClean = stripCreateAreaMapCommand(cleaned);
+        const strippedRaw = stripCreateAreaMapCommand(raw);
+        const stripped = strippedClean.command ? strippedClean : strippedRaw;
+        if (stripped.command) return { message, stripped, index: i };
+    }
+    return null;
+}
+
+/**
+ * Text-command CreateAreaMap fallback: strip the fence, run Map Architect, continue the narrator.
+ * Returns true when the normal ST/LA/updater cadence must be skipped for this generation.
+ */
+async function maybeRunMapArchitectTextOpener({ chat, settings, currentType, source = 'generation_ended' }) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+    const type = String(currentType || '').toLowerCase();
+    const textMode = isMapArchitectTextOpener(settings);
+    const mappingOn = isLocationMappingEnabled(settings);
+    if (!mappingOn) {
+        if (textMode) logMapArchitectTextOpener('skip', { reason: 'persistent_maps_off', source, generationType: type });
+        return false;
+    }
+    if (_mapArchitectTextOpenerBusy) {
+        logMapArchitectTextOpener('skip', { reason: 'busy', source, generationType: type });
+        return true;
+    }
+    if (['impersonate', 'quiet'].includes(type)) {
+        logMapArchitectTextOpener('skip', { reason: 'generation_type', source, generationType: type });
+        return false;
+    }
+
+    const candidate = findCreateAreaMapCandidate(chat);
+    if (!candidate) {
+        const latest = getLatestAssistantCandidate(chat);
+        const preview = String(latest?.mes || '').slice(0, 240);
+        const fenceMentioned = /CREATE_AREA_MAP/i.test(preview);
+        if (textMode || fenceMentioned) {
+            logMapArchitectTextOpener('skip', {
+                reason: 'no_fence',
+                source,
+                generationType: type,
+                textMode,
+                fenceMentioned,
+                preview,
+            });
+        }
+        return false;
+    }
+
+    const { message, stripped, index } = candidate;
+    logMapArchitectTextOpener('fence_found', {
+        source,
+        generationType: type,
+        index,
+        site: stripped.command.args?.site || '',
+        speaker: message.name || '',
+        isSystem: !!message.is_system,
+    });
+
+    _mapArchitectTextOpenerBusy = true;
+    try {
+        message.extra = message.extra || {};
+        message.extra.rpgMapArchitectTextOpenerRan = true;
+        applyAssistantMessageText(SillyTavern.getContext(), message, stripped.text);
+
+        const args = stripped.command.args;
+        if (!createAreaMapCommandIsComplete(args)) {
+            logMapArchitectTextOpener('skip', { reason: 'incomplete_command', source, generationType: type, args });
+            globalThis.toastr?.error?.(
+                'Map Architect text command is missing site, entrance, kind, prompt, or brief_description. Stay outside and try again next turn.',
+                'Map Architect',
+                { timeOut: 10000 },
+            );
+            return true;
+        }
+
+        const siteLabel = args.site;
+        logMapArchitectTextOpener('running', { source, generationType: type, site: siteLabel });
+        chatCommitResult(ownsChat, await runMapArchitect(args));
+        clearAssistantReasoning(message);
+        if (args.attachTo) {
+            _pendingMapArchitectResult = null;
+            _mapArchitectNarrationContinue = false;
+            logMapArchitectTextOpener('completed_offsite_attachment', { source, generationType: type, site: siteLabel });
+            return true;
+        }
+        applyAssistantMessageText(
+            SillyTavern.getContext(),
+            message,
+            seedMapArchitectContinueText(stripped.text, args.entrance),
+        );
+        _pendingMapArchitectResult = buildMapArchitectContinueBrief(args);
+        _mapArchitectNarrationContinue = true;
+        const ctx = SillyTavern.getContext();
+        if (typeof ctx.generate !== 'function') {
+            console.error('[RPG Tracker] Cannot continue after Map Architect text opener: generate() is unavailable.');
+            _pendingMapArchitectResult = null;
+            _mapArchitectNarrationContinue = false;
+            return true;
+        }
+        setTimeout(() => {
+            if (!ownsChat()) return;
+            void Promise.resolve(ctx.generate('continue')).catch(error => {
+                if (!ownsChat()) return;
+                console.error('[RPG Tracker] Continue after Map Architect text opener failed:', error);
+                _pendingMapArchitectResult = null;
+                _mapArchitectNarrationContinue = false;
+            });
+        }, 75);
+        return true;
+    } catch (error) {
+        if (!ownsChat()) return true;
+
+        _pendingMapArchitectResult = null;
+        _mapArchitectNarrationContinue = false;
+        console.error('[RPG Tracker] Map Architect text opener failed:', error);
+        return true;
+    } finally {
+        _mapArchitectTextOpenerBusy = false;
+    }
+}
+
+/**
+ * Backup path when GENERATION_ENDED never emits (ST only emits it if #mes_stop was visible).
+ * MESSAGE_RECEIVED still fires after the assistant message is saved.
+ */
+export async function onMapArchitectAssistantMessage(messageId, type) {
+    const ctx = SillyTavern.getContext();
+    const chat = Array.isArray(ctx?.chat) ? ctx.chat : [];
+    const message = Number.isInteger(messageId) ? chat[messageId] : null;
+    if (message?.is_user) return false;
+    return maybeRunMapArchitectTextOpener({
+        chat,
+        settings: getSettings(),
+        currentType: type || _lastGenerationType,
+        source: 'message_received',
+    });
+}
+
 function getLatestAssistantCandidate(chat) {
     if (!Array.isArray(chat)) return null;
     for (let i = chat.length - 1; i >= 0; i--) {
@@ -2122,9 +2869,16 @@ export function isLatestAssistantFromActiveChar(chat, ctx) {
 
 /**
  * Fires on GENERATION_STARTED. Stores the type of generation.
+ * ST also emits this for prompt-build dry runs — those must not look like a live turn.
  * @param {string} type
+ * @param {object} [_options]
+ * @param {boolean} [dryRun]
  */
-export function onGenerationStarted(type) {
+export function onGenerationStarted(type, _options, dryRun) {
+    if (dryRun === true) {
+        recordSchedulerEvent('generation_started_dry_run', { generationType: type ?? null });
+        return;
+    }
     _lastGenerationType = type;
     _rpgIsGenerating = true;
     recordSchedulerEvent('generation_started', { generationType: type ?? null });
@@ -2135,11 +2889,14 @@ let _lastTickDecision = null;
 
 /** In-memory counter: how many generations have fired since the agent last ran. Resets on chat change. */
 let _routerAutoTick = 0;
+/** Independent cadence counter for the Map Updater. */
+let _mapUpdaterAutoTick = 0;
 
 /** @returns {object} Live scheduler internals for debug snapshot. */
 export function getRouterSchedulerInternals() {
     return {
         routerAutoTick: _routerAutoTick,
+        mapUpdaterAutoTick: _mapUpdaterAutoTick,
         stateTrackerAutoTick: _stateTrackerAutoTick,
         lastGenerationType: _lastGenerationType,
         isGenerating: _rpgIsGenerating,
@@ -2161,6 +2918,12 @@ function incrementRouterAutoTick(reason, meta = {}) {
     document.dispatchEvent(new CustomEvent('rt_generation_tick'));
 }
 
+function setMapUpdaterAutoTick(value, reason, meta = {}) {
+    const tickBefore = _mapUpdaterAutoTick;
+    _mapUpdaterAutoTick = value;
+    recordSchedulerEvent('map_updater_tick_set', { tickBefore, tickAfter: value, reason, ...meta });
+}
+
 /** In-memory counter: how many generations have fired since the state tracker last ran. */
 let _stateTrackerAutoTick = 0;
 
@@ -2177,6 +2940,7 @@ let _pendingKeywordTriggered = [];
 export function resetRouterTick(clearKeywordPool = false) {
     const prevTick = _routerAutoTick;
     _routerAutoTick = 0;
+    _mapUpdaterAutoTick = 0;
     _stateTrackerAutoTick = 0;
     _pendingKeywordTriggered = [];
     _lastTickDecision = null;
@@ -2196,11 +2960,15 @@ export function resetRouterTick(clearKeywordPool = false) {
         // Reset the "since last run" watermark so the next auto-pass on the new chat
         // doesn't incorrectly skip content using the old chat's position.
         s.routerLastRunChatLength = 0;
+        s.mapUpdaterLastRunChatLength = 0;
     }
 }
 
 /** Returns how many auto-generations have fired since the Lorebook Agent last ran. */
 export function getRouterTick() { return _routerAutoTick; }
+
+/** Returns how many auto-generations have fired since the Map Updater last ran. */
+export function getMapUpdaterTick() { return _mapUpdaterAutoTick; }
 
 /** Reset the auto-run throttle counter (e.g. after a manual agent pass). */
 export function resetRouterAutoTick(reason = 'manual') {
@@ -2215,228 +2983,373 @@ export function resetRouterAutoTick(reason = 'manual') {
  * a hard circular dep — it will be a direct import once memo-processor.js exists.
  */
 export async function onGenerationEnded() {
-    _rpgIsGenerating = false;
-    // CYOA decoration is independent of tracker state. Finalize it before this
-    // handler awaits scanning or a State Tracker model pass.
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     try {
-        globalThis._rpgFinalizeCyoaNarratorRender?.();
-    } catch (error) {
-        console.warn('[RPG Tracker] CYOA render finalization failed:', error);
-    }
-    const settings = getSettings();
+        _rpgIsGenerating = false;
+        // CYOA decoration is independent of tracker state. Finalize it before this
+        // handler awaits scanning or a State Tracker model pass.
+        try {
+            globalThis._rpgFinalizeCyoaNarratorRender?.();
+        } catch (error) {
 
-    const isStateRunning = typeof globalThis._rpgStateModelRunning === 'function' && globalThis._rpgStateModelRunning();
-    const routerActive = !!settings.routerEnabled;
-    if ((!settings.enabled && !routerActive) || isStateRunning) {
-        recordSchedulerEvent('generation_ended_aborted', {
-            reason: (!settings.enabled && !routerActive) ? 'disabled' : 'state_running',
-            generationType: _lastGenerationType ?? null,
-        });
-        return;
-    }
-
-    // Check if the generation was for Impersonation or Quiet tasks.
-    // In these cases, the chat history did not actually change.
-    const currentType = _lastGenerationType;
-    recordSchedulerEvent('generation_ended_enter', {
-        generationType: currentType ?? null,
-        chatLength: SillyTavern.getContext()?.chat?.length ?? 0,
-        tickBefore: _routerAutoTick,
-    });
-    // Reset the tracker after a timeout (next tick) to handle synchronous multi-event triggers (e.g. ENDED + STOPPED)
-    setTimeout(() => {
-        _lastGenerationType = null;
-    }, 0);
-
-    if (currentType === 'impersonate' || currentType === 'quiet') {
-        if (settings.debugMode) {
-            console.log(`[RPG Tracker] Skipping State Tracker and Researcher passes for generation type: ${currentType}`);
+            console.warn('[RPG Tracker] CYOA render finalization failed:', error);
         }
-        recordSchedulerEvent('generation_ended_aborted', { reason: 'generation_type', generationType: currentType });
-        return;
-    }
+        const settings = getSettings();
+        const currentType = _lastGenerationType;
+        const ctx = SillyTavern.getContext();
+        const { chat } = ctx;
 
-    const ctx = SillyTavern.getContext();
-    const { chat } = ctx;
-
-    // Only auto-run State Tracker / Lorebook Agent when the latest assistant speaker is {{char}}.
-    // Fake announcement speakers (e.g. "System Notifications") must not tick run-every or fire passes.
-    if (!isLatestAssistantFromActiveChar(chat, ctx)) {
-        if (settings.debugMode) {
-            const last = getLatestAssistantCandidate(chat);
-            console.log('[RPG Tracker] Skipping auto ST/LA — latest speaker is not {{char}}:', last?.name || '(none)');
+        // Fence handshake beats ST/LA, including while a previous tracker pass is still running
+        // and even when the latest row is a tool-call system message.
+        if (chatCommitResult(ownsChat, await maybeRunMapArchitectTextOpener({ chat, settings, currentType, source: 'generation_ended' }))) {
+            recordSchedulerEvent('generation_ended_aborted', {
+                reason: 'map_architect_text_opener',
+                generationType: currentType ?? null,
+            });
+            setTimeout(() => { _lastGenerationType = null; }, 0);
+            return;
         }
-        recordSchedulerEvent('generation_ended_aborted', {
-            reason: 'non_char_speaker',
+
+        const isStateRunning = typeof globalThis._rpgStateModelRunning === 'function' && globalThis._rpgStateModelRunning();
+        const routerActive = isLorebookAgentRuntimeActive(settings);
+        if ((!settings.enabled && !routerActive) || isStateRunning) {
+            recordSchedulerEvent('generation_ended_aborted', {
+                reason: (!settings.enabled && !routerActive) ? 'disabled' : 'state_running',
+                generationType: currentType ?? null,
+            });
+            return;
+        }
+
+        // Check if the generation was for Impersonation or Quiet tasks.
+        // In these cases, the chat history did not actually change.
+        recordSchedulerEvent('generation_ended_enter', {
             generationType: currentType ?? null,
-            speaker: getLatestAssistantCandidate(chat)?.name || null,
-            activeChar: ctx?.name2 || null,
+            chatLength: SillyTavern.getContext()?.chat?.length ?? 0,
+            tickBefore: _routerAutoTick,
         });
-        return;
-    }
+        // Reset the tracker after a timeout (next tick) to handle synchronous multi-event triggers (e.g. ENDED + STOPPED)
+        setTimeout(() => {
+            _lastGenerationType = null;
+        }, 0);
 
-    const combinedNarrative = getNarrativeBlocks(chat, -1, !!settings.routerIncludeHidden);
-    if (!combinedNarrative) {
-        recordSchedulerEvent('generation_ended_aborted', { reason: 'no_narrative', generationType: currentType ?? null });
-        return;
-    }
-
-    // Narrator-regex relationship awards are read directly from chat and do not
-    // require either agent to run. Apply them before the shared pause boundary.
-    if (shouldProcessRegexRelationshipUpdates(settings)) {
-        await handleRelationshipSwipeChange();
-    }
-
-    // Pausing still suppresses State Tracker, Lorebook Agent, keyword scanning,
-    // world progression, and their tracker-based relationship command path.
-    if (settings.paused) {
-        recordSchedulerEvent('generation_ended_aborted', {
-            reason: 'paused',
-            generationType: currentType ?? null,
-        });
-        return;
-    }
-
-    // Real-Time Visualization: scene art every-N / location-change (independent of router throttle).
-    // Defer one tick so the new assistant message is in chat before we count outputs.
-    setTimeout(() => {
-        if (typeof globalThis._rpgCheckRealtimeSceneArt === 'function') {
-            void globalThis._rpgCheckRealtimeSceneArt();
-        }
-    }, 0);
-
-    if (settings.debugMode) console.log("[RPG Tracker] Assistant generation ended. Running keyword scanner...");
-
-    // Step 1: Scan assistant output for entry keywords and activate matches immediately.
-    // Must run before the state model pass and on EVERY generation, regardless of throttle,
-    // so entries are never one turn behind the narrator even when the agent is skipped.
-    // Skipped when routerNativeKeywordActivation is enabled (native ST system handles keywords).
-    if (settings.routerEnabled && !settings.routerNativeKeywordActivation) {
-        const thisGenTriggered = await scanAssistantOutputForKeywords(combinedNarrative);
-        if (thisGenTriggered.length > 0) {
-            // Accumulate across throttled turns — deduplicate so IDs are not repeated.
-            const accumulated = new Set([..._pendingKeywordTriggered, ...thisGenTriggered]);
-            _pendingKeywordTriggered = [...accumulated];
+        if (currentType === 'impersonate' || currentType === 'quiet') {
             if (settings.debugMode) {
-                console.log("[RPG Tracker] Keyword scanner activated entries:", thisGenTriggered, "| Pending total:", _pendingKeywordTriggered.length);
+                console.log(`[RPG Tracker] Skipping State Tracker and Researcher passes for generation type: ${currentType}`);
+            }
+            recordSchedulerEvent('generation_ended_aborted', { reason: 'generation_type', generationType: currentType });
+            return;
+        }
+
+        // Only auto-run State Tracker / Lorebook Agent when the latest assistant speaker is {{char}}.
+        // Fake announcement speakers (e.g. "System Notifications") must not tick run-every or fire passes.
+        if (!isLatestAssistantFromActiveChar(chat, ctx)) {
+            if (settings.debugMode) {
+                const last = getLatestAssistantCandidate(chat);
+                console.log('[RPG Tracker] Skipping auto ST/LA — latest speaker is not {{char}}:', last?.name || '(none)');
+            }
+            recordSchedulerEvent('generation_ended_aborted', {
+                reason: 'non_char_speaker',
+                generationType: currentType ?? null,
+                speaker: getLatestAssistantCandidate(chat)?.name || null,
+                activeChar: ctx?.name2 || null,
+            });
+            return;
+        }
+
+        // Persist a newly generated initial map immediately, before the Lorebook
+        // Agent pass. Swipe/regenerate outputs are provisional and are captured
+        // only after the replacement becomes the selected response.
+        if (isLocationMappingEnabled(settings)
+            && !['swipe', 'regenerate'].includes(String(currentType || '').toLowerCase())) {
+            try {
+                // Pin before lorebook awaits: live prefix / settings become the arriving chat after switch.
+                const passChatId = getActiveChatId();
+                const capture = chatCommitResult(ownsChat, await syncDungeonMapsToLocationLorebook(chat, {
+                    capture: true,
+                    chatId: passChatId,
+                }));
+                if (capture.changed) {
+                    console.info(`[RPG Tracker] Attached ${capture.capturedMaps} dungeon map(s) to root Location lorebook entries.`);
+                }
+                for (const error of capture.errors || []) {
+                    console.error(`[RPG Tracker] Dungeon Reality capture failed: ${error}.`);
+                }
+                if (!canCommitPassForChat(passChatId, getActiveChatId()) || capture.ownsChat === false) {
+                    recordSchedulerEvent('generation_ended_aborted', {
+                        reason: 'chat_changed',
+                        generationType: currentType ?? null,
+                        stage: 'dungeon_map_capture',
+                    });
+                    return;
+                }
+                const state = { version: 3, sites: capture.sites || {} };
+                syncDungeonLoreAgentActivation(settings, state, findLatestDungeonLocation(chat));
+            } catch (error) {
+                if (!ownsChat()) return;
+
+                console.error('[RPG Tracker] Could not persist the dungeon map to the Locations lorebook:', error);
+            }
+        }
+
+        const combinedNarrative = getNarrativeBlocks(chat, -1, !!settings.routerIncludeHidden);
+        if (!combinedNarrative) {
+            recordSchedulerEvent('generation_ended_aborted', { reason: 'no_narrative', generationType: currentType ?? null });
+            return;
+        }
+
+        // Narrator-regex relationship awards are read directly from chat and do not
+        // require either agent to run. Apply them before the shared pause boundary.
+        if (shouldProcessRegexRelationshipUpdates(settings)) {
+            chatCommitResult(ownsChat, await handleRelationshipSwipeChange());
+        }
+
+        // Pausing still suppresses State Tracker, Lorebook Agent, keyword scanning,
+        // world progression, and their tracker-based relationship command path.
+        if (settings.paused) {
+            recordSchedulerEvent('generation_ended_aborted', {
+                reason: 'paused',
+                generationType: currentType ?? null,
+            });
+            return;
+        }
+
+        // Real-Time Visualization: scene art every-N / location-change (independent of router throttle).
+        // Defer one tick so the new assistant message is in chat before we count outputs.
+        setTimeout(() => {
+            if (!ownsChat()) return;
+            if (typeof globalThis._rpgCheckRealtimeSceneArt === 'function') {
+                void globalThis._rpgCheckRealtimeSceneArt();
+            }
+        }, 0);
+
+        if (settings.debugMode) console.log("[RPG Tracker] Assistant generation ended. Running keyword scanner...");
+
+        // Step 1: Scan assistant output for entry keywords and activate matches immediately.
+        // Must run before the state model pass and on EVERY generation, regardless of throttle,
+        // so entries are never one turn behind the narrator even when the agent is skipped.
+        // Skipped when routerNativeKeywordActivation is enabled (native ST system handles keywords).
+        if (isLorebookAgentRuntimeActive(settings) && !settings.routerNativeKeywordActivation) {
+            const thisGenTriggered = chatCommitResult(ownsChat, await scanAssistantOutputForKeywords(combinedNarrative));
+            if (thisGenTriggered.length > 0) {
+                // Accumulate across throttled turns — deduplicate so IDs are not repeated.
+                const accumulated = new Set([..._pendingKeywordTriggered, ...thisGenTriggered]);
+                _pendingKeywordTriggered = [...accumulated];
+                if (settings.debugMode) {
+                    console.log("[RPG Tracker] Keyword scanner activated entries:", thisGenTriggered, "| Pending total:", _pendingKeywordTriggered.length);
+                }
+
+                // Trigger UI refresh
+                if (typeof globalThis._rpgRenderRouterUI === 'function') {
+                    globalThis._rpgRenderRouterUI();
+                }
+            }
+        }
+
+        if (settings.enabled) {
+            // State Tracker pass — throttled by stateTrackerRunEvery.
+            const stateRunEvery = settings.stateTrackerRunEvery || 1;
+            _stateTrackerAutoTick++;
+            if (_stateTrackerAutoTick >= stateRunEvery) {
+                _stateTrackerAutoTick = 0;
+                if (settings.debugMode) console.log("[RPG Tracker] Triggering State Model pass...", combinedNarrative);
+                if (typeof globalThis._rpgRunStateModelPass === 'function') {
+                    chatCommitResult(ownsChat, await globalThis._rpgRunStateModelPass(combinedNarrative));
+                }
+            } else {
+                if (settings.debugMode) console.log(`[RPG Tracker] State Tracker skipped (tick ${_stateTrackerAutoTick}/${stateRunEvery}).`);
             }
 
-            // Trigger UI refresh
-            if (typeof globalThis._rpgRenderRouterUI === 'function') {
-                globalThis._rpgRenderRouterUI();
+            // Step 2b: Combat main-profile auto-switch — check raw memo after State Tracker (or on existing memo if throttled).
+            try {
+                chatCommitResult(ownsChat, await syncCombatProfile(getSettings().currentMemo, settings));
+            } catch (e) {
+                if (!ownsChat()) return;
+
+                console.warn('[RPG Tracker] Combat profile sync failed:', e);
+            }
+
+            try {
+                chatCommitResult(ownsChat, await globalThis._rpgSyncDynamicRngPrompt?.(getSettings().currentMemo, settings));
+            } catch (e) {
+                if (!ownsChat()) return;
+
+                console.warn('[RPG Tracker] Dynamic RNG prompt sync failed:', e);
+            }
+
+            // Re-check scene art after State Tracker may have updated location in memo.
+            if (typeof globalThis._rpgCheckRealtimeSceneArt === 'function') {
+                void globalThis._rpgCheckRealtimeSceneArt();
             }
         }
-    }
 
-    if (settings.enabled) {
-        // State Tracker pass — throttled by stateTrackerRunEvery.
-        const stateRunEvery = settings.stateTrackerRunEvery || 1;
-        _stateTrackerAutoTick++;
-        if (_stateTrackerAutoTick >= stateRunEvery) {
-            _stateTrackerAutoTick = 0;
-            if (settings.debugMode) console.log("[RPG Tracker] Triggering State Model pass...", combinedNarrative);
-            if (typeof globalThis._rpgRunStateModelPass === 'function') {
-                await globalThis._rpgRunStateModelPass(combinedNarrative);
+        // Map Updater cadence is independent of Lorebook Agent. It can run every turn
+        // while LA stays on a slower record/relationship schedule. Occupancy runs before
+        // World Progression / Map Evolution so Evolution cannot move something play just destroyed.
+        const countsTowardRunEvery = currentType !== 'swipe' && currentType !== 'regenerate';
+        const mapEvery = Math.max(1, Number(settings.mapUpdaterRunEvery) || 1);
+        if (countsTowardRunEvery) {
+            const mapTickBefore = _mapUpdaterAutoTick;
+            _mapUpdaterAutoTick++;
+            recordSchedulerEvent('map_updater_tick_inc', {
+                tickBefore: mapTickBefore,
+                tickAfter: _mapUpdaterAutoTick,
+                generationType: currentType ?? null,
+            });
+            document.dispatchEvent(new CustomEvent('rt_generation_tick'));
+        }
+        const mapUpdaterAvailable = countsTowardRunEvery
+            && settings.mapUpdaterEnabled !== false
+            && isLocationMappingEnabled(settings);
+        const forceBuildingPopulation = mapUpdaterAvailable && chatCommitResult(ownsChat, await shouldForceBuildingPopulationPass());
+        const shouldTryMapUpdater = mapUpdaterAvailable
+            && (_mapUpdaterAutoTick >= mapEvery || forceBuildingPopulation);
+
+        let exitResult = null;
+        let holdExitBookkeeping = false;
+        let currentRoot = '';
+        let exitDeferredWatermark = false;
+        if (mapUpdaterAvailable) {
+            currentRoot = chatCommitResult(ownsChat, await getActiveMapUpdaterSiteRoot());
+            const previousRoot = String(settings.mapUpdaterLastSiteRoot || '').trim();
+            let pendingExitRoot = String(settings.mapUpdaterPendingExitRoot || '').trim();
+            const rootsDiffer = normalizeDungeonLabel(previousRoot) !== normalizeDungeonLabel(currentRoot);
+            let bookkeepingChanged = false;
+
+            if (!pendingExitRoot && previousRoot && rootsDiffer) {
+                pendingExitRoot = previousRoot;
+                settings.mapUpdaterPendingExitRoot = previousRoot;
+                bookkeepingChanged = true;
             }
-        } else {
-            if (settings.debugMode) console.log(`[RPG Tracker] State Tracker skipped (tick ${_stateTrackerAutoTick}/${stateRunEvery}).`);
+
+            if (pendingExitRoot) {
+                exitDeferredWatermark = shouldTryMapUpdater;
+                exitResult = chatCommitResult(ownsChat, await runMapUpdaterPass({
+                    siteRoot: pendingExitRoot,
+                    trigger: 'site_exit',
+                    deferWatermark: exitDeferredWatermark,
+                }));
+                holdExitBookkeeping = exitResult?.skipped === 'busy' || exitResult?.skipped === 'stopped';
+                if (!holdExitBookkeeping) {
+                    settings.mapUpdaterPendingExitRoot = '';
+                    settings.mapUpdaterLastSiteRoot = currentRoot;
+                    bookkeepingChanged = true;
+                }
+                recordSchedulerEvent('map_updater_exit_pass', {
+                    siteRoot: pendingExitRoot,
+                    currentRoot: currentRoot || null,
+                    skipped: exitResult?.skipped || null,
+                    ok: exitResult?.ok === true,
+                    noop: exitResult?.noop === true,
+                    pending: holdExitBookkeeping,
+                });
+            } else if (normalizeDungeonLabel(previousRoot) !== normalizeDungeonLabel(currentRoot)) {
+                settings.mapUpdaterLastSiteRoot = currentRoot;
+                bookkeepingChanged = true;
+            }
+
+            if (bookkeepingChanged) persistMapUpdaterState();
         }
 
-        // Step 2b: Combat main-profile auto-switch — check raw memo after State Tracker (or on existing memo if throttled).
-        try {
-            await syncCombatProfile(getSettings().currentMemo, settings);
-        } catch (e) {
-            console.warn('[RPG Tracker] Combat profile sync failed:', e);
+        let mapResult = null;
+        if (shouldTryMapUpdater && !holdExitBookkeeping) {
+            const exitStampedSwipe = exitResult?.ok === true && exitResult?.noop !== true;
+            mapResult = chatCommitResult(ownsChat, await runMapUpdaterPass({ stampSwipe: !exitStampedSwipe }));
+            const skipped = mapResult?.skipped;
+            if (exitDeferredWatermark && skipped) {
+                persistMapUpdaterLastRunWatermark(ctx.chat?.length || 0);
+                persistMapUpdaterLastRunTimestamp();
+            }
+            if (!skipped || !['no_active_map', 'dungeon_reality_off', 'location_mapping_off', 'disabled', 'busy'].includes(skipped)) {
+                setMapUpdaterAutoTick(0, 'map_updater_fire_threshold', { generationType: currentType ?? null, runEvery: mapEvery });
+            }
+            recordSchedulerEvent('map_updater_pass', {
+                skipped: skipped || null,
+                ok: mapResult?.ok === true,
+                noop: mapResult?.noop === true,
+                forcedBuildingPopulation: forceBuildingPopulation,
+                afterExit: !!exitResult,
+            });
         }
 
-        try {
-            await globalThis._rpgSyncDynamicRngPrompt?.(getSettings().currentMemo, settings);
-        } catch (e) {
-            console.warn('[RPG Tracker] Dynamic RNG prompt sync failed:', e);
-        }
+        // World Progression then Map Evolution — TIME is already on the memo; occupancy is current.
+        chatCommitResult(ownsChat, await maybeRunWorldProgression());
+        chatCommitResult(ownsChat, await maybeRunMapEvolution());
 
-        // Re-check scene art after State Tracker may have updated location in memo.
-        if (typeof globalThis._rpgCheckRealtimeSceneArt === 'function') {
-            void globalThis._rpgCheckRealtimeSceneArt();
-        }
-    }
+        // Step 4: Run-every throttle — only fire the Lorebook Agent every N new turns.
+        // Swipe/regenerate generations reuse an existing message slot and must not advance the
+        // counter (otherwise swiping through alternatives walks the cycle forward normally).
+        // Use a denylist rather than an allowlist: a fresh send may report its type as 'normal',
+        // '', or undefined depending on the entry path, but swipes/regens are always explicit.
+        // (impersonate/quiet already returned earlier and never reach here.)
+        const runEvery = settings.routerRunEvery || 1;
+        const tickBefore = _routerAutoTick;
 
-    // Step 3: World Progression deterministic check — runs AFTER the State Tracker has updated
-    // currentMemo, so the [TIME] block reflects the current in-world clock.
-    await maybeRunWorldProgression();
-
-    // Step 4: Run-every throttle — only fire the Lorebook Agent every N new turns.
-    // Swipe/regenerate generations reuse an existing message slot and must not advance the
-    // counter (otherwise swiping through alternatives walks the cycle forward normally).
-    // Use a denylist rather than an allowlist: a fresh send may report its type as 'normal',
-    // '', or undefined depending on the entry path, but swipes/regens are always explicit.
-    // (impersonate/quiet already returned earlier and never reach here.)
-    const countsTowardRunEvery = currentType !== 'swipe' && currentType !== 'regenerate';
-    const runEvery = settings.routerRunEvery || 1;
-    const tickBefore = _routerAutoTick;
-
-    _lastTickDecision = {
-        at: Date.now(),
-        generationType: currentType ?? null,
-        countsTowardRunEvery,
-        tickBefore,
-        runEvery,
-    };
-
-    recordSchedulerEvent('run_every_eval', {
-        generationType: currentType ?? null,
-        countsTowardRunEvery,
-        tickBefore,
-        runEvery,
-        nextInIfInc: countsTowardRunEvery ? Math.max(0, runEvery - (tickBefore + 1)) : Math.max(0, runEvery - tickBefore),
-    });
-
-    if (countsTowardRunEvery) {
-        incrementRouterAutoTick('generation_ended', { generationType: currentType ?? null });
-    } else {
-        recordSchedulerEvent('router_tick_skipped', {
+        _lastTickDecision = {
+            at: Date.now(),
             generationType: currentType ?? null,
-            reason: 'denylist_swipe_or_regenerate',
-            tick: _routerAutoTick,
-        });
-    }
-
-    if (!countsTowardRunEvery || _routerAutoTick < runEvery) {
-        _lastTickDecision = { ..._lastTickDecision, action: 'hold', tickAfter: _routerAutoTick };
-        recordSchedulerEvent('lore_agent_hold', {
-            reason: !countsTowardRunEvery ? 'generation_type_excluded' : 'below_threshold',
-            tick: _routerAutoTick,
+            countsTowardRunEvery,
+            tickBefore,
             runEvery,
+        };
+
+        recordSchedulerEvent('run_every_eval', {
+            generationType: currentType ?? null,
+            countsTowardRunEvery,
+            tickBefore,
+            runEvery,
+            nextInIfInc: countsTowardRunEvery ? Math.max(0, runEvery - (tickBefore + 1)) : Math.max(0, runEvery - tickBefore),
         });
-        return;
-    }
 
-    setRouterAutoTick(0, 'lore_agent_fire_threshold', { generationType: currentType ?? null, runEvery });
-    _lastTickDecision = { ..._lastTickDecision, action: 'fire', tickAfter: 0 };
-
-    // Step 5: Lorebook Agent pass — passes the full accumulated set of keyword-triggered IDs
-    // from all throttled turns since the last agent run (not just the current generation).
-    if (settings.routerWatermarkBaselinePending) {
-        settings.routerWatermarkBaselinePending = false;
-        persistRouterLastRunWatermark(chat.length);
-        recordSchedulerEvent('lore_agent_watermark_baseline', { chatLength: chat.length });
-        if (settings.debugMode) {
-            console.log('[RPG Tracker] Lorebook Agent watermark baselined at chat.length', chat.length);
+        if (countsTowardRunEvery) {
+            incrementRouterAutoTick('generation_ended', { generationType: currentType ?? null });
+        } else {
+            recordSchedulerEvent('router_tick_skipped', {
+                generationType: currentType ?? null,
+                reason: 'denylist_swipe_or_regenerate',
+                tick: _routerAutoTick,
+            });
         }
-        return;
-    }
-    recordSchedulerEvent('lore_agent_fire', {
-        generationType: currentType ?? null,
-        chatLength: chat.length,
-        pendingKeywords: _pendingKeywordTriggered.length,
-    });
-    const triggeredForAgent = [..._pendingKeywordTriggered];
-    _pendingKeywordTriggered = []; // reset accumulator now that the agent is about to process them
-    await runRouterPass(combinedNarrative, null, null, false, triggeredForAgent);
 
-    // Step 6: Re-check World Progression after the Lorebook Agent — an overlapping agent
-    // run from a prior generation may have blocked the pre-agent check.
-    await maybeRunWorldProgression();
+        if (!countsTowardRunEvery || _routerAutoTick < runEvery) {
+            _lastTickDecision = { ..._lastTickDecision, action: 'hold', tickAfter: _routerAutoTick };
+            recordSchedulerEvent('lore_agent_hold', {
+                reason: !countsTowardRunEvery ? 'generation_type_excluded' : 'below_threshold',
+                tick: _routerAutoTick,
+                runEvery,
+            });
+            return;
+        }
+
+        setRouterAutoTick(0, 'lore_agent_fire_threshold', { generationType: currentType ?? null, runEvery });
+        _lastTickDecision = { ..._lastTickDecision, action: 'fire', tickAfter: 0 };
+
+        // Step 5: Lorebook Agent pass — passes the full accumulated set of keyword-triggered IDs
+        // from all throttled turns since the last agent run (not just the current generation).
+        if (settings.routerWatermarkBaselinePending) {
+            settings.routerWatermarkBaselinePending = false;
+            persistRouterLastRunWatermark(chat.length);
+            recordSchedulerEvent('lore_agent_watermark_baseline', { chatLength: chat.length });
+            if (settings.debugMode) {
+                console.log('[RPG Tracker] Lorebook Agent watermark baselined at chat.length', chat.length);
+            }
+            return;
+        }
+        recordSchedulerEvent('lore_agent_fire', {
+            generationType: currentType ?? null,
+            chatLength: chat.length,
+            pendingKeywords: _pendingKeywordTriggered.length,
+        });
+        const triggeredForAgent = [..._pendingKeywordTriggered];
+        _pendingKeywordTriggered = []; // reset accumulator now that the agent is about to process them
+        chatCommitResult(ownsChat, await runRouterPass(combinedNarrative, null, null, false, triggeredForAgent));
+
+        // Step 6: Re-check World Progression after the Lorebook Agent — an overlapping agent
+        // run from a prior generation may have blocked the pre-agent check.
+        chatCommitResult(ownsChat, await maybeRunWorldProgression());
+
+    } catch (error) {
+        if (ownsChat()) throw error;
+    }
 }
 
 // ── World Progression deterministic trigger ─────────────────────────────────────────
@@ -2448,7 +3361,7 @@ export async function onGenerationEnded() {
  */
 async function maybeRunWorldProgression() {
     const settings = getSettings();
-    if (!settings.worldProgressionEnabled || !settings.routerEnabled) return;
+    if (!settings.worldProgressionEnabled || !isLorebookAgentRuntimeActive(settings)) return;
     if (!settings.currentMemo) return;
 
     // Extract time string from the [TIME] block

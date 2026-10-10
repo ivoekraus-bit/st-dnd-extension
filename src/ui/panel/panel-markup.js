@@ -1,4 +1,6 @@
 /** Produces the static Tracker and Lorebook Agent panel structure. */
+import { AGENT_TERMINAL_TABS, resolveActiveTerminalTab } from './agent-terminal.js';
+
 export function buildPanelMarkup({ settings, agentPanelCollapsedClass }) {
     return `
             <div class="rt-resizer-tr" id="rt-resizer-tr" title="Resize from top-right"></div>
@@ -14,13 +16,13 @@ export function buildPanelMarkup({ settings, agentPanelCollapsedClass }) {
                 </div>
                 <div class="rpg-tracker-header-center" id="rpg-tracker-pause-banner"></div>
                 <div class="rpg-tracker-header-right">
+                    <button type="button" class="rpg-tracker-icon-btn" id="rpg-tracker-settings-btn" title="Open Settings"><i class="fa-solid fa-wrench" aria-hidden="true"></i></button>
                     <button class="rpg-tracker-icon-btn rt-tutorial-help-btn" id="rpg-tracker-help-btn" title="CHAT">CHAT</button>
                     <button class="rpg-tracker-icon-btn" id="rpg-tracker-view-btn" title="Toggle rendered view">⊞</button>
-                    <button class="rpg-tracker-icon-btn" id="rpg-tracker-enable-btn" title="${settings.enabled ? 'Disable State Tracker' : 'Enable State Tracker'}" style="${settings.enabled ? '' : 'opacity:0.4;'}" >⏻</button>
+                    <button class="rpg-tracker-icon-btn" id="rpg-tracker-enable-btn" title="${settings.enabled ? 'Disable Multihog Framework' : 'Enable Multihog Framework'}" style="${settings.enabled ? '' : 'opacity:0.4;'}" >⏻</button>
                     <button class="rpg-tracker-icon-btn" id="rpg-tracker-update-btn" title="Update State Now">🔄</button>
                     <button class="rpg-tracker-icon-btn" id="rpg-tracker-pause-btn" title="Pause Tracker">⏸</button>
                     <button class="rpg-tracker-icon-btn" id="rpg-tracker-portraits-menu-btn" title="AI Portrait Actions">🖼️</button>
-                    <button class="rpg-tracker-icon-btn" id="rpg-tracker-debug-btn" title="Context Debugger" style="display:none;">🛠️</button>
                     <button class="rpg-tracker-icon-btn rt-overflow-trigger" id="rt-overflow-btn" title="More actions">⋯</button>
                     <button class="rpg-tracker-icon-btn" id="rpg-tracker-collapse-btn" title="Collapse Panel"><i class="fa-solid ${settings.trackerCollapsed ? 'fa-chevron-down' : 'fa-chevron-up'}"></i></button>
                     <button class="rpg-tracker-icon-btn" id="rpg-tracker-close-btn" title="Hide panel">✕</button>
@@ -28,11 +30,18 @@ export function buildPanelMarkup({ settings, agentPanelCollapsedClass }) {
                 </div>
                 <div class="rt-header-face rt-header-face-inactive" id="rt-header-face-agent">
                     <div class="rpg-tracker-header-left">
-                        <i class="fa-solid fa-robot"></i> <span>Lorebook Agent: Autonomous Librarian</span>
+                        <i class="fa-solid fa-robot"></i> <span>Lorebook Agent &amp; Maps</span>
                     </div>
                     <div class="rpg-tracker-header-center" id="rt-agent-pause-banner" style="color:#ffa500; font-size:0.7em; font-weight:bold; letter-spacing:0.04em;">${settings.routerPaused ? 'AGENT PAUSED' : ''}</div>
                     <div class="rpg-tracker-header-right">
-                        <button class="rpg-tracker-icon-btn" id="rt-agent-router-manual-run" title="Run Research Now" style="color: var(--rt-accent);"><i class="fa-solid fa-play"></i></button>
+                        <div id="rt-research-menu-wrap" style="position:relative; display:inline-flex;">
+                            <button class="rpg-tracker-icon-btn" id="rt-agent-router-manual-run" title="Run Research Now — Lorebook Agent, Map Updater, or Map Evolution" style="color: var(--rt-accent);"><i class="fa-solid fa-play"></i></button>
+                            <div id="rt-research-dropdown" class="rt-update-menu rt-research-dropdown" style="display:none;">
+                                <div class="rt-menu-item" id="rt-research-lorebook"><b>Lorebook Agent</b><small>NPCs, locations, relationships</small></div>
+                                <div class="rt-menu-item" id="rt-research-map-updater"><b>Map Updater</b><small>Dungeon and town occupancy</small></div>
+                                <div class="rt-menu-item" id="rt-research-map-evolution"><b>Map Evolution</b><small>Pick maps to evolve now</small></div>
+                            </div>
+                        </div>
                         <button class="rpg-tracker-stop-btn" id="rt-agent-stop-btn" title="Stop Agent" style="display:none;">■</button>
                         <button class="rpg-tracker-icon-btn" id="rt-agent-router-full-audit-panel" title="Run Full Audit (Chunked)" style="color: #ff5555;"><i class="fa-solid fa-book-journal-whills"></i></button>
                          <div id="rt-cleanup-menu-wrap" style="position:relative; display:inline-flex;">
@@ -55,7 +64,6 @@ export function buildPanelMarkup({ settings, agentPanelCollapsedClass }) {
                                  </div>
                              </div>
                          </div>
-                        <button class="rpg-tracker-icon-btn" id="rt-agent-router-enable-btn" title="${settings.routerEnabled ? 'Disable Lorebook Agent' : 'Enable Lorebook Agent'}" style="${settings.routerEnabled ? '' : 'opacity:0.35;'}">⏻</button>
                         <button class="rpg-tracker-icon-btn" id="rt-agent-router-pause-btn" title="${settings.routerPaused ? 'Resume Agent (auto-runs paused)' : 'Pause Agent (skip auto-runs)'}" style="${settings.routerPaused ? 'color:#ffa500;' : ''}">${settings.routerPaused ? '▶' : '⏸'}</button>
                         <button class="rpg-tracker-icon-btn" id="rt-agent-router-detach" title="Detach Lorebook Agent">⧉</button>
                         <button class="rpg-tracker-icon-btn" id="rt-agent-router-collapse-btn" title="Collapse Panel"><i class="fa-solid ${settings.agentCollapsed ? 'fa-chevron-down' : 'fa-chevron-up'}"></i></button>
@@ -71,13 +79,14 @@ export function buildPanelMarkup({ settings, agentPanelCollapsedClass }) {
                     </div>
                     <div class="rt-agent-view-mode-switch rt-panel-mode-switch" id="rt-panel-mode-switch" role="tablist" aria-label="Panel content mode">
                         <button type="button" id="rt-panel-mode-tracker" class="rt-agent-view-mode-btn rt-agent-view-mode-btn-active" role="tab" aria-selected="true">State Tracker</button>
-                        <button type="button" id="rt-panel-mode-agent" class="rt-agent-view-mode-btn" role="tab" aria-selected="false">Lorebook Agent</button>
+                        <button type="button" id="rt-panel-mode-agent" class="rt-agent-view-mode-btn" role="tab" aria-selected="false">Lorebook Agent &amp; Maps</button>
                     </div>
                 </div>
                 <div class="rt-panel-mode-pane" id="rt-panel-tracker-pane">
                 <textarea class="rpg-tracker-memo-area" id="rpg-tracker-memo">${settings.currentMemo}</textarea>
                 <div class="rpg-tracker-render-view" id="rpg-tracker-render" style="display:none;"></div>
                 <div class="rt-tutorial-view" id="rt-tutorial-view" style="display:none;" aria-label="CHAT"></div>
+                <div class="rt-bottom-xp-bar" id="rt-bottom-xp-bar" style="display:none;" aria-label="Experience progress"></div>
                 </div>
                 <div class="rt-panel-mode-pane" id="rt-panel-agent-pane" style="display:none;">
             <div class="rpg-tracker-panel rpg-tracker-agent-panel rt-agent-integrated ${agentPanelCollapsedClass}${settings.trackerTheme || 'rt-theme-native'}" id="rpg-tracker-agent">
@@ -133,6 +142,11 @@ export function buildPanelMarkup({ settings, agentPanelCollapsedClass }) {
                                 <input type="text" inputmode="numeric" pattern="[0-9]*" id="rt-agent-router-run-every" value="${settings.routerRunEvery || 3}" min="1" max="50" style="width: 40px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); color: white; border-radius: 3px; text-align: center; font-size: 0.769em; padding: 1px;">
                                 <span style="font-size: 0.769em; opacity: 0.5;">msgs</span>
                             </div>
+                            <div style="display: flex; align-items: center; gap: 6px; flex: 1;" title="Map Updater cadence while inside a mapped dungeon or settlement. Independent of Lorebook Agent. 1 = occupancy updates every turn.">
+                                <span style="font-size: 0.769em; opacity: 0.7;">Map every:</span>
+                                <input type="text" inputmode="numeric" pattern="[0-9]*" id="rt-agent-map-updater-run-every" value="${settings.mapUpdaterRunEvery ?? 1}" min="1" max="50" style="width: 40px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); color: white; border-radius: 3px; text-align: center; font-size: 0.769em; padding: 1px;">
+                                <span style="font-size: 0.769em; opacity: 0.5;">msgs</span>
+                            </div>
                         </div>
 
                         <label style="display: flex; align-items: center; gap: 5px; margin-bottom: 10px; cursor: pointer; font-size: 0.769em; opacity: 0.75;" title="Include hidden messages (e.g. messages collapsed by a summarizer) in the agent's lookback window.">
@@ -152,11 +166,11 @@ export function buildPanelMarkup({ settings, agentPanelCollapsedClass }) {
                             </div>
                             <div style="flex: 1;" title="Max Active Keys: The maximum number of lore entries the agent can keep in Active Memory. Once reached, it must deactivate old entries to add new ones.">
                                 <div style="margin-bottom: 5px; opacity: 0.8; font-size: 0.846em; color: var(--rt-text-muted);">Max Active Keys:</div>
-                                <input type="text" inputmode="numeric" pattern="[0-9]*" id="rt-agent-router-max-activations" value="${settings.routerMaxActivations || 8}" min="1" max="20" style="width: 100%; background: var(--rt-card-bg); color: var(--rt-text); border: var(--rt-border); border-radius: 4px; padding: 4px; font-size: 0.846em; box-sizing: border-box;">
+                                <input type="text" inputmode="numeric" pattern="[0-9]*" id="rt-agent-router-max-activations" value="${settings.routerMaxActivations || 12}" min="1" max="20" style="width: 100%; background: var(--rt-card-bg); color: var(--rt-text); border: var(--rt-border); border-radius: 4px; padding: 4px; font-size: 0.846em; box-sizing: border-box;">
                             </div>
-                            <div style="flex: 1;" title="Keyword Overflow Cap: max keyword-triggered entries allowed above Max Active Keys (0 = no cap). When exceeded, the oldest keyword entries are evicted first. Example: Max Active=8, Cap=4 → hard ceiling of 12 total.">
+                            <div style="flex: 1;" title="Keyword Overflow Cap: max keyword-triggered entries allowed above Max Active Keys (0 = no cap). When exceeded, the oldest keyword entries are evicted first. Example: Max Active=12, Cap=6 → hard ceiling of 18 total.">
                                 <div style="margin-bottom: 5px; opacity: 0.8; font-size: 0.846em; color: var(--rt-text-muted); line-height: 1.2;">Keyword Overflow Cap<br><span style="font-size: 0.75em; opacity: 0.5; font-weight: normal;">(0 = no cap)</span>:</div>
-                                <input type="text" inputmode="numeric" pattern="[0-9]*" id="rt-agent-router-kw-overflow-cap" value="${settings.routerMaxKeywordOverflow ?? 0}" min="0" max="50" style="width: 100%; background: var(--rt-card-bg); color: var(--rt-text); border: var(--rt-border); border-radius: 4px; padding: 4px; font-size: 0.846em; box-sizing: border-box;">
+                                <input type="text" inputmode="numeric" pattern="[0-9]*" id="rt-agent-router-kw-overflow-cap" value="${settings.routerMaxKeywordOverflow ?? 6}" min="0" max="50" style="width: 100%; background: var(--rt-card-bg); color: var(--rt-text); border: var(--rt-border); border-radius: 4px; padding: 4px; font-size: 0.846em; box-sizing: border-box;">
                             </div>
                         </div>
                         
@@ -181,23 +195,87 @@ export function buildPanelMarkup({ settings, agentPanelCollapsedClass }) {
                         <button id="rt-agent-add-custom-tag" style="width: 100%; background: #333; border: 1px solid #444; color: #ddd; font-size: 0.769em; padding: 2px; border-radius: 3px; cursor: pointer; margin-top: 4px; flex-shrink: 0;">+ Add Custom Tag</button>
                     </div>
 
-                    <!-- Console Collapsible Header -->
+                    <!-- Terminal/Direct Prompt Collapsible Header -->
                     <div id="rt-agent-console-header" style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; cursor: pointer; padding-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.08); user-select: none; flex-shrink: 0;">
                         <div style="font-weight: bold; font-size: 0.846em; display: flex; align-items: center; gap: 6px; color: var(--rt-text-muted);">
-                            <i class="fa-solid ${settings.agentConsoleOpen !== false ? 'fa-chevron-down' : 'fa-chevron-right'}" id="rt-agent-console-toggle-icon"></i> Console
+                            <i class="fa-solid ${settings.agentConsoleOpen !== false ? 'fa-chevron-down' : 'fa-chevron-right'}" id="rt-agent-console-toggle-icon"></i> Terminal/Direct Prompt
                         </div>
                     </div>
 
-                    <!-- Console Section Drawer -->
+                    <!-- Terminal/Direct Prompt Section Drawer -->
                     <div id="rt-agent-console-drawer" style="display: ${settings.agentConsoleOpen !== false ? 'block' : 'none'}; margin-bottom: 10px; flex-shrink: 0;">
-                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
-                            <div style="font-weight: bold; opacity: 0.8; font-size: 0.846em;">Lorebook Terminal:</div>
-                            <button id="rt-agent-router-terminal-clear" style="background: transparent; border: none; color: #ff5555; font-size: 0.692em; cursor: pointer; opacity: 0.7;">Clear</button>
+                        ${(() => {
+            const activeTab = resolveActiveTerminalTab(settings.agentTerminalTab);
+            const directConfig = {
+                state_tracker: {
+                    draft: settings.stateTrackerDirectPrompt || '',
+                    lookback: settings.directPromptContext ?? 5,
+                    lookbackMax: 50,
+                    lookbackMin: 0,
+                    placeholder: 'Instruct the tracker model… (Enter to send, Shift+Enter for newline)',
+                },
+                lorebook_agent: {
+                    draft: settings.routerDirectPrompt || '',
+                    lookback: settings.routerDirectLookback || 10,
+                    lookbackMax: 100,
+                    lookbackMin: 1,
+                    placeholder: 'Instruct the Lorebook Agent… (Enter to send, Shift+Enter for newline)',
+                },
+                map_updater: {
+                    draft: settings.mapUpdaterDirectPrompt || '',
+                    lookback: settings.mapUpdaterDirectLookback ?? 10,
+                    lookbackMax: 100,
+                    lookbackMin: 0,
+                    placeholder: 'Instruct Map Updater for the active map… (Enter to send, Shift+Enter for newline)',
+                },
+                map_evolution: {
+                    draft: settings.mapEvolutionDirectPrompt || '',
+                    lookback: settings.mapEvolutionDirectLookback ?? 10,
+                    lookbackMax: 100,
+                    lookbackMin: 0,
+                    placeholder: 'Instruct Map Evolution… (Enter to send, Shift+Enter for newline)',
+                },
+                map_architect: {
+                    draft: settings.mapArchitectDirectPrompt || '',
+                    lookback: settings.mapArchitectDirectLookback ?? 10,
+                    lookbackMax: 100,
+                    lookbackMin: 0,
+                    placeholder: 'Instruct Map Architect for the current site… (Enter to send, Shift+Enter for newline)',
+                },
+            };
+            const tabButtons = AGENT_TERMINAL_TABS.map(tab => {
+                const isActive = tab.id === activeTab;
+                return `<button type="button" class="rt-agent-view-mode-btn rt-agent-terminal-tab-btn${isActive ? ' rt-agent-view-mode-btn-active' : ''}" data-terminal-tab="${tab.id}" role="tab" aria-selected="${isActive ? 'true' : 'false'}">${tab.label}</button>`;
+            }).join('');
+            const panes = AGENT_TERMINAL_TABS.map(tab => {
+                const isActive = tab.id === activeTab;
+                const cfg = directConfig[tab.id] || { draft: '', lookback: 10, lookbackMax: 100, lookbackMin: 0, placeholder: 'Instruct…' };
+                return `<div id="rt-agent-terminal-${tab.id}" class="rt-agent-terminal-pane${isActive ? ' rt-agent-terminal-pane-active' : ''}">
+                            <div class="rt-agent-terminal-shell">
+                                <div class="rt-agent-terminal-feed"></div>
+                                <div class="rt-agent-terminal-direct-bar">
+                                    <span class="rt-agent-terminal-direct-prompt" aria-hidden="true">$</span>
+                                    <textarea class="rt-agent-terminal-direct-input" id="rt-terminal-direct-${tab.id}" rows="1" data-terminal-tab="${tab.id}" placeholder="${cfg.placeholder}">${cfg.draft}</textarea>
+                                    <div class="rt-agent-terminal-direct-actions">
+                                        <label class="rt-lookback-field rt-agent-terminal-direct-lookback-label" title="Recent message lookback for this direct run">
+                                            <span class="rt-lookback-field-label rt-agent-terminal-direct-lookback-text">Lookback:</span>
+                                            <input type="text" inputmode="numeric" pattern="[0-9]*" class="rt-lookback-field-input rt-agent-terminal-direct-lookback" id="rt-terminal-direct-lookback-${tab.id}" data-terminal-tab="${tab.id}" min="${cfg.lookbackMin}" max="${cfg.lookbackMax}" value="${cfg.lookback}">
+                                        </label>
+                                        <button type="button" class="rt-agent-terminal-direct-run" data-terminal-tab="${tab.id}" title="Run command">↵</button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>`;
+            }).join('');
+            return `
+                        <div style="display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 5px;">
+                            <div class="rt-agent-view-mode-switch rt-agent-terminal-tabs" id="rt-agent-terminal-tabs" role="tablist" aria-label="Terminal/Direct Prompt">${tabButtons}</div>
+                            <button id="rt-agent-terminal-clear" style="background: transparent; border: none; color: #ff5555; font-size: 0.692em; cursor: pointer; opacity: 0.7; flex-shrink: 0;">Clear</button>
                         </div>
-                        <div id="rt-agent-router-terminal" style="background: var(--rt-card-bg); border: var(--rt-border); border-radius: 4px; padding: 8px; min-height: 80px; max-height: 200px; overflow-y: auto; margin-bottom: 10px; font-family: var(--rt-font-mono);">
-                            <div style="opacity: 0.4; font-size: 0.769em; font-style: italic; color: var(--rt-text-muted);">Waiting for agent activity...</div>
-                        </div>
+                        <div id="rt-agent-terminal-panes">${panes}</div>`;
+        })()}
 
+                        <div id="rt-agent-terminal-log-history" style="display: ${resolveActiveTerminalTab(settings.agentTerminalTab) === 'lorebook_agent' ? 'block' : 'none'};">
                         <hr style="border-color: rgba(255,255,255,0.05); margin: 10px 0;">
                         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px;">
                             <div style="font-weight: bold; opacity: 0.8; font-size: 0.846em;">Agent Log History:</div>
@@ -205,6 +283,75 @@ export function buildPanelMarkup({ settings, agentPanelCollapsedClass }) {
                         </div>
                         <div id="rt-agent-router-log" style="display: flex; flex-direction: column; gap: 5px; margin-bottom: 15px; max-height: 150px; overflow-y: auto;">
                         </div>
+                        </div>
+                    </div>
+
+                    <!-- Map Evolution Collapsible Header -->
+                    <div id="rt-agent-map-evo-header" style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; cursor: pointer; padding-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.08); user-select: none; flex-shrink: 0;">
+                        <div style="font-weight: bold; font-size: 0.846em; display: flex; align-items: center; gap: 6px; color: var(--rt-text-muted);">
+                            <i class="fa-solid ${settings.agentMapEvolutionOpen ? 'fa-chevron-down' : 'fa-chevron-right'}" id="rt-agent-map-evo-toggle-icon"></i>
+                            🗺️ Map Evolution
+                        </div>
+                        <span id="rt-agent-map-evo-enabled-badge" style="font-size:0.692em; padding:1px 7px; border-radius:10px; font-weight:bold; cursor:pointer; user-select:none; ${settings.mapEvolutionEnabled !== false ? 'background:rgba(52,168,83,0.18); color:#34a853; border:1px solid rgba(52,168,83,0.3);' : 'background:rgba(255,255,255,0.06); color:rgba(255,255,255,0.35); border:1px solid rgba(255,255,255,0.1);'}" title="Click to toggle Map Evolution">${settings.mapEvolutionEnabled !== false ? 'ON' : 'OFF'}</span>
+                    </div>
+
+                    <!-- Map Evolution Drawer -->
+                    <div id="rt-agent-map-evo-drawer" style="display: ${settings.agentMapEvolutionOpen ? 'block' : 'none'}; margin-bottom: 10px; flex-shrink: 0;">
+                        <div style="display:grid; grid-template-columns:1fr 1fr; gap:6px; margin-bottom:8px;">
+                            <div style="background:var(--rt-card-bg); border:var(--rt-border); border-radius:4px; padding:5px 8px;">
+                                <div style="font-size:0.692em; opacity:0.5; color:var(--rt-text-muted); margin-bottom:2px;">Last evolved</div>
+                                <div id="rt-agent-map-evo-last-fired" style="font-size:0.769em; color:var(--rt-text);">—</div>
+                            </div>
+                            <div style="background:var(--rt-card-bg); border:var(--rt-border); border-radius:4px; padding:5px 8px;">
+                                <div style="font-size:0.692em; opacity:0.5; color:var(--rt-text-muted); margin-bottom:2px;">Next evolution</div>
+                                <div id="rt-agent-map-evo-next-fire" style="font-size:0.769em; color:var(--rt-text);">—</div>
+                            </div>
+                        </div>
+                        <div style="display:flex; flex-direction:column; gap:6px; margin-bottom:8px;">
+                            <div style="display:flex; align-items:center; gap:6px; flex-wrap:wrap;">
+                                <span style="font-size:0.769em; opacity:0.7; white-space:nowrap;">Other maps:</span>
+                                <input type="text" inputmode="numeric" pattern="[0-9]*" id="rt-agent-map-evo-interval" value="${settings.mapEvolutionIntervalHours ?? 8}" style="width:50px; background:var(--rt-card-bg); color:var(--rt-text); border:var(--rt-border); border-radius:3px; text-align:center; font-size:0.769em; padding:2px;" title="Interval for mapped sites the party is not in.">
+                                <span style="font-size:0.769em; opacity:0.5;">h</span>
+                                <span style="font-size:0.769em; opacity:0.7; white-space:nowrap;">Current map:</span>
+                                <input type="text" inputmode="numeric" pattern="[0-9]*" id="rt-agent-map-evo-onsite-interval" value="${settings.mapEvolutionOnSiteIntervalHours ?? 1}" style="width:42px; background:var(--rt-card-bg); color:var(--rt-text); border:var(--rt-border); border-radius:3px; text-align:center; font-size:0.769em; padding:2px;" title="Current-map interval hours. Use 0 with a nonzero minutes value for intervals below one hour.">
+                                <span style="font-size:0.769em; opacity:0.5;">h</span>
+                                <input type="text" inputmode="numeric" pattern="[0-9]*" id="rt-agent-map-evo-onsite-minutes" value="${settings.mapEvolutionOnSiteIntervalMinutes ?? 0}" style="width:42px; background:var(--rt-card-bg); color:var(--rt-text); border:var(--rt-border); border-radius:3px; text-align:center; font-size:0.769em; padding:2px;" title="Additional current-map interval minutes (0–59). 0h 0m skips automatic current-map ticks.">
+                                <span style="font-size:0.769em; opacity:0.5;">m in-world</span>
+                            </div>
+                        </div>
+                        <div style="display:flex; flex-direction:column; gap:6px; margin-bottom:8px;">
+                            <label style="font-size:0.769em; opacity:0.7; display:flex; flex-direction:column; gap:3px;">
+                                Maps per interval tick
+                                <select id="rt-agent-map-evo-tick-scope" style="width:100%; background:var(--rt-card-bg); color:var(--rt-text); border:var(--rt-border); border-radius:3px; font-size:0.769em; padding:3px 4px;">
+                                    <option value="active"${(settings.mapEvolutionTickScope || 'all') === 'active' ? ' selected' : ''}>Current map only</option>
+                                    <option value="count"${settings.mapEvolutionTickScope === 'count' ? ' selected' : ''}>N maps from every mapped site</option>
+                                    <option value="all"${(settings.mapEvolutionTickScope || 'all') === 'all' ? ' selected' : ''}>All mapped sites (N per turn)</option>
+                                    <option value="selected"${settings.mapEvolutionTickScope === 'selected' ? ' selected' : ''}>Selected maps</option>
+                                </select>
+                            </label>
+                            <div id="rt-agent-map-evo-n-row" style="display:${(settings.mapEvolutionTickScope || 'all') === 'active' ? 'none' : 'flex'}; align-items:center; gap:8px; flex-wrap:wrap;">
+                                <label style="font-size:0.769em; opacity:0.7; display:flex; align-items:center; gap:5px;">
+                                    How many
+                                    <input type="text" inputmode="numeric" pattern="[0-9]*" id="rt-agent-map-evo-tick-count" value="${settings.mapEvolutionTickCount ?? 2}" style="width:44px; background:var(--rt-card-bg); color:var(--rt-text); border:var(--rt-border); border-radius:3px; text-align:center; font-size:0.769em; padding:2px;" title="Due maps beyond this number wait for later turns. The current map always takes a slot when it is due. 0 = all due maps this turn.">
+                                </label>
+                                <label style="font-size:0.769em; opacity:0.7; display:flex; align-items:center; gap:5px; cursor:pointer; user-select:none;">
+                                    <input type="checkbox" id="rt-agent-map-evo-tick-randomize" ${settings.mapEvolutionTickRandomize !== false ? 'checked' : ''} style="margin:0; cursor:pointer;">
+                                    Randomize due maps
+                                </label>
+                            </div>
+                            <div id="rt-agent-map-evo-selected-hint" style="display:${settings.mapEvolutionTickScope === 'selected' ? 'block' : 'none'}; font-size:0.692em; opacity:0.55; line-height:1.35;">
+                                Selected maps use the checklist under Settings → Persistent Maps → Map Evolution.
+                            </div>
+                        </div>
+                        <button id="rt-agent-map-evo-fire-now" style="width:100%; background:rgba(156,39,176,0.15); border:1px solid rgba(156,39,176,0.3); color:#ce93d8; border-radius:4px; padding:5px; font-size:0.769em; font-weight:bold; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:5px;">
+                            <i class="fa-solid fa-map-location-dot"></i> Evolve Now
+                        </button>
+                        <button id="rt-agent-map-evo-reset-timeline" title="Clears per-site last-evolved timestamps so Map Evolution starts fresh from now" style="width:100%; background:rgba(234,67,53,0.1); border:1px solid rgba(234,67,53,0.25); color:rgba(234,67,53,0.75); border-radius:4px; padding:4px; font-size:0.692em; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:5px; margin-top:5px;">
+                            <i class="fa-solid fa-clock-rotate-left"></i> Reset Timeline
+                        </button>
+                        <button id="rt-agent-map-evo-testing-ground" title="Advance time, spawn entities, and run Evolution ticks without playing" style="width:100%; background:rgba(125,211,252,0.1); border:1px solid rgba(125,211,252,0.28); color:#7dd3fc; border-radius:4px; padding:4px; font-size:0.692em; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:5px; margin-top:5px;">
+                            <i class="fa-solid fa-flask"></i> Testing Ground
+                        </button>
                     </div>
 
                     <!-- World Progression Collapsible Header -->
@@ -232,6 +379,11 @@ export function buildPanelMarkup({ settings, agentPanelCollapsedClass }) {
                             <span style="font-size:0.769em; opacity:0.7; white-space:nowrap;">Interval:</span>
                             <input type="text" inputmode="numeric" pattern="[0-9]*" id="rt-agent-world-interval" value="${settings.worldProgressionIntervalHours || 24}" style="width:50px; background:var(--rt-card-bg); color:var(--rt-text); border:var(--rt-border); border-radius:3px; text-align:center; font-size:0.769em; padding:2px;">
                             <span style="font-size:0.769em; opacity:0.5;">in-world hours</span>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:6px; margin-bottom:8px;">
+                            <span style="font-size:0.769em; opacity:0.7; white-space:nowrap;">Locations:</span>
+                            <input type="text" inputmode="numeric" pattern="[0-9]*" id="rt-agent-world-locations" value="${settings.worldProgressionLocationsPerReport ?? 3}" style="width:50px; background:var(--rt-card-bg); color:var(--rt-text); border:var(--rt-border); border-radius:3px; text-align:center; font-size:0.769em; padding:2px;" title="How many location dossiers receive their own section in each report.">
+                            <span style="font-size:0.769em; opacity:0.5;">per report</span>
                         </div>
                         <button id="rt-agent-world-fire-now" style="width:100%; background:rgba(52,168,83,0.15); border:1px solid rgba(52,168,83,0.3); color:#34a853; border-radius:4px; padding:5px; font-size:0.769em; font-weight:bold; cursor:pointer; display:flex; align-items:center; justify-content:center; gap:5px;">
                             <i class="fa-solid fa-globe"></i> Fire Now
@@ -261,11 +413,11 @@ export function buildPanelMarkup({ settings, agentPanelCollapsedClass }) {
                     <div id="rt-agent-campaign-section" style="margin-top: 10px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 15px; display: flex; flex-direction: column; flex-shrink: 0;">
                         <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; flex-shrink: 0; gap: 8px;">
                             <div id="rt-agent-campaign-header-title" style="font-weight: bold; opacity: 0.8; font-size: 0.846em; flex: 1; min-width: 0;${settings.locationImages ? ' display: none;' : ''}">CAMPAIGN RECORDS</div>
-                            <div class="rt-agent-view-mode-switch" id="rt-agent-view-mode-switch" role="tablist" aria-label="Lorebook view mode"${settings.locationImages ? '' : ' style="display: none;"'}>
+                            <div class="rt-agent-view-mode-switch" id="rt-agent-view-mode-switch" role="tablist" aria-label="Campaign Records or Visuals/Map"${settings.locationImages ? '' : ' style="display: none;"'}>
                                 <button type="button" class="rt-agent-view-mode-btn${settings.agentImmersionMode ? '' : ' rt-agent-view-mode-btn-active'}" id="rt-agent-view-mode-records" role="tab" aria-selected="${settings.agentImmersionMode ? 'false' : 'true'}">Campaign Records</button>
                                 <button type="button" class="rt-agent-view-mode-btn rt-agent-view-mode-btn-visualization${settings.agentImmersionMode ? ' rt-agent-view-mode-btn-active' : ''}" id="rt-agent-view-mode-visualization" role="tab" aria-selected="${settings.agentImmersionMode ? 'true' : 'false'}">
                                     <span class="rt-agent-view-mode-glow" aria-hidden="true"></span>
-                                    <span class="rt-agent-view-mode-label">Visualization Mode</span>
+                                    <span class="rt-agent-view-mode-label">Visuals/Map</span>
                                 </button>
                             </div>
                             <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0;">
@@ -277,16 +429,6 @@ export function buildPanelMarkup({ settings, agentPanelCollapsedClass }) {
                         <div id="rt-agent-manifest-list" style="display: ${settings.agentImmersionMode ? 'none' : 'flex'}; flex-direction: column; gap: 6px; flex-shrink: 0;">
                             <div style="text-align: center; opacity: 0.5; font-size: 0.769em; padding: 10px;">Click refresh to load lore...</div>
                         </div>
-                    </div>
-                </div>
-                <div class="rpg-tracker-prompt-bar" id="rt-agent-prompt-bar" style="display:none; border-top: var(--rt-border); box-sizing: border-box;">
-                    <textarea class="rpg-tracker-prompt-input" id="rt-agent-prompt-input" rows="2" placeholder="Instruct the agent model… (Enter to send, Shift+Enter for newline)">${settings.routerDirectPrompt || ''}</textarea>
-                    <div style="display: flex; flex-direction: column; gap: 4px; align-items: center; justify-content: flex-end;">
-                        <div class="rt-prompt-ctx-control" style="font-size: 0.692em; display: flex; flex-direction: column; align-items: center; gap: 0;" title="Direct lookback: last N chat messages (user and assistant) for this manual run.">
-                            <input type="text" inputmode="numeric" pattern="[0-9]*" id="rt-agent-prompt-context-val" value="${settings.routerDirectLookback || 10}" min="1" max="100" style="width: 28px; height: 16px; font-size: 0.692em; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); color: white; border-radius: 3px; text-align: center; padding: 0;">
-                            <span style="opacity: 0.5; font-size: 8px; line-height: 1;">msg</span>
-                        </div>
-                        <button class="rpg-tracker-prompt-send" id="rt-agent-prompt-send" title="Run command">▶</button>
                     </div>
                 </div>
                 <div class="rpg-tracker-footer" id="rt-agent-footer">
@@ -303,7 +445,6 @@ export function buildPanelMarkup({ settings, agentPanelCollapsedClass }) {
                     </div>
                     <div class="rt-agent-footer-right">
                         <div id="rt-agent-last-run"></div>
-                        <button class="rpg-tracker-icon-btn rt-footer-prompt-btn" id="rt-agent-prompt-btn" title="Toggle direct prompt">💬</button>
                     </div>
                 </div>
                 <div class="rt-resizer-br" id="rt-agent-resizer-br" title="Resize from bottom-right"></div>
@@ -321,11 +462,11 @@ export function buildPanelMarkup({ settings, agentPanelCollapsedClass }) {
             </div>
             <div class="rpg-tracker-prompt-bar" id="rpg-tracker-prompt-bar" style="display:none;">
                 <textarea class="rpg-tracker-prompt-input" id="rpg-tracker-prompt-input" rows="2" placeholder="Instruct the tracker model… (Enter to send, Shift+Enter for newline)"></textarea>
-                <div style="display: flex; flex-direction: column; gap: 4px; align-items: center; justify-content: flex-end;">
-                    <div class="rt-prompt-ctx-control" style="font-size: 0.692em; display: flex; flex-direction: column; align-items: center; gap: 0;" title="Context: number of recent messages to include">
-                        <input type="text" inputmode="numeric" pattern="[0-9]*" id="rt-prompt-context-val" value="${settings.directPromptContext || 5}" min="0" max="50" style="width: 28px; height: 16px; font-size: 0.692em; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); color: white; border-radius: 3px; text-align: center; padding: 0;">
-                        <span style="opacity: 0.5; font-size: 8px; line-height: 1;">msg</span>
-                    </div>
+                <div class="rpg-tracker-prompt-actions">
+                    <label class="rt-lookback-field rt-prompt-ctx-control" title="Lookback: number of recent messages to include">
+                        <span class="rt-lookback-field-label">Lookback:</span>
+                        <input type="text" inputmode="numeric" pattern="[0-9]*" class="rt-lookback-field-input" id="rt-prompt-context-val" value="${settings.directPromptContext || 5}" min="0" max="50">
+                    </label>
                     <button class="rpg-tracker-prompt-send" id="rpg-tracker-prompt-send" title="Send instruction">▶</button>
                 </div>
             </div>

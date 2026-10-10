@@ -8,7 +8,10 @@ import { getSettings } from './state-manager.js';
 import { cleanToolCallMessage, memoForGmContext } from './memo-processor.js';
 import { runtimeState } from './src/app/runtime-state.js';
 import { isRouterRunning, runRouterPass, sendDirectPrompt } from './src/app/runtime-bridge.js';
-import { isEffectiveSectionEnabled } from './src/state/section-enabled.js';
+import { isCyoaEnabled, isLorebookAgentRuntimeActive, isLocationMappingEnabled } from './src/state/section-enabled.js';
+import { canCommitPassForChat } from './src/state/pass-affinity.js';
+import { HISTORY_ENTRY_LIMIT } from './src/state/history-retention.js';
+import { formatDungeonMapForPlayer, stripDungeonMapSection } from './dungeon-reality.js';
 import { clampFloatingPanelToViewport, isMobileLayout, makeDraggable, makeResizableBL, makeResizableBR, resolveViewportClampedGeometry } from './ui-geometry.js';
 
 const FOLDER_NAME = (function () {
@@ -31,7 +34,7 @@ const COMPANION_BY_CHAT_KEY = 'rpg_tracker_companion_by_chat_v1';
 const LEGACY_HISTORY_KEY = 'rpg_tracker_tutorial_chat';
 const LEGACY_LOOKBACK_KEY = 'rpg_tracker_tutorial_lookback';
 
-const SHELL_VERSION = '8';
+const SHELL_VERSION = '9';
 const DETACHED_CHAT_KEY = 'rpg_tracker_adventure_companion_detached';
 const DETACHED_CHAT_GEO_KEY = 'rpg_tracker_geometry_adventure_companion';
 const CHAT_OPEN_KEY = 'rpg_tracker_adventure_companion_open';
@@ -43,17 +46,18 @@ export const COMPANION_PERSONA = `You are the Adventure Companion — a witty, i
 Rules:
 - Help with entertainment, brainstorming, theories, roleplay ideas, jokes, and discussing what just happened in the story.
 - Answer questions about the Multihog D&D Framework. When a DOCUMENTATION block is present, treat it as the source of truth and prefer it over guesswork.
-- Use CURRENT STORY CONTEXT, STATE MEMO, and ACTIVE LORE when provided. Stay consistent with those facts; do not contradict them.
+- Use CURRENT STORY CONTEXT, STATE MEMO, ACTIVE LORE, and ACTIVE SITE MAP when provided. Stay consistent with those facts; do not contradict them. The site map is player-facing knowledge (same as Visuals/Map): discuss exploration from what is already revealed, and treat Unexplored neighbors as unknown rather than inventing hidden rooms, traps, or occupants.
 - Do not invent major plot outcomes as if you were the Game Master running the live game — suggest possibilities and riff, rather than declaring canon.
 - For framework and settings questions, be brief and practical. If the supplied documentation does not cover something, say you are unsure rather than inventing settings, IDs, or behavior.
 - Keep replies engaging but not endless. Match the player's energy.
 
-Actions — these three ONLY (hard limit):
+Actions — these four ONLY (hard limit):
 1. Send a direct command to the **State Tracker** to correct or update mechanical campaign state (memo / tracked modules).
-2. Send a direct command to the **Lorebook Agent** to create or update campaign lore.
-3. **Act for the player** — submit their next turn (send a chat message for them, or choose a CYOA button when CYOA choices are supplied).
+2. Send a direct command to the **Lorebook Agent** to create or update campaign lore (NPCs, factions, quests, readable location history — not private map occupancy).
+3. Send a direct command to the **Map Updater** to correct or update the active site's private map occupancy ([MAP]: areas, assets, routes, building contents). Use for removing mistaken assets, clearing remains from a room, marking kills as DESTROYED when remains stay, MOVE_ASSET, and similar durable occupancy facts — not for lorebook NPC bios or memo modules.
+4. **Act for the player** — submit their next turn (send a chat message for them, or choose a CYOA button when CYOA choices are supplied).
 
-You have no other action surface. You cannot click Multihog UI, open settings drawers, edit relationship bars / NPC cards / inventory panels / module toggles in the interface, or walk the player through invented menu paths. If a change belongs in campaign state or lore, do it via State Tracker or Lorebook Agent commands — never invent a UI workflow. If you do not know how a Multihog screen looks or whether a control exists, say so or use one of the three actions above; do not guess at buttons, tabs, or editors.
+You have no other action surface. You cannot click Multihog UI, open settings drawers, edit relationship bars / NPC cards / inventory panels / module toggles in the interface, or walk the player through invented menu paths. Campaign state goes to State Tracker; lore goes to Lorebook Agent; map occupancy goes to Map Updater — never invent a UI workflow. If you do not know how a Multihog screen looks or whether a control exists, say so or use one of the four actions above; do not guess at buttons, tabs, or editors.
 
 Action rules:
 - Act whenever the player's intent to make a change is clear from ordinary conversation. They do not need exact wording, command syntax, magic phrases, or the names "State Tracker" and "Lorebook Agent."
@@ -66,13 +70,14 @@ Action rules:
 - When ACT FOR USER MODE says CYOA is inactive, compose a concise in-character player action and submit it as action_text.
 - Every act_for_user call must include commentary: a brief, lively, context-aware reaction to the move you chose. Make it feel like a clever friend at the table—amused, intrigued, impressed, ominous, or playful as appropriate. Do not mechanically report that an action was submitted, repeat the full action, use a status/checkmark format, or invent the outcome.
 - A successful act-for-user submission ends your current turn. Do not call another action afterward.
-- A request may require multiple actions. Execute them one at a time. If it combines bookkeeping/lore changes with a player turn, perform State Tracker and Lorebook Agent work first and act_for_user last.
-- For State Tracker and Lorebook Agent work, accurately tell the player whether it completed, made no change, was unavailable, or failed. For a successful player turn, use the supplied organic commentary instead of a mechanical completion receipt; the submitted action is already visible in the main chat.
+- A request may require multiple actions. Execute them one at a time. If it combines bookkeeping/lore/map changes with a player turn, perform State Tracker, Lorebook Agent, and Map Updater work first and act_for_user last.
+- For State Tracker, Lorebook Agent, and Map Updater work, accurately tell the player whether it completed, made no change, was unavailable, or failed. For a successful player turn, use the supplied organic commentary instead of a mechanical completion receipt; the submitted action is already visible in the main chat.
 - You cannot change extension settings or narrate/declare new story outcomes yourself. act_for_user only submits the player's turn; the main narrator remains the authority that advances the story.
 
 When native tools are unavailable, emit actions using exactly one or more of these fallback blocks:
 <companion_action type="state_tracker">the direct instruction</companion_action>
 <companion_action type="lorebook_agent">the direct instruction</companion_action>
+<companion_action type="map_updater">the direct instruction</companion_action>
 <companion_action type="act_for_user">{"choice_index":2,"commentary":"A quiet route into danger. I respect the optimism."}</companion_action>
 <companion_action type="act_for_user">{"action_text":"the player action to submit","commentary":"Subtlety has left the building. Let's see who notices first."}</companion_action>
 Do not show fallback blocks unless you are actually performing a change the player clearly intends. After action results are supplied, do not repeat completed actions; summarize the results for the player.
@@ -119,6 +124,24 @@ export const COMPANION_ACTION_TOOLS = [
     {
         type: 'function',
         function: {
+            name: 'command_map_updater',
+            description: 'Send a direct instruction to the Map Updater when ordinary conversational language shows clear intent to correct active-site map occupancy: remove an asset from [MAP], mark a kill DESTROYED when remains stay, clear remains with REMOVE_ASSET, move assets, fix mistaken clutter, or similar durable occupancy facts. Not for Lorebook lore or State Tracker memo modules.',
+            parameters: {
+                type: 'object',
+                properties: {
+                    instruction: {
+                        type: 'string',
+                        description: 'A self-contained Map Updater instruction preserving the player’s intent. Name exact asset ids when known from ACTIVE SITE MAP; otherwise describe the durable occupancy change clearly.',
+                    },
+                },
+                required: ['instruction'],
+                additionalProperties: false,
+            },
+        },
+    },
+    {
+        type: 'function',
+        function: {
             name: 'act_for_user',
             description: 'Submit the player’s next turn when they clearly ask the Companion to choose, act, or continue for them. With active CYOA choices, either select one supplied choice by list number or provide a concise player action to send through the normal chat input. Without CYOA, provide a concise player action.',
             parameters: {
@@ -149,7 +172,7 @@ const MAX_COMPANION_AGENT_TURNS = 6;
 
 /**
  * @typedef {{ lookback: number, lookbackAll: boolean, history: Array<{role:'user'|'assistant', content:string}> }} ModePrefs
- * @typedef {{ tutorialMode: boolean, injectLore: boolean, injectMemo: boolean, companion: ModePrefs }} ChatPrefs
+ * @typedef {{ tutorialMode: boolean, injectLore: boolean, injectMemo: boolean, injectMap: boolean, companion: ModePrefs }} ChatPrefs
  */
 
 /** @returns {ModePrefs} */
@@ -163,6 +186,7 @@ function defaultPrefs() {
         tutorialMode: false,
         injectLore: false,
         injectMemo: false,
+        injectMap: false,
         companion: defaultCompanionPrefs(),
     };
 }
@@ -190,7 +214,8 @@ function loadPrefs() {
                 if (Array.isArray(parsed)) {
                     base.companion.history = parsed
                         .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
-                        .map((m) => ({ role: m.role, content: m.content }));
+                        .map((m) => ({ role: m.role, content: m.content }))
+                        .slice(-HISTORY_ENTRY_LIMIT);
                 }
             }
             if (legacyLook != null && legacyLook !== '') {
@@ -224,6 +249,7 @@ function mergePrefs(base, parsed) {
             : parsed.mode === 'tutorial',
         injectLore: !!parsed.injectLore,
         injectMemo: !!parsed.injectMemo,
+        injectMap: !!parsed.injectMap,
         companion,
     };
 }
@@ -242,7 +268,8 @@ function mergeModePrefs(base, parsed) {
         ? parsed.history
             .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string')
             .map((m) => ({ role: m.role, content: m.content }))
-        : [...base.history];
+            .slice(-HISTORY_ENTRY_LIMIT)
+        : base.history.slice(-HISTORY_ENTRY_LIMIT);
     return {
         lookback,
         lookbackAll: !!parsed.lookbackAll,
@@ -313,7 +340,7 @@ function snapshotCompanion(companion) {
     return {
         lookback: companion?.lookback ?? 5,
         lookbackAll: !!companion?.lookbackAll,
-        history: JSON.parse(JSON.stringify(companion?.history || [])),
+        history: JSON.parse(JSON.stringify((companion?.history || []).slice(-HISTORY_ENTRY_LIMIT))),
     };
 }
 
@@ -322,7 +349,7 @@ function companionWithPreservedLookback(history) {
     return {
         lookback: _prefs.companion?.lookback ?? 5,
         lookbackAll: !!_prefs.companion?.lookbackAll,
-        history: Array.isArray(history) ? history : [],
+        history: Array.isArray(history) ? history.slice(-HISTORY_ENTRY_LIMIT) : [],
     };
 }
 
@@ -408,6 +435,19 @@ function loadCompanionForChat(chatId) {
 }
 
 /**
+ * Abort an in-flight Adventure Companion LLM/action loop.
+ * Chat switches must call this before loading the arriving partition so a late
+ * act_for_user / State Tracker / Lorebook Agent tool call cannot land in chat B.
+ */
+export function abortAdventureCompanionInFlight() {
+    if (!_abort) return;
+    try { _abort.abort(); } catch (_) { /* ignore */ }
+    _abort = null;
+    setBusy(false);
+    chatUiRoot()?.querySelector('#rt-tutorial-pending')?.remove();
+}
+
+/**
  * Flush the in-memory Adventure Companion session under an explicit chat id.
  * Must run before the live companion is swapped on chat switch (currentChatId may already have flipped).
  * @param {string|null|undefined} chatId
@@ -444,6 +484,7 @@ export function loadAdventureCompanionForChat(chatId) {
  * @param {string|null|undefined} newChatId
  */
 export function onChatChangedForAdventureCompanion(oldChatId, newChatId) {
+    abortAdventureCompanionInFlight();
     flushAdventureCompanionForChat(oldChatId);
     loadAdventureCompanionForChat(newChatId);
 }
@@ -451,6 +492,7 @@ export function onChatChangedForAdventureCompanion(oldChatId, newChatId) {
 // Bridges for chat-persistence / chat-state-loader / index without import cycles
 globalThis._rpgGetAdventureCompanionSnapshot = getAdventureCompanionSnapshot;
 globalThis._rpgApplyAdventureCompanionSnapshot = applyAdventureCompanionSnapshot;
+globalThis._rpgAbortAdventureCompanionInFlight = abortAdventureCompanionInFlight;
 globalThis._rpgFlushAdventureCompanionForChat = flushAdventureCompanionForChat;
 globalThis._rpgLoadAdventureCompanionForChat = loadAdventureCompanionForChat;
 globalThis._rpgOnChatChangedForAdventureCompanion = onChatChangedForAdventureCompanion;
@@ -511,12 +553,13 @@ export function getAdventureCompanionRequestSettings(baseSettings = getSettings(
     };
 }
 
-/** @returns {{tutorialMode:boolean, injectLore:boolean, injectMemo:boolean, lookback:number, lookbackAll:boolean}} */
+/** @returns {{tutorialMode:boolean, injectLore:boolean, injectMemo:boolean, injectMap:boolean, lookback:number, lookbackAll:boolean}} */
 export function getAdventureCompanionPreferences() {
     return {
         tutorialMode: !!_prefs.tutorialMode,
         injectLore: !!_prefs.injectLore,
         injectMemo: !!_prefs.injectMemo,
+        injectMap: !!_prefs.injectMap,
         lookback: _prefs.companion.lookback,
         lookbackAll: !!_prefs.companion.lookbackAll,
     };
@@ -532,6 +575,7 @@ export function updateAdventureCompanionPreferences(patch = {}) {
     if (typeof patch.tutorialMode === 'boolean') _prefs.tutorialMode = patch.tutorialMode;
     if (typeof patch.injectLore === 'boolean') _prefs.injectLore = patch.injectLore;
     if (typeof patch.injectMemo === 'boolean') _prefs.injectMemo = patch.injectMemo;
+    if (typeof patch.injectMap === 'boolean') _prefs.injectMap = patch.injectMap;
     if (typeof patch.lookbackAll === 'boolean') _prefs.companion.lookbackAll = patch.lookbackAll;
     if (patch.lookback !== undefined) {
         let lookback = parseInt(String(patch.lookback), 10);
@@ -549,11 +593,13 @@ function syncCompanionSettingsDrawerUi(prefs = _prefs) {
     const tutorial = /** @type {HTMLInputElement|null} */ (document.getElementById('rpg_adventure_companion_tutorial_mode'));
     const lore = /** @type {HTMLInputElement|null} */ (document.getElementById('rpg_adventure_companion_inject_lore'));
     const memo = /** @type {HTMLInputElement|null} */ (document.getElementById('rpg_adventure_companion_inject_memo'));
+    const map = /** @type {HTMLInputElement|null} */ (document.getElementById('rpg_adventure_companion_inject_map'));
     const lookback = /** @type {HTMLInputElement|null} */ (document.getElementById('rpg_adventure_companion_lookback'));
     const lookbackAll = /** @type {HTMLInputElement|null} */ (document.getElementById('rpg_adventure_companion_lookback_all'));
     if (tutorial) tutorial.checked = !!prefs.tutorialMode;
     if (lore) lore.checked = !!prefs.injectLore;
     if (memo) memo.checked = !!prefs.injectMemo;
+    if (map) map.checked = !!prefs.injectMap;
     if (lookbackAll) lookbackAll.checked = !!prefs.companion.lookbackAll;
     if (lookback) {
         lookback.value = String(prefs.companion.lookback);
@@ -573,6 +619,7 @@ export function bindAdventureCompanionSettingsDrawer() {
     bindCheckbox('rpg_adventure_companion_tutorial_mode', 'tutorialMode');
     bindCheckbox('rpg_adventure_companion_inject_lore', 'injectLore');
     bindCheckbox('rpg_adventure_companion_inject_memo', 'injectMemo');
+    bindCheckbox('rpg_adventure_companion_inject_map', 'injectMap');
     bindCheckbox('rpg_adventure_companion_lookback_all', 'lookbackAll');
 
     const lookback = /** @type {HTMLInputElement|null} */ (document.getElementById('rpg_adventure_companion_lookback'));
@@ -785,10 +832,36 @@ async function buildLoreContext() {
         const entry = bookCache[bookName]?.entries?.[uid];
         if (!entry?.content) continue;
         const title = (entry.comment || '').replace(/^\[.*?\]\s*/i, '').trim() || uid;
-        blocks.push(`### ${title}\n${String(entry.content).trim()}`);
+        const visible = stripDungeonMapSection(String(entry.content).trim());
+        if (!visible) continue;
+        blocks.push(`### ${title}\n${visible}`);
     }
     if (!blocks.length) return '';
     return `## ACTIVE LORE (Lorebook Agent)\n${blocks.join('\n\n')}`;
+}
+
+/**
+ * Player-facing current site map (same knowledge fog as Visuals/Map).
+ * @returns {Promise<string>}
+ */
+async function buildMapContext() {
+    try {
+        const { loadActiveDungeonMapContext } = await import('./router.js');
+        const loaded = await loadActiveDungeonMapContext();
+        const document = loaded?.context?.document;
+        if (!document) {
+            return '## ACTIVE SITE MAP\nThe party is not inside a mapped site right now.';
+        }
+        const currentLocation = loaded.currentLocation || loaded.context.currentLocation || '';
+        const body = formatDungeonMapForPlayer(document, currentLocation);
+        return `## ACTIVE SITE MAP (player-facing, same knowledge as Visuals/Map with Reveal all off)
+Use this to discuss exploration and possible actions. You only know visited interiors and discovered names. Unexplored neighbors are unknown — do not invent hidden rooms, traps, or occupants.
+
+${body}`;
+    } catch (err) {
+        console.warn('[CHAT] Failed to load active map:', err);
+        return '## ACTIVE SITE MAP\nThe active map could not be loaded.';
+    }
 }
 
 /**
@@ -820,7 +893,7 @@ export function getCurrentCyoaChoices(root = document) {
  */
 function buildActForUserContext() {
     const settings = getSettings();
-    const cyoaActive = isEffectiveSectionEnabled('CYOA_mode', settings);
+    const cyoaActive = isCyoaEnabled(settings);
     if (!cyoaActive) {
         return `## ACT FOR USER MODE
 CYOA is inactive. If the player clearly asks you to take their turn, call act_for_user with action_text containing the concise player message to submit. Include brief, organic commentary reacting to your move without repeating it or inventing the outcome.`;
@@ -845,9 +918,10 @@ ${choices.map((choice) => `${choice.index}. ${choice.text}`).join('\n')}`;
  * @param {string} [opts.narrative]
  * @param {string} [opts.memo]
  * @param {string} [opts.lore]
+ * @param {string} [opts.map]
  * @param {string} [opts.playerAction]
  */
-function buildSystemPrompt({ doc = '', narrative = '', memo = '', lore = '', playerAction = '' } = {}) {
+function buildSystemPrompt({ doc = '', narrative = '', memo = '', lore = '', map = '', playerAction = '' } = {}) {
     let prompt = COMPANION_PERSONA;
 
     if (doc) {
@@ -861,6 +935,9 @@ function buildSystemPrompt({ doc = '', narrative = '', memo = '', lore = '', pla
     }
     if (lore) {
         prompt += `\n\n--- LOREBOOK ---\n${lore}\n--- END LOREBOOK ---`;
+    }
+    if (map) {
+        prompt += `\n\n--- ACTIVE SITE MAP ---\n${map}\n--- END ACTIVE SITE MAP ---`;
     }
     if (playerAction) {
         prompt += `\n\n--- PLAYER ACTION CAPABILITY ---\n${playerAction}\n--- END PLAYER ACTION CAPABILITY ---`;
@@ -882,9 +959,14 @@ export function parseCompanionFallbackActions(text) {
     const visibleText = source.replace(actionPattern, (_match, doubleQuotedType, singleQuotedType, body) => {
         const type = String(doubleQuotedType || singleQuotedType || '').trim().toLowerCase();
         const instruction = String(body || '').trim();
-        if (instruction && (type === 'state_tracker' || type === 'lorebook_agent')) {
+        if (instruction && (type === 'state_tracker' || type === 'lorebook_agent' || type === 'map_updater')) {
+            const nameByType = {
+                state_tracker: 'command_state_tracker',
+                lorebook_agent: 'command_lorebook_agent',
+                map_updater: 'command_map_updater',
+            };
             actions.push({
-                name: type === 'state_tracker' ? 'command_state_tracker' : 'command_lorebook_agent',
+                name: nameByType[type],
                 instruction,
             });
         } else if (instruction && type === 'act_for_user') {
@@ -930,7 +1012,7 @@ function normalizeCompanionAction(name, args) {
         }
         return null;
     }
-    if (name !== 'command_state_tracker' && name !== 'command_lorebook_agent') return null;
+    if (name !== 'command_state_tracker' && name !== 'command_lorebook_agent' && name !== 'command_map_updater') return null;
     const instruction = String(args?.instruction || '').trim();
     if (!instruction) return null;
     return { name, instruction };
@@ -948,15 +1030,64 @@ function companionActionArgs(action) {
     return { instruction: action.instruction };
 }
 
+/** @param {any} result */
+function summarizeMapUpdaterCompanionResult(result) {
+    const skipped = result?.skipped;
+    if (skipped === 'location_mapping_off' || skipped === 'dungeon_reality_off') {
+        return { success: false, status: 'unavailable', message: 'Persistent Maps is off.' };
+    }
+    if (skipped === 'no_active_map') {
+        return { success: false, status: 'unavailable', message: 'No active dungeon or settlement map.' };
+    }
+    if (skipped === 'no_such_map') {
+        return { success: false, status: 'unavailable', message: 'That mapped site could not be loaded.' };
+    }
+    if (skipped === 'disabled') {
+        return { success: false, status: 'disabled', message: 'Map Updater is disabled.' };
+    }
+    if (skipped === 'busy') {
+        return { success: false, status: 'busy', message: 'Another agent is already running.' };
+    }
+    if (skipped === 'stopped') {
+        return { success: true, status: 'stopped', message: 'Stopped.' };
+    }
+    if (result?.ok && result?.noop) {
+        return { success: true, status: 'noop', message: 'Nothing durable changed on the map.' };
+    }
+    if (result?.ok) {
+        return { success: true, status: 'completed', message: 'Map occupancy update applied.' };
+    }
+    return { success: false, status: 'failed', message: 'Could not apply a valid map occupancy update.' };
+}
+
 /**
  * @param {any} action
  * @returns {Promise<{action:string, success:boolean, status:string, message:string, terminal?:boolean}>}
  */
-async function executeCompanionAction(action) {
+async function executeCompanionAction(action, passChatId = null, signal = null) {
+    const originChatId = passChatId != null && String(passChatId).length > 0
+        ? passChatId
+        : resolveActiveChatId();
+    if (!canCommitPassForChat(originChatId, resolveActiveChatId(), { aborted: !!signal?.aborted })) {
+        return {
+            action: action?.name === 'act_for_user'
+                ? 'Player Turn'
+                : action?.name === 'command_state_tracker'
+                    ? 'State Tracker'
+                    : action?.name === 'command_map_updater'
+                        ? 'Map Updater'
+                        : 'Lorebook Agent',
+            success: false,
+            status: signal?.aborted ? 'aborted' : 'chat_changed',
+            message: signal?.aborted
+                ? 'Adventure Companion request was cancelled; action was skipped.'
+                : 'Active chat changed; Adventure Companion action was skipped.',
+        };
+    }
     try {
         if (action.name === 'act_for_user') {
             const settings = getSettings();
-            const cyoaActive = isEffectiveSectionEnabled('CYOA_mode', settings);
+            const cyoaActive = isCyoaEnabled(settings);
             const actionText = String(action.action_text || '').trim();
             // A free-form player message deliberately remains available in
             // CYOA mode. When present, it takes precedence over a choice.
@@ -1048,8 +1179,59 @@ async function executeCompanionAction(action) {
             };
         }
 
+        if (action.name === 'command_map_updater') {
+            const settings = getSettings();
+            if (!isLocationMappingEnabled(settings)) {
+                return {
+                    action: 'Map Updater',
+                    success: false,
+                    status: 'unavailable',
+                    message: 'Persistent Maps is off.',
+                };
+            }
+            if (settings.mapUpdaterEnabled === false) {
+                return {
+                    action: 'Map Updater',
+                    success: false,
+                    status: 'disabled',
+                    message: 'Map Updater is disabled.',
+                };
+            }
+            if (typeof runtimeState.isLoreOrMapAgentBusyRef === 'function' && runtimeState.isLoreOrMapAgentBusyRef()) {
+                return {
+                    action: 'Map Updater',
+                    success: false,
+                    status: 'busy',
+                    message: 'Another agent is already running.',
+                };
+            }
+            const run = runtimeState.runMapUpdaterPassRef;
+            if (typeof run !== 'function') {
+                return {
+                    action: 'Map Updater',
+                    success: false,
+                    status: 'unavailable',
+                    message: 'Map Updater is not available yet.',
+                };
+            }
+            const lookback = settings.mapUpdaterDirectLookback ?? settings.routerLookback ?? 10;
+            const result = await run({
+                isManual: true,
+                lookback,
+                directInstruction: action.instruction,
+            });
+            const summary = summarizeMapUpdaterCompanionResult(result);
+            if (summary.success && result?.ok && !result?.noop && typeof runtimeState.refreshImmersionView === 'function') {
+                await runtimeState.refreshImmersionView();
+            }
+            return {
+                action: 'Map Updater',
+                ...summary,
+            };
+        }
+
         const settings = getSettings();
-        if (!settings.routerEnabled) {
+        if (!isLorebookAgentRuntimeActive(settings)) {
             return {
                 action: 'Lorebook Agent',
                 success: false,
@@ -1082,6 +1264,8 @@ async function executeCompanionAction(action) {
     } catch (err) {
         const actionLabel = action.name === 'command_state_tracker'
             ? 'State Tracker'
+            : action.name === 'command_map_updater'
+                ? 'Map Updater'
             : action.name === 'act_for_user'
                 ? 'Player Turn'
                 : 'Lorebook Agent';
@@ -1154,12 +1338,23 @@ export function formatPlayerTurnCommentary(action, modelText = '', completedActi
  * @param {AbortSignal} signal
  * @returns {Promise<string>}
  */
-export async function runCompanionAgentLoop(messages, signal) {
+export async function runCompanionAgentLoop(messages, signal, options = {}) {
     const settings = getAdventureCompanionRequestSettings(getSettings());
     let actionCount = 0;
     const completedActions = [];
+    const passChatId = options.passChatId != null && String(options.passChatId).length > 0
+        ? options.passChatId
+        : resolveActiveChatId();
 
     for (let turn = 0; turn < MAX_COMPANION_AGENT_TURNS; turn++) {
+        if (!canCommitPassForChat(passChatId, resolveActiveChatId(), { aborted: !!signal?.aborted })) {
+            if (completedActions.length > 0) {
+                return formatCompanionActionReceipt(completedActions);
+            }
+            const abortError = new Error('The operation was aborted.');
+            abortError.name = 'AbortError';
+            throw abortError;
+        }
         let result;
         try {
             result = await sendAgentTurn(settings, messages, COMPANION_ACTION_TOOLS, signal);
@@ -1173,6 +1368,7 @@ export async function runCompanionAgentLoop(messages, signal) {
             }
             throw err;
         }
+        const affinityOk = canCommitPassForChat(passChatId, resolveActiveChatId(), { aborted: !!signal?.aborted });
         const nativeAction = result?.toolCall
             ? normalizeCompanionAction(result.toolCall.name, result.toolCall.args)
             : null;
@@ -1182,7 +1378,26 @@ export async function runCompanionAgentLoop(messages, signal) {
         const requestedActions = nativeAction ? [nativeAction] : fallback.actions;
 
         if (!requestedActions.length) {
+            if (!affinityOk) {
+                if (completedActions.length > 0) {
+                    return formatCompanionActionReceipt(completedActions);
+                }
+                const abortError = new Error('The operation was aborted.');
+                abortError.name = 'AbortError';
+                throw abortError;
+            }
             return fallback.visibleText || String(result?.content || '').trim() || '(No response from the model.)';
+        }
+
+        if (!affinityOk) {
+            // LLM returned tool calls after a chat switch — refuse each action
+            // rather than executing against the arriving chat.
+            for (const action of requestedActions) {
+                const actionResult = await executeCompanionAction(action, passChatId, signal);
+                actionCount++;
+                completedActions.push(actionResult);
+            }
+            return formatCompanionActionReceipt(completedActions);
         }
 
         if (actionCount + requestedActions.length > MAX_COMPANION_ACTIONS) {
@@ -1203,9 +1418,12 @@ export async function runCompanionAgentLoop(messages, signal) {
                     },
                 }],
             });
-            const actionResult = await executeCompanionAction(nativeAction);
+            const actionResult = await executeCompanionAction(nativeAction, passChatId, signal);
             actionCount++;
             completedActions.push(actionResult);
+            if (actionResult.status === 'chat_changed' || actionResult.status === 'aborted') {
+                return formatCompanionActionReceipt(completedActions);
+            }
             if (actionResult.success && actionResult.terminal) {
                 return formatPlayerTurnCommentary(nativeAction, result.content, completedActions);
             }
@@ -1220,10 +1438,13 @@ export async function runCompanionAgentLoop(messages, signal) {
         messages.push({ role: 'assistant', content: result.content || '' });
         const batchResults = [];
         for (const action of requestedActions) {
-            const actionResult = await executeCompanionAction(action);
+            const actionResult = await executeCompanionAction(action, passChatId, signal);
             actionCount++;
             completedActions.push(actionResult);
             batchResults.push(actionResult);
+            if (actionResult.status === 'chat_changed' || actionResult.status === 'aborted') {
+                return formatCompanionActionReceipt(completedActions);
+            }
             if (actionResult.success && actionResult.terminal) {
                 return formatPlayerTurnCommentary(action, fallback.visibleText, completedActions);
             }
@@ -1332,9 +1553,11 @@ function syncGearUi() {
     const root = chatUiRoot();
     const lore = /** @type {HTMLInputElement|null} */ (root?.querySelector('#rt-chat-inject-lore'));
     const memo = /** @type {HTMLInputElement|null} */ (root?.querySelector('#rt-chat-inject-memo'));
+    const map = /** @type {HTMLInputElement|null} */ (root?.querySelector('#rt-chat-inject-map'));
     const tutorial = /** @type {HTMLInputElement|null} */ (root?.querySelector('#rt-chat-tutorial-mode'));
     if (lore) lore.checked = !!_prefs.injectLore;
     if (memo) memo.checked = !!_prefs.injectMemo;
+    if (map) map.checked = !!_prefs.injectMap;
     if (tutorial) tutorial.checked = !!_prefs.tutorialMode;
 }
 
@@ -1365,7 +1588,7 @@ function ensureChatShell(panel) {
                 <button type="button" class="rt-chat-tutorial-info-btn" id="rt-chat-tutorial-info-btn" aria-label="About Tutorial Mode" aria-haspopup="dialog" aria-expanded="false">?</button>
                 <div class="rt-chat-tutorial-info" id="rt-chat-tutorial-info" role="dialog" aria-label="About Tutorial Mode" style="display:none;">
                     <strong>TUTORIAL MODE</strong>
-                    <span>Injects the Multihog documentation Markdown file into every Adventure Companion request. It is great while learning the system, but veterans can leave it off to avoid a few thousand extra input tokens. That added cost is usually negligible with a recommended tracker model such as Gemini Flash-Lite or Flash.</span>
+                    <span>Injects the Multihog documentation Markdown file into every Adventure Companion request. It is great while learning the system, but veterans can leave it off to avoid a few thousand extra input tokens. That added cost is usually negligible with inexpensive models such as Gemini Flash-Lite/Flash, Deepseek V4 Flash 0731, or GPT-5.6 Luna.</span>
                 </div>
             </div>
             <div class="rt-chat-gear-wrap">
@@ -1390,6 +1613,10 @@ function ensureChatShell(panel) {
                         <input type="checkbox" id="rt-chat-inject-memo" ${_prefs.injectMemo ? 'checked' : ''}>
                         <span>Inject State Tracker</span>
                     </label>
+                    <label class="rt-chat-gear-item" role="menuitemcheckbox" title="Attach the player-facing current site map (Visuals/Map knowledge).">
+                        <input type="checkbox" id="rt-chat-inject-map" ${_prefs.injectMap ? 'checked' : ''}>
+                        <span>Inject current site map</span>
+                    </label>
                 </div>
             </div>
             <button type="button" class="rpg-tracker-nav-btn rt-tutorial-clear" id="rt-tutorial-clear" title="Clear the Adventure Companion conversation">Clear</button>
@@ -1413,7 +1640,7 @@ function welcomeHtml() {
     return `
         <div class="rt-tutorial-msg rt-tutorial-msg-bot rt-tutorial-welcome">
             <div class="rt-tutorial-msg-label">Adventure Companion</div>
-            <div class="rt-tutorial-msg-body">Ask me about Multihog, brainstorm or discuss your adventure, or ask me to do one of three things: update the State Tracker, update the Lorebook Agent, or take your next turn (chat message / CYOA)—no special command wording required. I can't operate Multihog UI menus myself. Enable Tutorial Mode when you want the framework guide attached to every request.</div>
+            <div class="rt-tutorial-msg-body">Ask me about Multihog, brainstorm or discuss your adventure, or ask me to do one of four things: update the State Tracker, update the Lorebook Agent, update the active site map (Map Updater), or take your next turn (chat message / CYOA)—no special command wording required. I can't operate Multihog UI menus myself. Enable Tutorial Mode when you want the framework guide attached to every request.</div>
         </div>`;
 }
 
@@ -1865,9 +2092,15 @@ async function sendMessage() {
     const text = (input?.value || '').trim();
     if (!text) return;
 
+    // Pin before any await — a mid-flight chat switch must not land companion
+    // actions or history into the arriving chat.
+    const passChatId = resolveActiveChatId();
+    if (!canCommitPassForChat(passChatId, resolveActiveChatId())) return;
+
     if (input) input.value = '';
     const mp = activeModePrefs();
     mp.history.push({ role: 'user', content: text });
+    if (mp.history.length > HISTORY_ENTRY_LIMIT) mp.history.splice(0, mp.history.length - HISTORY_ENTRY_LIMIT);
     savePrefs(_prefs);
     renderTranscript();
 
@@ -1882,14 +2115,18 @@ async function sendMessage() {
     }
 
     setBusy(true);
-    _abort = new AbortController();
+    const controller = new AbortController();
+    _abort = controller;
+    let stillOwnsChat = true;
 
     try {
         readLookbackFromUi();
         const loreChk = /** @type {HTMLInputElement|null} */ (root?.querySelector('#rt-chat-inject-lore'));
         const memoChk = /** @type {HTMLInputElement|null} */ (root?.querySelector('#rt-chat-inject-memo'));
+        const mapChk = /** @type {HTMLInputElement|null} */ (root?.querySelector('#rt-chat-inject-map'));
         _prefs.injectLore = !!loreChk?.checked;
         _prefs.injectMemo = !!memoChk?.checked;
+        _prefs.injectMap = !!mapChk?.checked;
         savePrefs(_prefs);
 
         const narrative = (mp.lookbackAll || mp.lookback > 0)
@@ -1897,19 +2134,42 @@ async function sendMessage() {
             : '';
         const memo = _prefs.injectMemo ? buildMemoContext() : '';
         const lore = _prefs.injectLore ? await buildLoreContext() : '';
+        if (!canCommitPassForChat(passChatId, resolveActiveChatId(), { aborted: controller.signal.aborted })) {
+            stillOwnsChat = false;
+            return;
+        }
+        const map = _prefs.injectMap ? await buildMapContext() : '';
+        if (!canCommitPassForChat(passChatId, resolveActiveChatId(), { aborted: controller.signal.aborted })) {
+            stillOwnsChat = false;
+            return;
+        }
         const doc = _prefs.tutorialMode ? await loadDocumentation() : '';
+        if (!canCommitPassForChat(passChatId, resolveActiveChatId(), { aborted: controller.signal.aborted })) {
+            stillOwnsChat = false;
+            return;
+        }
         const playerAction = buildActForUserContext();
 
-        const systemPrompt = buildSystemPrompt({ doc, narrative, memo, lore, playerAction });
+        const systemPrompt = buildSystemPrompt({ doc, narrative, memo, lore, map, playerAction });
         const messages = [
             { role: 'system', content: systemPrompt },
             ...mp.history.map((m) => ({ role: m.role, content: m.content })),
         ];
-        const reply = await runCompanionAgentLoop(messages, _abort.signal);
+        const reply = await runCompanionAgentLoop(messages, controller.signal, { passChatId });
+        if (!canCommitPassForChat(passChatId, resolveActiveChatId(), { aborted: controller.signal.aborted })) {
+            stillOwnsChat = false;
+            return;
+        }
         mp.history.push({ role: 'assistant', content: reply });
+        if (mp.history.length > HISTORY_ENTRY_LIMIT) mp.history.splice(0, mp.history.length - HISTORY_ENTRY_LIMIT);
     } catch (err) {
-        if (err?.name === 'AbortError') {
+        stillOwnsChat = !controller.signal.aborted && canCommitPassForChat(passChatId, resolveActiveChatId());
+        if (!stillOwnsChat) {
+            // Departing-chat history was already flushed on switch; do not
+            // append cancel/error noise into the arriving companion session.
+        } else if (err?.name === 'AbortError') {
             mp.history.push({ role: 'assistant', content: '(Cancelled.)' });
+            if (mp.history.length > HISTORY_ENTRY_LIMIT) mp.history.splice(0, mp.history.length - HISTORY_ENTRY_LIMIT);
         } else {
             console.error('[CHAT]', err);
             const msg = err?.message || String(err);
@@ -1917,14 +2177,24 @@ async function sendMessage() {
                 role: 'assistant',
                 content: `I could not reach the model. Check Adventure Companion connection settings.\n\n${msg}`,
             });
+            if (mp.history.length > HISTORY_ENTRY_LIMIT) mp.history.splice(0, mp.history.length - HISTORY_ENTRY_LIMIT);
             toastr['error']('CHAT request failed — see conversation.', 'CHAT');
         }
     } finally {
-        _abort = null;
-        setBusy(false);
-        savePrefs(_prefs);
-        chatUiRoot()?.querySelector('#rt-tutorial-pending')?.remove();
-        renderTranscript();
+        // A cancelled request may finish after a new chat starts another request.
+        // Only the request that still owns the UI may release its controls.
+        const ownsUi = _abort === controller;
+        if (ownsUi) {
+            _abort = null;
+            setBusy(false);
+            chatUiRoot()?.querySelector('#rt-tutorial-pending')?.remove();
+        }
+        if (stillOwnsChat && canCommitPassForChat(passChatId, resolveActiveChatId())) {
+            savePrefs(_prefs);
+        }
+        if (stillOwnsChat && canCommitPassForChat(passChatId, resolveActiveChatId())) {
+            renderTranscript();
+        }
     }
 }
 
@@ -2124,6 +2394,14 @@ function bindAdventureCompanionControls(panel) {
         memoChk.dataset.rtTutorialBound = '1';
         memoChk.addEventListener('change', () => {
             updateAdventureCompanionPreferences({ injectMemo: memoChk.checked });
+        });
+    }
+
+    const mapChk = panel.querySelector('#rt-chat-inject-map');
+    if (mapChk instanceof HTMLInputElement && !mapChk.dataset.rtTutorialBound) {
+        mapChk.dataset.rtTutorialBound = '1';
+        mapChk.addEventListener('change', () => {
+            updateAdventureCompanionPreferences({ injectMap: mapChk.checked });
         });
     }
 

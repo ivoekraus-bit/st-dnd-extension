@@ -106,6 +106,54 @@ export function decodeHtml(str) {
         .replace(/&amp;/g, '&');
 }
 
+/** Author-written color markup the Lorebook Agent and tracker should keep. */
+export const FONT_COLOR_TAG_RE = /<font\s+color\s*=\s*["']?(#[0-9a-fA-F]{3,8}|[a-zA-Z]+)["']?>([\s\S]*?)<\/font>/gi;
+const HEX_COLOR_TOKEN_RE = /^\[#[0-9a-fA-F]{3,8}\]$/;
+const RARITY_TOKEN_RE = /^\[(poor|common|uncommon|rare|epic|legendary|artifact|heirloom)\]$/i;
+
+/**
+ * True for a line that is only a bookkeeping timestamp like `[Day 1]` or `[4:47 PM, Day 2]`.
+ * Hex color tokens (`[#ff5555]`) and rarity tags (`[Epic]`) are not timestamps.
+ * @param {string} trimmed
+ */
+export function isStrippableBareBracketLine(trimmed) {
+    const line = String(trimmed || '').trim();
+    if (!/^\[[^\]]+\]\s*$/.test(line)) return false;
+    if (/^\[\/?core\]$/i.test(line)) return false;
+    if (HEX_COLOR_TOKEN_RE.test(line) || RARITY_TOKEN_RE.test(line)) return false;
+    return true;
+}
+
+/**
+ * Models often emit `<font color="#rrggbb">` inside JSON strings. Those unescaped
+ * quotes break JSON.parse and the whole Lorebook Agent commit is dropped.
+ * Normalize to unquoted hex/named colors before parsing.
+ * @param {string} raw
+ * @returns {string}
+ */
+export function repairJsonColorAttributes(raw) {
+    if (!raw || typeof raw !== 'string') return raw;
+    return raw.replace(/<font\s+color\s*=\s*["'](#[0-9a-fA-F]{3,8}|[a-zA-Z]+)["']/gi, '<font color=$1');
+}
+
+/**
+ * JSON.parse that first repairs unquoted-breaking font color attributes.
+ * @param {string} raw
+ * @returns {{ ok: boolean, value: any, error?: string }}
+ */
+export function parseJsonWithColorRepair(raw) {
+    if (typeof raw !== 'string') return { ok: true, value: raw ?? {} };
+    try {
+        return { ok: true, value: JSON.parse(raw) };
+    } catch (first) {
+        try {
+            return { ok: true, value: JSON.parse(repairJsonColorAttributes(raw)) };
+        } catch (_) {
+            return { ok: false, value: {}, error: String(first?.message || first) };
+        }
+    }
+}
+
 /**
  * Strips bare timestamp-only lines and a leading timestamp immediately before [CORE].
  * Used when saving or displaying lorebook record content.
@@ -120,7 +168,7 @@ export function sanitizeLorebookRecordContent(content) {
         .filter(line => {
             const trimmed = line.trim();
             if (/^\[\/?core\]$/i.test(trimmed)) return true;
-            return !/^\[[^\]]+\]\s*$/.test(trimmed);
+            return !isStrippableBareBracketLine(trimmed);
         })
         .join('\n')
         .replace(/\n{3,}/g, '\n\n')
@@ -153,6 +201,33 @@ export function extractCurrentTimeStr(timeBlockContent) {
     const timeLine = lines.find(line => !line.toLowerCase().startsWith('last rest:'));
     if (!timeLine) return '';
     return timeLine.replace(/^(?:current\s+)?time:\s*/i, '').trim();
+}
+
+/** Replace the current-time line inside a [TIME] block, preserving Last Rest. */
+export function replaceMemoCurrentTime(memo, timeLabel) {
+    const label = String(timeLabel || '').trim();
+    const source = String(memo || '');
+    if (!label) return source;
+    if (!/\[TIME\]/i.test(source)) {
+        return `${source.trimEnd()}${source.trim() ? '\n\n' : ''}[TIME]\n${label}\n[/TIME]\n`;
+    }
+    return source.replace(/\[TIME\]([\s\S]*?)\[\/TIME\]/i, (_, inner) => {
+        const lines = inner.split('\n');
+        let replaced = false;
+        const next = lines.map(line => {
+            if (!replaced && line.trim() && !/^\s*last rest:/i.test(line)) {
+                replaced = true;
+                const prefix = line.match(/^\s*/)?.[0] || '';
+                return `${prefix}${label}`;
+            }
+            return line;
+        });
+        if (!replaced) {
+            const insertAt = next[0] === '' ? 1 : 0;
+            next.splice(insertAt, 0, label);
+        }
+        return `[TIME]${next.join('\n')}[/TIME]`;
+    });
 }
 
 /**
@@ -406,7 +481,12 @@ export function mergeMemo(currentMemo, aiOutput) {
             continue;
         }
 
-        const isRemoval = /^(?:REMOVED|EXPIRED|CLEARED|NONE|END_COMBAT)$/i.test(newContent);
+        // An empty tag pair (e.g. `[PARTY]\n[/PARTY]`) carries zero information — treat it
+        // identically to an explicit removal marker so it never gets written into the
+        // persisted memo as literal clutter. This matters most for Full Review Mode, where
+        // weaker models sometimes emit a hollow block for a module with nothing to report
+        // instead of omitting the section entirely.
+        const isRemoval = newContent === '' || /^(?:REMOVED|EXPIRED|CLEARED|NONE|END_COMBAT)$/i.test(newContent);
 
         const escapedTag = escapeRegex(tag);
         let mergedContent = newContent;
@@ -1481,8 +1561,23 @@ export function cleanMessageContent(msg) {
         mes = mes.replace(extraThought, '');
     }
 
-    // Strip any remaining HTML/XML tags
+    // Private dungeon maps are persistence payloads for the extension, not
+    // narrative evidence for the Lorebook Agent. Removing the whole block
+    // prevents undiscovered rooms, enemies, and traps from becoming visible
+    // child Location entries. Accept the common malformed `</div hidden>` too.
+    mes = mes.replace(/<div\b(?=[^>]*\bdata-dungeon-(?:map|delta)\b)[^>]*>[\s\S]*?<\/div(?:\s+hidden)?>/gi, '');
+
+    // Keep author-written <font color=...> tags (hex name colors) so Full Audit
+    // and Direct Prompt can see them. Other HTML/XML is still stripped to text.
+    const fontPlaceholders = [];
+    FONT_COLOR_TAG_RE.lastIndex = 0;
+    mes = mes.replace(FONT_COLOR_TAG_RE, (_, color, inner) => {
+        const safeInner = String(inner || '').replace(/<[^>]+>/g, '');
+        fontPlaceholders.push(`<font color=${color}>${safeInner}</font>`);
+        return `\x01FONT${fontPlaceholders.length - 1}\x02`;
+    });
     mes = mes.replace(/<[^>]+>/g, '');
+    mes = mes.replace(/\x01FONT(\d+)\x02/g, (_, i) => fontPlaceholders[Number(i)] || '');
 
     return mes.trim();
 }
@@ -1491,8 +1586,60 @@ export function cleanMessageContent(msg) {
 // ── User action extraction ────────────────────────────────────────────────────
 
 /**
+ * Strip Multihog core prompt injections from a user-message string.
+ * @param {string} text
+ * @param {{ keepRng?: boolean, keepMemo?: boolean }} [opts]
+ * @returns {string}
+ */
+export function stripPromptInjectionsFromUserText(text, opts = {}) {
+    let raw = String(text || '');
+    if (!raw) return '';
+
+    // Prefer the payload after the last CURRENT USER INPUT marker (fresh typed text).
+    const inputParts = raw.split(/###\s*CURRENT USER INPUT\s*\n/i);
+    if (inputParts.length > 1) {
+        raw = inputParts[inputParts.length - 1];
+    }
+
+    if (!opts.keepMemo) {
+        raw = raw.replace(/<state_memo>[\s\S]*?<\/state_memo>[ \t]*\n?/gi, '');
+        raw = raw.replace(/###\s*STATE MEMO[^]*?(?=\n\[RNG_QUEUE|\n###|\n\[(?!RNG_QUEUE)[A-Z]|<CYOA_mode>|<high_agency_mode_on>|<output_length>|<slice_of_life_mode_on>|$)/i, '');
+        raw = raw.replace(/##\s*TRACKER STATE 0[^\n]*\n?/gi, '');
+    }
+    if (!opts.keepRng) {
+        raw = raw.replace(/\[RNG_QUEUE(?:_d100)?\s[^\]]*\][\s\S]*?\[\/RNG_QUEUE(?:_d100)?\][ \t]*\n?/gi, '');
+    }
+    raw = raw.replace(/<CYOA_mode>[\s\S]*?<\/CYOA_mode>[ \t]*\n?/gi, '');
+    raw = raw.replace(/<high_agency_mode_on>[\s\S]*?<\/high_agency_mode_on>[ \t]*\n?/gi, '');
+    raw = raw.replace(/<output_length>[\s\S]*?<\/output_length>[ \t]*\n?/gi, '');
+    raw = raw.replace(/<slice_of_life_mode_on>[\s\S]*?<\/slice_of_life_mode_on>[ \t]*\n?/gi, '');
+    raw = raw.replace(/\[PLAYER_CHARACTER\][\s\S]*?\[\/PLAYER_CHARACTER\][ \t]*\n?/gi, '');
+    raw = raw.replace(/\[NPC_RELATIONS\][\s\S]*?\[\/NPC_RELATIONS\][ \t]*\n?/gi, '');
+    raw = raw.replace(/\[[A-Z_]+\][\s\S]*?\[\/[A-Z_]+\]/g, '');
+    raw = raw.replace(/###\s*CURRENT USER INPUT[^\n]*\n?/gi, '');
+    raw = raw.replace(/\[Continue the narrative\]/gi, '');
+
+    return raw.trim();
+}
+
+/**
+ * Strip only CYOA + pacing tags (leave RNG/memo intact on older turns).
+ * @param {string} text
+ * @returns {string}
+ */
+export function stripCyoaAndPacingInjections(text) {
+    let raw = String(text || '');
+    if (!raw) return '';
+    raw = raw.replace(/<CYOA_mode>[\s\S]*?<\/CYOA_mode>[ \t]*\n?/gi, '');
+    raw = raw.replace(/<high_agency_mode_on>[\s\S]*?<\/high_agency_mode_on>[ \t]*\n?/gi, '');
+    raw = raw.replace(/<output_length>[\s\S]*?<\/output_length>[ \t]*\n?/gi, '');
+    raw = raw.replace(/<slice_of_life_mode_on>[\s\S]*?<\/slice_of_life_mode_on>[ \t]*\n?/gi, '');
+    return raw.replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/**
  * Extracts the last user message from the chat, stripping injected blocks
- * (STATE MEMO, RNG_QUEUE) so only the player's actual typed input remains.
+ * (STATE MEMO, RNG_QUEUE, CYOA, pacing) so only the player's actual typed input remains.
  */
 export function getLastUserAction() {
     const { chat } = SillyTavern.getContext();
@@ -1514,13 +1661,7 @@ export function getLastUserAction() {
         raw = String(raw);
     }
 
-    raw = raw.replace(/###\s*STATE MEMO[^]*?(?=\n\[RNG_QUEUE|\n###|\n\[(?!RNG_QUEUE)[A-Z]|$)/i, '');
-    raw = raw.replace(/\[RNG_QUEUE(?:_d100)?\s[^\]]*\][\s\S]*?\[\/RNG_QUEUE(?:_d100)?\][ \t]*\n?/gi, '');
-    raw = raw.replace(/\[[A-Z_]+\][\s\S]*?\[\/[A-Z_]+\]/g, '');
-    raw = raw.replace(/###\s*CURRENT USER INPUT[^\n]*\n?/gi, '');
-    raw = raw.replace(/\[Continue the narrative\]/gi, '');
-
-    return raw.trim();
+    return stripPromptInjectionsFromUserText(raw);
 }
 
 // ── Lorebook context builder ──────────────────────────────────────────────────

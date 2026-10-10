@@ -1,9 +1,22 @@
-import { getSettings, getEffectiveRouterCampaignPrefix, saveChatState } from './state-manager.js';
+import { getSettings, getActiveChatId, getEffectiveRouterCampaignPrefix, saveChatState } from './state-manager.js';
 import { escapeHtml } from './memo-processor.js';
-import { normalizeLocationPath, resolveLocationImageWithMeta, triggerBackgroundLocationGeneration, hasLocationImage, getLinkedPlayerCharacter, isLocationImageGenerating, resolvePortraitSrcForPlayerCharacter } from './portraits.js';
+import { normalizeLocationPath, resolveLocationImageWithMeta, triggerBackgroundLocationGeneration, hasLocationImage, getLinkedPlayerCharacter, isLocationImageGenerating, resolvePortraitSrcForPlayerCharacter, applyLocationImageToChatBackground } from './portraits.js';
 import { resolvePortraitDisplaySrc, lookupCustomPortraitSrc } from './portrait-storage.js';
 import { resolveCurrentLocationPath, formatLocationBreadcrumb } from './location-resolver.js';
-import { scanRecentOutputForPresentNpcs } from './router.js';
+import { isWorldInfoBookKnown, scanRecentOutputForPresentNpcs } from './router.js';
+import { canCommitPassForChat, createChatCommitGuard, chatCommitResult } from './src/state/pass-affinity.js';
+import { canUseSceneMemo } from './src/state/scene-affinity.js';
+import { resolveDungeonMapForLocation, resolveDungeonMapFromHistorySnapshot, stripDungeonMapSection } from './dungeon-reality.js';
+import { buildDungeonMapGraph, renderDungeonMapEmbedHtml } from './dungeon-map-graph.js';
+import { isDungeonMapDetached, isDungeonMapRevealAll } from './src/ui/panel/dungeon-map-panel.js';
+import { isLocationMappingEnabled } from './src/state/section-enabled.js';
+import { runtimeState } from './src/app/runtime-state.js';
+
+/** Prefer a pinned pass id, then the tracked chat, then ST's possibly-stale ctx.chatId. */
+function resolveImmersionChatId(optsChatId, ctx) {
+    if (optsChatId != null && String(optsChatId).length > 0) return String(optsChatId);
+    return getActiveChatId() || ctx?.chatId || null;
+}
 
 /**
  * Parse current location from recent chat status footer, then memo [TIME] block.
@@ -24,6 +37,23 @@ export function getCurrentLocationText(memo, ctx) {
     return locMatch ? locMatch[1].trim() : '';
 }
 
+/** Apply the current location image when the user opted into chat-background syncing. */
+export function syncCurrentLocationBackground(scene) {
+    const s = getSettings();
+    if (!s.portraitAutoApplyLocationBackground || !s.locationImages) return;
+    if (scene?.locationImage) applyLocationImageToChatBackground(scene.locationImage);
+}
+
+globalThis._rpgSyncCurrentLocationBackground = async () => {
+    const s = getSettings();
+    if (!s.portraitAutoApplyLocationBackground || !s.locationImages) return;
+    // The builder applies the current image before loading NPCs. Reapplying its
+    // result here could overwrite a newer scene that finished while NPCs loaded.
+    await buildImmersionSceneState(s.currentMemo, s);
+};
+
+let latestBackgroundSceneRequest = 0;
+
 /**
  * @param {object} ctx
  * @param {object} settings
@@ -31,29 +61,44 @@ export function getCurrentLocationText(memo, ctx) {
  */
 export async function loadAllLocationPaths(ctx, settings) {
     const s = settings || getSettings();
-    const chatId = ctx?.chatId;
+    // Prefer tracked chat — ctx.chatId can lag during CHAT_CHANGED / MESSAGE_SWIPED.
+    const chatId = resolveImmersionChatId(null, ctx);
     if (!chatId) return [];
 
     const prefix = getEffectiveRouterCampaignPrefix(chatId);
     const bookName = prefix ? `${prefix}_Locations` : 'Locations';
 
     try {
-        if (typeof ctx.updateWorldInfoList === 'function') {
-            await ctx.updateWorldInfoList();
-        }
+        if (!await isWorldInfoBookKnown(bookName, ctx)) return [];
         const book = await ctx.loadWorldInfo(bookName);
-        if (!book?.entries) return [];
-        return Object.values(book.entries)
-            .map(e => normalizeLocationPath((e.comment || '').trim()))
-            .filter(Boolean);
+        return getLocationPathsFromBook(book);
     } catch (err) {
         console.error('[RPG Tracker] loadAllLocationPaths error:', err);
         return [];
     }
 }
 
+/** Return normalized Location paths without cloning or reloading the lorebook. */
+export function getLocationPathsFromBook(book) {
+    if (!book?.entries) return [];
+    return Object.values(book.entries)
+        .map(e => normalizeLocationPath((e.comment || '').trim()))
+        .filter(Boolean);
+}
+
+function findLocationEntryInBook(book, normPath) {
+    if (!book?.entries || !normPath) return null;
+    for (const [uid, entry] of Object.entries(book.entries)) {
+        const label = normalizeLocationPath((entry.comment || '').trim());
+        if (label === normPath) return { uid, entry, label };
+    }
+    return null;
+}
+
 /**
  * Present Now NPCs from a name scan of the most recent narrator output only.
+ * User messages are skipped so a player turn without NPC names does not clear the list.
+ * CYOA choice/button blocks are ignored so names in unused options do not count.
  * Matches NPC entry labels (first/last name); ignores lorebook key[] keywords.
  * Independent of Lorebook Agent activeRouterKeys (avoids stale characters).
  * @param {object} settings
@@ -111,25 +156,25 @@ export async function loadLocationEntryByPath(path, settings) {
 
     const s = settings || getSettings();
     const ctx = SillyTavern.getContext();
-    const prefix = getEffectiveRouterCampaignPrefix(ctx.chatId);
+    // Prefer tracked chat — ctx.chatId can lag during CHAT_CHANGED / MESSAGE_SWIPED.
+    const chatId = resolveImmersionChatId(null, ctx);
+    const prefix = getEffectiveRouterCampaignPrefix(chatId || '');
     const bookName = prefix ? `${prefix}_Locations` : 'Locations';
 
     try {
+        if (!await isWorldInfoBookKnown(bookName, ctx)) return null;
         const book = await ctx.loadWorldInfo(bookName);
-        if (!book?.entries) return null;
-        for (const [uid, entry] of Object.entries(book.entries)) {
-            const label = normalizeLocationPath((entry.comment || '').trim());
-            if (label !== normPath) continue;
-            const fullId = `${bookName}::${uid}`;
-            return {
-                id: fullId,
-                label: entry.comment || label,
-                content: entry.content || '',
-                keys: entry.key,
-                is_active: (s.activeRouterKeys || []).includes(fullId),
-                book: bookName,
-            };
-        }
+        const match = findLocationEntryInBook(book, normPath);
+        if (!match) return null;
+        const fullId = `${bookName}::${match.uid}`;
+        return {
+            id: fullId,
+            label: match.entry.comment || match.label,
+            content: stripDungeonMapSection(match.entry.content || ''),
+            keys: match.entry.key,
+            is_active: (s.activeRouterKeys || []).includes(fullId),
+            book: bookName,
+        };
     } catch (err) {
         console.error('[RPG Tracker] loadLocationEntryByPath error:', err);
     }
@@ -169,29 +214,41 @@ export async function loadNpcEntryByKey(entryId, settings) {
 /**
  * @param {string} memo
  * @param {object} [settings]
+ * @param {{ chatId?: string|null }} [opts] Originating chat — never re-read live ctx.chatId for books.
  * @returns {Promise<object>}
  */
-export async function buildImmersionSceneState(memo, settings) {
+export async function buildImmersionSceneState(memo, settings, opts = {}) {
+    const backgroundRequest = ++latestBackgroundSceneRequest;
     const s = settings || getSettings();
     const ctx = SillyTavern.getContext();
+    // Prefer the pinned / tracked chat — ctx.chatId can lag behind runtimeState during
+    // CHAT_CHANGED / MESSAGE_SWIPED, which would load another campaign's Locations book
+    // and enqueue its scene art into this chat's portrait store.
+    const backgroundChatId = resolveImmersionChatId(opts.chatId, ctx);
+    const ownsBackground = createChatCommitGuard(backgroundChatId, getActiveChatId);
+    const backgroundMemo = memo ?? s.currentMemo;
+    const backgroundMemoCurrent = canUseSceneMemo(s, backgroundChatId, backgroundMemo);
 
     const rawLocationText = getCurrentLocationText(memo ?? s.currentMemo, ctx);
-    const allLocationPaths = await loadAllLocationPaths(ctx, s);
+    const prefix = getEffectiveRouterCampaignPrefix(backgroundChatId || '');
+    const locationBookName = prefix ? `${prefix}_Locations` : 'Locations';
+    let locationBook = null;
+    try {
+        if (await isWorldInfoBookKnown(locationBookName, ctx)) {
+            // One load per Scene View refresh. worldInfoCache clones on every get,
+            // so the old path could make four full copies of a large Locations book.
+            locationBook = await ctx.loadWorldInfo(locationBookName);
+        }
+    } catch (_) {
+        locationBook = null;
+    }
+    const allLocationPaths = getLocationPathsFromBook(locationBook);
 
     const activeLocLabels = [];
-    const locBooks = {};
     for (const k of s.activeRouterKeys || []) {
         const [bookName, uid] = k.split('::');
-        const lower = (bookName || '').toLowerCase();
-        if (!lower.endsWith('_locations') && !lower.endsWith('_location') && lower !== 'locations' && lower !== 'location') continue;
-        if (!locBooks[bookName]) {
-            try {
-                locBooks[bookName] = await ctx.loadWorldInfo(bookName);
-            } catch {
-                locBooks[bookName] = null;
-            }
-        }
-        const entry = locBooks[bookName]?.entries?.[uid];
+        if (String(bookName || '').toLowerCase() !== locationBookName.toLowerCase()) continue;
+        const entry = locationBook?.entries?.[uid];
         const label = normalizeLocationPath((entry?.comment || '').trim());
         if (label) activeLocLabels.push(label);
     }
@@ -204,16 +261,42 @@ export async function buildImmersionSceneState(memo, settings) {
 
     let locationContent = '';
     if (resolvedPath) {
-        const entry = await loadLocationEntryByPath(resolvedPath, s);
-        locationContent = entry?.content || '';
+        const match = findLocationEntryInBook(locationBook, normalizeLocationPath(resolvedPath));
+        locationContent = stripDungeonMapSection(match?.entry?.content || '');
     }
 
     const locationImage = storagePath ? resolveLocationImageWithMeta(storagePath).src : '';
+    const liveCtx = SillyTavern.getContext();
+    if (ownsBackground() && backgroundRequest === latestBackgroundSceneRequest
+        && backgroundMemoCurrent
+        && canUseSceneMemo(getSettings(), backgroundChatId, backgroundMemo)
+        && backgroundChatId === getActiveChatId()
+        && rawLocationText === getCurrentLocationText(getSettings().currentMemo, liveCtx)) {
+        syncCurrentLocationBackground({ locationImage });
+    }
     const locationBreadcrumb = resolvedPath ? formatLocationBreadcrumb(resolvedPath) : '';
     const locationLeaf = resolvedPath ? resolvedPath.split(' :: ').pop() : rawLocationText;
 
     let npcs = await loadActiveSceneNpcs(s, ctx);
     npcs = prependPlayerCharacterToSceneNpcs(npcs, s, ctx);
+
+    let dungeonMap = null;
+    if (isLocationMappingEnabled(s)) {
+        try {
+            const overlay = runtimeState.dungeonMapHistoryOverlay;
+            if (overlay) {
+                dungeonMap = resolveDungeonMapFromHistorySnapshot(overlay, rawLocationText || resolvedPath);
+            } else if (locationBook?.entries) {
+                    dungeonMap = resolveDungeonMapForLocation(
+                        locationBook.entries,
+                        rawLocationText || resolvedPath,
+                        locationBookName,
+                    );
+            }
+        } catch (err) {
+            console.error('[RPG Tracker] dungeon map scene resolve failed:', err);
+        }
+    }
 
     return {
         rawLocationText,
@@ -224,6 +307,7 @@ export async function buildImmersionSceneState(memo, settings) {
         locationBreadcrumb,
         locationLeaf,
         npcs,
+        dungeonMap,
         locationImagesEnabled: !!s.locationImages,
         npcPortraitsEnabled: s.npcPortraits !== false,
         isLocationGenerating: storagePath ? isLocationImageGenerating(storagePath) : false,
@@ -288,9 +372,21 @@ export function renderImmersionViewHtml(scene) {
         }).join('')
         : `<div class="rt-immersion-empty">No player character linked and no NPCs named in the latest narrator output.</div>`;
 
+    let mapHtml = '';
+    if (scene.dungeonMap?.document) {
+        const graph = buildDungeonMapGraph(scene.dungeonMap.document, {
+            playerFacing: !isDungeonMapRevealAll(),
+            currentLocation: rawLocationText || resolvedPath || '',
+        });
+        mapHtml = renderDungeonMapEmbedHtml(graph, {
+            detached: isDungeonMapDetached(),
+            siteRoot: scene.dungeonMap.siteRoot || graph.site,
+        });
+    }
+
     return `<div class="rt-immersion-root">
         ${locationImagesEnabled ? `
-        <div class="rt-immersion-hero-wrap${isLocationGenerating ? ' rt-immersion-hero-generating' : ''}" ${locDataAttrs} role="button" tabindex="0" title="${isLocationGenerating ? 'Generating scene art…' : (locationImage ? 'View location' : 'Set location image')}">
+        <div class="rt-immersion-hero-wrap${isLocationGenerating ? ' rt-immersion-hero-generating' : ''}" ${locDataAttrs} role="button" tabindex="0" title="${isLocationGenerating ? 'Generating scene art…' : (locationImage ? 'Manage location image' : 'Set location image')}">
             ${heroInner}
             ${generatingOverlay}
             <div class="rt-immersion-hero-overlay">
@@ -302,6 +398,7 @@ export function renderImmersionViewHtml(scene) {
             <div class="rt-immersion-hero-title">${locTitle}</div>
             ${breadcrumbHtml}
         </div>`}
+        ${mapHtml}
         <div class="rt-immersion-section-label">Present now</div>
         <div class="rt-immersion-npc-grid">${npcTiles}</div>
     </div>`;
@@ -318,10 +415,6 @@ let _lastImmersionSceneArtChatLen = null;
 
 const _lastLocSessionKey = (chatId) => `rpg_rt_last_loc_${chatId || 'default'}`;
 const _lastChatLenSessionKey = (chatId) => `rpg_rt_last_loc_chatlen_${chatId || 'default'}`;
-
-function getActiveChatId() {
-    return typeof globalThis._rpgCurrentChatId === 'function' ? globalThis._rpgCurrentChatId() : null;
-}
 
 function getChatMessageCount() {
     try {
@@ -406,18 +499,18 @@ function getLastImmersionSceneArtChatLen() {
     return readPersistedImmersionSceneArtChatLen(getActiveChatId());
 }
 
-function rememberImmersionSceneArtPath(storagePath) {
+function rememberImmersionSceneArtPath(storagePath, chatId = getActiveChatId()) {
     if (!storagePath || _lastImmersionSceneArtPath === storagePath) return;
     _lastImmersionSceneArtPath = storagePath;
-    persistImmersionSceneArtPath(getActiveChatId(), storagePath);
+    persistImmersionSceneArtPath(chatId, storagePath);
 }
 
-function rememberImmersionSceneArtChatLen(chatLen) {
+function rememberImmersionSceneArtChatLen(chatLen, chatId = getActiveChatId()) {
     if (chatLen == null || !Number.isFinite(Number(chatLen))) return;
     const n = Number(chatLen);
     if (_lastImmersionSceneArtChatLen === n) return;
     _lastImmersionSceneArtChatLen = n;
-    persistImmersionSceneArtChatLen(getActiveChatId(), n);
+    persistImmersionSceneArtChatLen(chatId, n);
 }
 
 /** Restore visit tracking after F5 / loadChatState (avoids treating reload as a new arrival). */
@@ -435,33 +528,54 @@ export function resetImmersionSceneArtTracking() {
 }
 
 /**
- * @returns {'location_change'|'every_n_outputs'}
+ * @returns {'location_enter'|'location_change'|'every_n_outputs'}
  */
 function getRealtimeTriggerMode(s) {
-    return s.portraitRealtimeTriggerMode === 'every_n_outputs' ? 'every_n_outputs' : 'location_change';
+    return ['location_enter', 'every_n_outputs'].includes(s.portraitRealtimeTriggerMode)
+        ? s.portraitRealtimeTriggerMode : 'location_change';
 }
 
 /**
  * Run Real-Time scene-art generation check (safe to call on every generation end).
- * Does not require Visualization Mode to be open.
+ * Does not require Visuals/Map to be open.
  */
 export async function runRealtimeSceneArtCheck() {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     const s = getSettings();
     if (!s.portraitAutoGenerateSceneView) return;
     if (!s.locationImages || s.enablePortraits === false) return;
+    // Pin before lorebook await — a mid-check chat switch must not stamp visit
+    // tracking or queue Real-Time location gen into the arriving chat.
+    // Also snapshot the memo string: onChatChanged can flip chat id first and
+    // only later project the arriving partition, so chat affinity alone is not
+    // enough when the build started against the departing live memo.
+    const passChatId = getActiveChatId();
+    const memoAtStart = s.currentMemo;
+    if (!canUseSceneMemo(s, passChatId, memoAtStart)) return;
     try {
-        const scene = await buildImmersionSceneState(s.currentMemo, s);
+        const scene = chatCommitResult(ownsChat, await buildImmersionSceneState(memoAtStart, s, { chatId: passChatId }));
+        if (!canCommitPassForChat(passChatId, getActiveChatId())) return;
+        if (!canUseSceneMemo(getSettings(), passChatId, memoAtStart)) return;
         maybeAutoGenerateImmersionSceneArt(scene, () => {
             if (typeof globalThis._rpgRefreshImmersionView === 'function') {
                 void globalThis._rpgRefreshImmersionView();
             }
-        });
+        }, { chatId: passChatId });
     } catch (err) {
+        if (!ownsChat()) return;
+
         console.error('[RPG Tracker] runRealtimeSceneArtCheck failed:', err);
     }
 }
 
-export function maybeAutoGenerateImmersionSceneArt(scene, refresh) {
+/**
+ * @param {object} scene From buildImmersionSceneState
+ * @param {() => void} [refresh]
+ * @param {{ chatId?: string|null }} [opts] Originating chat for visit stamps and image writes.
+ */
+export function maybeAutoGenerateImmersionSceneArt(scene, refresh, opts = {}) {
+    const passChatId = resolveImmersionChatId(opts.chatId, SillyTavern.getContext());
+    if (!canCommitPassForChat(passChatId, getActiveChatId())) return;
     const s = getSettings();
     if (!s.portraitAutoGenerateSceneView) return;
     if (!s.locationImages || s.enablePortraits === false) return;
@@ -480,7 +594,7 @@ export function maybeAutoGenerateImmersionSceneArt(scene, refresh) {
     let dueToLocation = false;
     let dueToOutputs = false;
 
-    if (!hasImage || locationChanged) {
+    if (!hasImage || (mode !== 'location_enter' && locationChanged)) {
         dueToLocation = true;
     }
 
@@ -490,17 +604,18 @@ export function maybeAutoGenerateImmersionSceneArt(scene, refresh) {
 
     // Track the current place even when skipping generation (so revisits don't re-fire forever).
     if (!dueToLocation && !dueToOutputs) {
-        if (locationChanged) rememberImmersionSceneArtPath(storagePath);
+        if (locationChanged) rememberImmersionSceneArtPath(storagePath, passChatId);
         if (mode === 'every_n_outputs' && lastChatLen == null) {
-            rememberImmersionSceneArtChatLen(chatLen);
+            rememberImmersionSceneArtChatLen(chatLen, passChatId);
         }
         return;
     }
 
-    rememberImmersionSceneArtPath(storagePath);
-    rememberImmersionSceneArtChatLen(chatLen);
+    rememberImmersionSceneArtPath(storagePath, passChatId);
+    rememberImmersionSceneArtChatLen(chatLen, passChatId);
     triggerBackgroundLocationGeneration(storagePath, refresh, scene.locationContent || '', {
         realtimeArrival: true,
         forceReplace: hasLocationImage(storagePath) || dueToOutputs,
+        chatId: passChatId,
     });
 }

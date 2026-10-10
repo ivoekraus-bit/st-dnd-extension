@@ -1,25 +1,105 @@
-import { getSettings, getEffectiveRouterCampaignPrefix, persistWorldProgressionTimer, persistRouterLastRunWatermark, persistRouterLastRunTimestamp, getNpcRelationshipMax, clampRelationshipValue, buildRouterRelationshipInstruction, sanitizeRouterState, adjustPromptTimestamps, DEFAULT_NPC_SECTIONS, saveChatState } from './state-manager.js';
+import { getSettings, getActiveChatId, getEffectiveRouterCampaignPrefix, persistWorldProgressionTimer, persistRouterLastRunWatermark, persistRouterLastRunTimestamp, persistMapEvolutionState, getNpcRelationshipMax, clampRelationshipValue, buildRouterRelationshipInstruction, sanitizeRouterState, adjustPromptTimestamps, DEFAULT_NPC_SECTIONS, saveChatState, computeUnpinnedActiveCount, extractCharacterBlock, extractPartyBlock, isPcCoreTarget, isAppearanceField, isEquipmentField, isCombatProfileField, getEligibleCoreFieldNames, patchLabeledSection, mergePreservedColorMarkup, expandLorebookPromptTemplate, resolveRecordCategoryTag, getEnabledRouterCategoryTags, getRouterCategoryBookSuffix, buildRouterCategoryMap } from './state-manager.js';
 import { sendStateRequest, sendAgentTurn } from './llm-client.js';
+import { canCommitPassForChat, createChatCommitGuard, assertChatCommit, chatCommitResult } from './src/state/pass-affinity.js';
 import { getRequestHeaders } from '../../../../script.js';
-import { extractCurrentTimeStr, cleanMessageContent, parseInWorldTime, formatInWorldTime, findNthUserMessageStartIdx, formatAgentChatLogFromIndex, sanitizeLorebookRecordContent } from './memo-processor.js';
+import { extractCurrentTimeStr, cleanMessageContent, parseInWorldTime, formatInWorldTime, findNthUserMessageStartIdx, formatAgentChatLogFromIndex, sanitizeLorebookRecordContent, parseJsonWithColorRepair } from './memo-processor.js';
 import { recordSchedulerEvent } from './swipe-scheduler-debug.js';
 import { saveSettings } from './src/app/runtime-bridge.js';
+import { isLorebookAgentRuntimeActive, isLocationMappingEnabled } from './src/state/section-enabled.js';
+import { buildSkeletonLorebookSourceContext } from './src/features/world-progression/skeleton-lorebooks.js';
+import { buildNpcRelationshipInstruction } from './src/state/relationship-prompts.js';
+import {
+    resolveAutoPassRestriction,
+    resolveCombatProfileGuidance,
+    resolveExistingNpcNudge,
+} from './src/state/lorebook-runtime-fragments.js';
+import {
+    bookBelongsToCampaignPrefix as bookBelongsToPrefix,
+    getCreatedLorebookNames,
+    getLorebookSnapshotNames,
+    isLoreHistoryEntryForChat,
+    isLoreRedoEntryForChat,
+    trimLoreHistoryForRollback,
+} from './src/state/lorebook-history.js';
+import { buildKeyringText, grepLoreInBooks, isSkeletonBookName, resolveBooksToScan } from './src/state/lorebook-keyring.js';
+import { findMostRecentNarratorMessage, stripCyoaChoiceBlocks } from './src/state/present-now.js';
+import {
+    applyDungeonMapTransaction,
+    attachDungeonMapToLocationEntry,
+    applyMappedSiteLocationCore,
+    detachDungeonMapFromLocationEntry,
+    buildDungeonSitesFromLocationEntries,
+    collectDungeonMapCandidates,
+    dungeonLabelIdentitiesMatch,
+    dungeonLabelsMatch,
+    dungeonSiteRootsMatch,
+    normalizeDungeonLabel,
+    normalizeMapSiteKind,
+    extractDungeonMapSection,
+    extractFooterLocation,
+    findLatestDungeonLocation,
+    locationContainsSiteRoot,
+    getDungeonMapAttachment,
+    listMappedSiteDocuments,
+    mappedSiteBoilerplateCore,
+    migrateDungeonMapAttachmentToContent,
+    parseDungeonMapDocument,
+    reconcileDungeonMapAreaKnowledge,
+    replaceDungeonMapSection,
+    resolveActiveDungeonSite,
+    resolveCurrentMapPlacement,
+    serializeDungeonMapDocument,
+    stripDungeonMapSection,
+    collectDungeonMapHistorySnapshot,
+    applyDungeonMapHistorySnapshotToBook,
+    DUNGEON_MAP_OPERATION_IDS_KEY,
+} from './dungeon-reality.js';
+import { recordLiveDungeonMapSnapshot } from './src/state/dungeon-map-history.js';
+import { HISTORY_ENTRY_LIMIT, LOREBOOK_ROLLBACK_LIMIT } from './src/state/history-retention.js';
+import { buildHostedPeerSitePath, ensureHostCoreMirror, MAX_HOSTED_MAP_DEPTH, reparentHostedLocationEntries, stampHostedPeerDocument } from './map-hosting.js';
+import { clearEvolutionHistoryForSite, setSiteEvolutionIntervalOverride } from './map-evolution-lib.js';
+import {
+    buildWorldProgressionLocationDossiers,
+    normalizeWorldReportMetadata,
+    selectWorldProgressionLocations,
+    stampLocationAdvancement,
+    WORLD_REPORT_METADATA_KEY,
+} from './world-progression-lib.js';
 
 let _routerRunning = false;
 let _routerNormalRunCount = 0; // tracks completed normal (non-cleanup) passes for auto-cleanup interval
 let _routerController = null; // AbortController for the active router pass
+let _routerCleanupTimer = null; // Delayed auto-cleanup belongs to the pass that queued it.
+let _worldProgressionController = null; // AbortController for the active World Progression pass
 
 /** Returns true while a router pass is actively running. */
 export function isRouterRunning() { return _routerRunning; }
 
 /**
  * Aborts the currently-running Lorebook Agent pass, if any.
- * Equivalent to the State Tracker's stop button: kills the in-flight LLM request.
+ * Chat switches must cancel the agent before flipping the live projection so a
+ * late applyAction / watermark persist cannot target the arriving chat.
  */
 export function stopRouterPass() {
+    if (_routerCleanupTimer !== null) {
+        clearTimeout(_routerCleanupTimer);
+        _routerCleanupTimer = null;
+    }
     if (_routerController) {
-        _routerController.abort();
+        try { _routerController.abort(); } catch (_) { /* ignore */ }
         _routerController = null;
+    }
+}
+
+/**
+ * Aborts the currently-running World Progression pass, if any.
+ * Chat switches must cancel WP before flipping the live projection so a late
+ * applyAction / timer persist cannot target the arriving chat.
+ */
+export function stopWorldProgressionPass() {
+    if (_worldProgressionController) {
+        try { _worldProgressionController.abort(); } catch (_) { /* ignore */ }
+        _worldProgressionController = null;
     }
 }
 
@@ -28,13 +108,7 @@ export function stopRouterPass() {
  * Returns '' only if there is no usable prefix.
  */
 function getLivePrefix() {
-    const ctx = SillyTavern.getContext();
-    return getEffectiveRouterCampaignPrefix(ctx.chatId || '');
-}
-
-/** World Skeleton lorebooks are only visible to World Progression / skeleton generation. */
-function isSkeletonBookName(bookName) {
-    return (bookName || '').toLowerCase().endsWith('_skeleton');
+    return getEffectiveRouterCampaignPrefix(getActiveChatId() || '');
 }
 
 function isSkeletonEntryId(entryId) {
@@ -48,24 +122,52 @@ function extractActiveCombatBlock(memo) {
     return match ? `[COMBAT]${match[1].trim()}[/COMBAT]` : null;
 }
 
-/** Router guidance when ACTIVE COMBAT STATE is injected this turn. */
-function buildCombatProfileRouterGuidance(hasCombat, mode = 'basic') {
-    if (!hasCombat) return '';
-    if (mode === 'agent') {
-        return `
-## COMBAT PROFILE (ACTIVE COMBAT STATE provided this turn)
-- **Existing NPCs** (listed in ACTIVE MEMORY with an ID): use \`commit({"core": [{"id": "Book::UID or NPC Name", "field": "Combat Profile", "content": "verbatim stats from [COMBAT]"}]})\`. Do NOT re-record the full NPC via \`record\` or embed a new \`[CORE]\` block in \`update\`.
-- **Brand-new combatants** with no lorebook entry yet: include \`Combat Profile:\` inside \`[CORE]\` in a \`record\` item.
-- Copy stats verbatim from ## ACTIVE COMBAT STATE only — never infer from GM prose.`;
+/** Resolve the linked Player Character card for the active chat, if any. */
+function getLinkedPlayerCharacter() {
+    try {
+        const settings = getSettings();
+        const chatId = SillyTavern.getContext()?.chatId;
+        if (!chatId || !settings.chatStates?.[chatId]?.playerCharacter) return null;
+        return settings.chatStates[chatId].playerCharacter;
+    } catch (_) {
+        return null;
     }
-    return `
-## COMBAT PROFILE (ACTIVE COMBAT STATE provided this turn)
-- **Existing NPCs** (in ACTIVE MEMORY or ARCHIVE): output \`[[UPDATE_CORE: NPC Name | Combat Profile | verbatim stats from [COMBAT]]]\` — NOT a full \`[[NPC:...]]\` re-record.
-- **Brand-new combatants** with no existing entry: include \`Combat Profile:\` inside \`[CORE]\` in a new \`[[NPC:...]]\` record.
-- Copy stats verbatim from ## ACTIVE COMBAT STATE only — never infer from GM prose.
-- Example: \`[[UPDATE_CORE: Marcus Thorne | Combat Profile | HP: 12, AC: 11, Fort +1, Ref +0, Will +4, weapons: ...]]\``;
 }
 
+/**
+ * Apply a Body or Worn Equipment (only) patch to the linked PC card's flat bio string.
+ * Species/Personality/Background/etc. are never mutable by the Lorebook Agent for
+ * the PC — those are the player's own, set at character creation.
+ * @returns {{ ok: boolean, error?: string }}
+ */
+function applyPcCoreUpdate(pc, field, content) {
+    if (!pc) return { ok: false, error: 'No Player Character card linked' };
+    if (!isAppearanceField(field) && !isEquipmentField(field)) {
+        return { ok: false, error: 'PC updates are limited to Body and Worn Equipment' };
+    }
+    const targetField = isEquipmentField(field) ? 'Worn Equipment' : 'Body';
+    const result = patchLabeledSection(pc.bio || '', targetField, content, { isPc: true });
+    if (!result.ok) return { ok: false, error: result.error || 'Failed to patch PC bio' };
+    pc.bio = result.text;
+    pc.timestamp = Date.now();
+    try {
+        const chatId = SillyTavern.getContext()?.chatId;
+        if (chatId) saveChatState(chatId);
+        else void saveSettings();
+    } catch (_) {
+        void saveSettings();
+    }
+    try {
+        if (typeof globalThis._rpgRefreshLorebookAgentViews === 'function') {
+            void globalThis._rpgRefreshLorebookAgentViews();
+        } else if (typeof globalThis._rpgRenderRouterUI === 'function') {
+            globalThis._rpgRenderRouterUI();
+        }
+    } catch (_) {}
+    return { ok: true };
+}
+
+/** Router guidance when ACTIVE COMBAT STATE is injected this turn. */
 /**
  * Resolve Book::UID or plain NPC label to a full lore entry id.
  * @returns {Promise<string|null>}
@@ -108,80 +210,42 @@ function stripSkeletonFromRouterPools() {
     const strip = (arr) => (arr || []).filter(id => !isSkeletonEntryId(id));
     const beforeRouter = JSON.stringify(settings.activeRouterKeys || []);
     const beforeKw = JSON.stringify(settings.keywordActivatedKeys || []);
+    const beforePinned = JSON.stringify(settings.pinnedRouterKeys || []);
     settings.activeRouterKeys = strip(settings.activeRouterKeys);
     settings.keywordActivatedKeys = strip(settings.keywordActivatedKeys);
+    settings.pinnedRouterKeys = strip(settings.pinnedRouterKeys);
     return beforeRouter !== JSON.stringify(settings.activeRouterKeys)
-        || beforeKw !== JSON.stringify(settings.keywordActivatedKeys);
+        || beforeKw !== JSON.stringify(settings.keywordActivatedKeys)
+        || beforePinned !== JSON.stringify(settings.pinnedRouterKeys);
 }
 
 /**
  * Lorebook Agent archive fetch — excludes World Skeleton books.
  * @param {string} prefix
  * @param {object} ctx
- * @param {object} settings
  */
-async function fetchRouterArchiveBooks(prefix, ctx, settings) {
-    if (typeof ctx.updateWorldInfoList === 'function') {
-        try { await ctx.updateWorldInfoList(); } catch (_) {}
-    }
-    const allBookNames = await getWorldInfoNamesSafe();
+async function fetchRouterArchiveBooks(prefix, ctx) {
+    const settings = getSettings();
+    const chatId = getRouterChatId(ctx);
+    const ownedNames = chatId ? (settings.chatStates?.[chatId]?.campaignBooks || []) : [];
+    // The per-chat ownership list is the hot path. Union the already-loaded ST
+    // registry for newly linked/legacy books, but never enumerate every lorebook
+    // on disk during an automatic Lorebook Agent pass.
+    const registryNames = await getWorldInfoNamesSafe({ fullProbe: false });
+    const allBookNames = [...new Set([...ownedNames, ...registryNames])];
     const inScope = (n) => !prefix || bookBelongsToPrefix(n, prefix);
     const scoped = new Set(prefix ? allBookNames.filter(inScope) : allBookNames);
 
-    const logBookNames = (settings.routerLog || [])
-        .flatMap(e => [...(e.record || []), ...(e.activate || [])].map(id => id.split('::')[0]))
-        .filter(Boolean);
-    for (const n of logBookNames) {
-        if (inScope(n) && !isSkeletonBookName(n)) scoped.add(n);
-    }
-
     const books = {};
     const loaded = await Promise.all([...scoped].map(async (n) => {
-        try {
-            const b = await ctx.loadWorldInfo(n);
-            return b?.entries ? [n, b] : null;
-        } catch (_) {
-            return null;
-        }
+        const b = await loadWorldInfoFresh(n, ctx);
+        if (!b?.entries) throw new Error(`Cannot safely load campaign lorebook "${n}".`);
+        return [n, b];
     }));
     for (const row of loaded) {
         if (row) books[row[0]] = row[1];
     }
     return books;
-}
-
-/**
- * grep_lore / inspect_book helper — never surface skeleton entries to the agent.
- */
-function grepLoreInBooks(allBooks, query) {
-    const q = (query || '').toLowerCase();
-    const hits = [];
-    for (const [name, book] of Object.entries(allBooks)) {
-        if (isSkeletonBookName(name)) continue;
-        for (const [uid, entry] of Object.entries(book.entries || {})) {
-            if ((entry.content || '').toLowerCase().includes(q) || (entry.comment || '').toLowerCase().includes(q)) {
-                hits.push(`[${name}::${uid}] "${entry.comment || uid}": ${(entry.content || '').substring(0, 120)}...`);
-            }
-        }
-    }
-    return hits;
-}
-
-/**
- * Returns true if `bookName` belongs to the given `prefix`.
- * Exact match: bookName === prefix, OR bookName === prefix + '_' + <single-word suffix>
- * (suffix must contain no underscores to prevent "Assistant" from matching
- * "Assistant_2026_05_13_NPCs" which belongs to a different longer prefix).
- * @param {string} bookName
- * @param {string} prefix
- */
-function bookBelongsToPrefix(bookName, prefix) {
-    if (!prefix) return false;
-    const lowerBook = String(bookName).toLowerCase();
-    const lowerPref = String(prefix).toLowerCase();
-    if (lowerBook === lowerPref) return true;
-    const rest = lowerBook.startsWith(lowerPref + '_') ? lowerBook.slice(lowerPref.length + 1) : null;
-    return rest !== null && !rest.includes('_');
 }
 
 /**
@@ -227,7 +291,9 @@ function parseTextAction(text) {
             args = { [argNames[name] || 'value']: cleaned };
         } else {
             cleaned = cleaned.replace(/,\s*\}/g, '}').replace(/,\s*\]/g, ']');
-            args = JSON.parse(cleaned);
+            const parsed = parseJsonWithColorRepair(cleaned);
+            if (!parsed.ok) throw new Error(parsed.error || 'Invalid JSON');
+            args = parsed.value;
         }
     } catch (_) {
         return null;
@@ -241,82 +307,1167 @@ function parseTextAction(text) {
  */
 function broadcastStep(type, content, metadata = {}) {
     document.dispatchEvent(new CustomEvent('rt_lore_agent_step', {
-        detail: { type, content, metadata, timestamp: Date.now() }
+        detail: { type, content, metadata: { source: 'lorebook_agent', ...metadata }, timestamp: Date.now() }
     }));
 }
 
 /**
  * Compatibility helper for older SillyTavern versions.
- * Probes both the frontend cache AND the backend API for ground truth,
- * so that cloned/renamed lorebooks are always discovered.
+ * Uses the frontend registry for the normal path and the dedicated backend
+ * lorebook-list endpoint for a disk-authoritative refresh.
+ *
+ * Do not use /api/settings/get here. That endpoint returns the user's complete
+ * settings payload, which can be hundreds of megabytes on long-running
+ * Multihog installs. Parsing it during every manifest refresh was the main
+ * Persistent Maps slowdown.
  */
 async function getWorldInfoNamesSafe(options = {}) {
     const fullProbe = options.fullProbe !== false;
     const ctx = SillyTavern.getContext();
-    const namesSet = new Set();
+    const frontendNames = new Set();
     
     // 1. Check frontend registry (may be stale or incomplete if books aren't linked yet)
-    if (typeof ctx.getWorldInfoNames === 'function') {
-        const res = await ctx.getWorldInfoNames();
-        if (Array.isArray(res)) res.forEach(n => namesSet.add(n));
-    } else if (typeof ctx.getLorebookList === 'function') {
-        const res = await ctx.getLorebookList();
-        if (Array.isArray(res)) res.forEach(n => namesSet.add(n));
-    }
-
-    if (!fullProbe) {
-        return [...namesSet];
-    }
-
-    // 2. Unconditionally probe the backend API (ground truth of what exists on disk).
-    // This prevents the agent from missing newly cloned books if the frontend hasn't refreshed.
     try {
-        const r = await fetch('/api/settings/get', { 
-            method: 'POST', 
-            headers: getRequestHeaders(),
-            body: JSON.stringify({})
-        });
-        if (r.ok) {
-            const j = await r.json();
-            if (Array.isArray(j?.world_names)) {
-                j.world_names.forEach(n => namesSet.add(n));
-            }
+        if (typeof ctx.getWorldInfoNames === 'function') {
+            const res = await ctx.getWorldInfoNames();
+            if (Array.isArray(res)) res.forEach(n => frontendNames.add(n));
+        } else if (typeof ctx.getLorebookList === 'function') {
+            const res = await ctx.getLorebookList();
+            if (Array.isArray(res)) res.forEach(n => frontendNames.add(n));
         }
     } catch (_) {}
 
-    // 3. Fallback: enumerate all lorebooks from the backend list endpoint
+    if (!fullProbe) {
+        return [...frontendNames];
+    }
+
+    // 2. Probe the dedicated backend list endpoint. Once it answers, its result
+    // is authoritative: unioning it with the frontend registry would resurrect
+    // deleted lorebooks that still exist only in SillyTavern's in-memory cache.
+    const backendNames = new Set();
+    let backendResponded = false;
     try {
         const r = await fetch('/api/worldinfo/list', { method: 'POST', headers: getRequestHeaders() });
         if (r.ok) {
             const j = await r.json();
             if (Array.isArray(j)) {
-                j.forEach(entry => { if (entry?.file_id) namesSet.add(entry.file_id); });
+                backendResponded = true;
+                j.forEach(entry => { if (entry?.file_id) backendNames.add(entry.file_id); });
             }
         }
     } catch (_) {}
 
-    return [...namesSet];
+    return backendResponded ? [...backendNames] : [...frontendNames];
 }
 
 /**
- * Builds the summary "Keyring" text for archive (inactive) entries only.
- * Active entries are excluded to avoid double-listing them in the agent context.
- * @param {object} allBooks
- * @param {string[]} activeKeys - IDs currently in activeRouterKeys (Book::uid format).
+ * Cheap existence guard for passive reads. SillyTavern's /worldinfo/get returns
+ * an empty dummy for a missing file and logs an error, so probing a generated
+ * `<prefix>_Locations` name on every map/UI refresh creates an error storm.
+ * The already-loaded frontend registry is authoritative when available.
  */
-function buildKeyringText(allBooks, activeKeys = []) {
-    const activeSet = new Set(activeKeys);
-    let lines = [];
-    for (const [bookName, bookData] of Object.entries(allBooks)) {
-        if (isSkeletonBookName(bookName)) continue;
-        if (!bookData || !bookData.entries) continue;
-        for (const [uid, entry] of Object.entries(bookData.entries)) {
-            if (activeSet.has(`${bookName}::${uid}`)) continue; // shown in ACTIVE MEMORY
-            const keys = (entry.key || []).join(', ');
-            lines.push(`[ARCHIVE] Label: ${entry.comment || entry.key?.[0] || 'Unnamed'} | Keys: [${keys}]`);
+export async function isWorldInfoBookKnown(bookName, ctx = SillyTavern.getContext()) {
+    const wanted = String(bookName || '').trim().toLowerCase();
+    if (!wanted) return false;
+
+    try {
+        const getter = typeof ctx?.getWorldInfoNames === 'function'
+            ? ctx.getWorldInfoNames.bind(ctx)
+            : (typeof ctx?.getLorebookList === 'function' ? ctx.getLorebookList.bind(ctx) : null);
+        if (getter) {
+            const names = await getter();
+            if (Array.isArray(names)) {
+                return names.some(name => String(name || '').toLowerCase() === wanted);
+            }
+        }
+    } catch (_) {
+        // Fall through to the per-chat ownership list on older ST versions.
+    }
+
+    const settings = getSettings();
+    const chatId = getRouterChatId(ctx);
+    const knownBooks = chatId ? settings.chatStates?.[chatId]?.campaignBooks : [];
+    return (knownBooks || []).some(name => String(name || '').toLowerCase() === wanted);
+}
+
+function cloneRouterValue(value, fallback) {
+    return JSON.parse(JSON.stringify(value ?? fallback));
+}
+
+function getRouterChatId(ctx = SillyTavern.getContext()) {
+    return (typeof globalThis._rpgCurrentChatId === 'function' && globalThis._rpgCurrentChatId())
+        || ctx?.chatId
+        || null;
+}
+
+/**
+ * Record a lorebook on the active chat's campaignBooks list so boot / chat-switch
+ * `/world state=on` and the keyword scanner's fast path can find it. Newly created
+ * NPCs books were previously omitted here, so ST native WI and the scanner both
+ * skipped them until a manual Activate Campaign Lorebooks.
+ * @param {string} bookName
+ * @param {object} [settings]
+ * @returns {boolean} true when the list changed
+ */
+export function rememberCampaignBook(bookName, settings = getSettings()) {
+    if (!bookName) return false;
+    const chatId = getRouterChatId();
+    if (!chatId) return false;
+    settings.chatStates = settings.chatStates || {};
+    settings.chatStates[chatId] = settings.chatStates[chatId] || {};
+    const existing = new Set(settings.chatStates[chatId].campaignBooks || []);
+    const before = existing.size;
+    existing.add(bookName);
+    settings.chatStates[chatId].campaignBooks = [...existing];
+    return existing.size !== before;
+}
+
+function buildRouterLoreState(settings, { prefix, chatId, bookSnapshots }) {
+    const chatState = chatId ? settings.chatStates?.[chatId] : null;
+    return {
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        campaignPrefix: prefix || '',
+        chatId,
+        campaignBookNames: Object.keys(bookSnapshots || {}),
+        campaignBooks: cloneRouterValue(chatState?.campaignBooks, []),
+        activeRouterKeys: cloneRouterValue(settings.activeRouterKeys, []),
+        activeWorldKeys: cloneRouterValue(settings.activeWorldKeys, []),
+        keywordActivatedKeys: cloneRouterValue(settings.keywordActivatedKeys, []),
+        pinnedRouterKeys: cloneRouterValue(settings.pinnedRouterKeys, []),
+        routerLog: cloneRouterValue(settings.routerLog, []),
+        pcCharacterBlockSeeded: !!settings.pcCharacterBlockSeeded,
+        routerLastRunChatLength: settings.routerLastRunChatLength ?? 0,
+        routerLastRunAt: settings.routerLastRunAt ?? 0,
+        bookSnapshots: cloneRouterValue(bookSnapshots, {}),
+    };
+}
+
+/** Loads current disk data, bypassing SillyTavern's worldInfoCache. */
+async function loadWorldInfoFresh(bookName, ctx = SillyTavern.getContext()) {
+    try {
+        const response = await fetch('/api/worldinfo/get', {
+            method: 'POST',
+            headers: getRequestHeaders(),
+            body: JSON.stringify({ name: bookName }),
+        });
+        // A completed backend response is authoritative, including "not found".
+        if (!response.ok) return null;
+        const data = await response.json();
+        return data && typeof data === 'object' && data.entries ? data : null;
+    } catch (_) {
+        // Compatibility fallback for old builds where the direct endpoint is unavailable.
+        try {
+            const data = await ctx.loadWorldInfo(bookName);
+            return data?.entries ? data : null;
+        } catch (_) {
+            return null;
         }
     }
-    return lines.join('\n');
+}
+
+async function evictWorldInfoCache(bookName) {
+    try {
+        const { worldInfoCache } = await import('../../../world-info.js');
+        worldInfoCache?.delete?.(bookName);
+    } catch (_) {
+        // The direct, authoritative reads below still keep the Agent UI correct on old builds.
+    }
+}
+
+export async function updateWorldInfoCache(bookName, bookData) {
+    try {
+        const { worldInfoCache } = await import('../../../world-info.js');
+        if (typeof worldInfoCache?.set !== 'function') return false;
+        worldInfoCache.set(bookName, bookData);
+        return true;
+    } catch (_) {
+        return false;
+    }
+}
+
+async function deleteWorldInfoFresh(bookName) {
+    const response = await fetch('/api/worldinfo/delete', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ name: bookName }),
+    });
+    if (!response.ok) {
+        throw new Error(`Failed to delete ${bookName}: HTTP ${response.status}`);
+    }
+    await evictWorldInfoCache(bookName);
+}
+
+async function saveWorldInfoSnapshot(bookName, bookData, ctx, operationLabel, canCommit = createChatCommitGuard(getActiveChatId(), getActiveChatId)) {
+    assertChatCommit(canCommit);
+    const response = chatCommitResult(canCommit, await fetch('/api/worldinfo/edit', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ name: bookName, data: bookData }),
+    }));
+    if (!response.ok) {
+        throw new Error(`${operationLabel}: failed to restore ${bookName}: HTTP ${response.status}`);
+    }
+    const cacheUpdated = chatCommitResult(canCommit, await updateWorldInfoCache(bookName, bookData));
+    if (!cacheUpdated && typeof ctx.saveWorldInfo === 'function') {
+        try { chatCommitResult(canCommit, await ctx.saveWorldInfo(bookName, bookData)); } catch (_) {
+            assertChatCommit(canCommit);
+         /* backend write already succeeded */ }
+    }
+}
+
+/**
+ * Persist the GM's one-time hidden map on a real root Location entry, then
+ * return every attached site with its descendant Location records. The map is
+ * stored in entry extension metadata so normal lorebook views never reveal it.
+ *
+ * Pin `chatId` / `campaignPrefix` before any lorebook await. A mid-flight chat
+ * switch must not stamp dungeonMapHistory onto the arriving live projection or
+ * target another campaign's Locations book.
+ */
+export async function syncDungeonMapsToLocationLorebook(chat, {
+    capture = true,
+    chatId = null,
+    campaignPrefix = null,
+    canCommit,
+} = {}) {
+    const ctx = SillyTavern.getContext();
+    // Prefer the originating pass. Re-reading getLivePrefix() after awaits can
+    // target another campaign if the user switched chats mid-load.
+    const passChatId = chatId != null && String(chatId).length > 0
+        ? String(chatId)
+        : getActiveChatId();
+    const prefix = String(campaignPrefix || getLivePrefix() || '').trim();
+    const ownsChat = createChatCommitGuard(passChatId, getActiveChatId, { canCommit });
+    if (!prefix) return { sites: {}, changed: false, capturedMaps: 0, errors: ['no campaign prefix is available'], ownsChat: ownsChat() };
+
+    const bookName = `${prefix}_Locations`;
+    const collected = capture ? collectDungeonMapCandidates(chat) : { maps: [], errors: [] };
+    const bookKnown = chatCommitResult(ownsChat, await isWorldInfoBookKnown(bookName, ctx));
+    let bookData = bookKnown ? chatCommitResult(ownsChat, await loadWorldInfoFresh(bookName, ctx)) : null;
+    if (!bookData) {
+        if (!collected.maps.length) {
+            return { bookName, sites: {}, changed: false, capturedMaps: 0, errors: collected.errors, ownsChat: ownsChat() };
+        }
+        if (bookKnown) {
+            throw new Error(`Refusing to replace existing Locations lorebook "${bookName}" because it could not be loaded.`);
+        }
+        bookData = {
+            entries: {},
+            name: bookName,
+            scan_depth: 4,
+            token_budget: 400,
+            recursive: false,
+            extensions: {},
+        };
+    }
+
+    let changed = false;
+    let capturedMaps = 0;
+    for (const entry of Object.values(bookData.entries || {})) {
+        if (migrateDungeonMapAttachmentToContent(entry)) changed = true;
+        if (getDungeonMapAttachment(entry) && entry.disable !== true) {
+            entry.disable = true;
+            changed = true;
+        }
+    }
+
+    for (const entry of Object.values(bookData.entries || {})) {
+        if (getDungeonMapAttachment(entry) && reconcileDungeonMapAreaKnowledge(entry, bookData.entries)) changed = true;
+    }
+    for (const map of collected.maps) {
+        let rootEntry = Object.values(bookData.entries || {}).find(entry => {
+            const label = String(entry?.comment || '').trim();
+            return label && !label.includes('::') && dungeonSiteRootsMatch(label, map.siteRoot);
+        });
+
+        if (!rootEntry) {
+            const uids = Object.keys(bookData.entries || {}).map(Number).filter(Number.isFinite);
+            const nextUid = uids.length ? Math.max(...uids) + 1 : 0;
+            rootEntry = {
+                uid: nextUid,
+                key: [map.siteRoot],
+                keysecondary: [],
+                comment: map.siteRoot,
+                content: `[CORE]\n${mappedSiteBoilerplateCore(map.siteRoot)}\n[/CORE]`,
+                constant: false,
+                selective: false,
+                selectiveLogic: 0,
+                addMemo: true,
+                order: getSettings().routerDefaultOrder ?? 100,
+                position: getSettings().routerDefaultPosition ?? 0,
+                disable: true,
+                probability: 100,
+                useProbability: false,
+                depth: getSettings().routerDefaultDepth ?? 4,
+                group: '',
+                groupOverride: false,
+                groupWeight: 100,
+                extensions: {},
+            };
+            bookData.entries[nextUid] = rootEntry;
+            changed = true;
+        }
+
+        if (attachDungeonMapToLocationEntry(rootEntry, map)) {
+            rootEntry.disable = true;
+            capturedMaps++;
+            changed = true;
+        }
+    }
+
+    // A map captured during this pass did not exist during the reconciliation
+    // above. Reconcile once more so pre-existing child Locations immediately mark
+    // its areas VISITED instead of requiring a second Lorebook Agent pass.
+    for (const entry of Object.values(bookData.entries || {})) {
+        if (getDungeonMapAttachment(entry) && reconcileDungeonMapAreaKnowledge(entry, bookData.entries)) changed = true;
+    }
+
+    if (changed) {
+        chatCommitResult(ownsChat, await saveWorldInfoSnapshot(bookName, bookData, ctx, 'Dungeon map persistence', ownsChat));
+        // Lorebook write used the pinned prefix; refuse live history if ownership
+        // was lost mid-await (arriving chat's dungeonMapHistory would be poisoned).
+        if (ownsChat()) {
+            recordLiveDungeonMapSnapshot(getSettings(), collectDungeonMapHistorySnapshot(bookData.entries, bookName));
+        }
+        if (!bookKnown && typeof ctx.updateWorldInfoList === 'function') {
+            try { chatCommitResult(ownsChat, await ctx.updateWorldInfoList()); } catch (_) {
+                assertChatCommit(ownsChat);
+        }
+        }
+        if (typeof ctx.reloadWorldInfoEditor === 'function') ctx.reloadWorldInfoEditor(bookName);
+        document.dispatchEvent(new CustomEvent('rt_lore_agent_updated'));
+    }
+
+    return {
+        bookName,
+        sites: buildDungeonSitesFromLocationEntries(bookData.entries, bookName),
+        bookData,
+        changed,
+        capturedMaps,
+        errors: collected.errors,
+        ownsChat: ownsChat(),
+    };
+}
+
+function rootEntryByExactSite(entries, site) {
+    return Object.values(entries || {}).find(entry => {
+        const label = String(entry?.comment || '').trim();
+        return label && !label.includes('::') && label === site;
+    }) || null;
+}
+
+function entryUidFromCompositeId(entryId) {
+    const value = String(entryId || '');
+    const separator = value.lastIndexOf('::');
+    return separator >= 0 ? value.slice(separator + 2) : value;
+}
+
+function allocateHostedAssetId(document, name) {
+    const used = new Set((document.assets || []).map(asset => asset.id));
+    const base = `subsite-${mapTransactionSignature(String(name || '')).slice(0, 8)}`;
+    if (!used.has(base)) return base;
+    let suffix = 2;
+    while (used.has(`${base}-${suffix}`)) suffix++;
+    return `${base}-${suffix}`;
+}
+
+function promoteHostedPeerAsset(hostDocument, site, expectedKind, areaId, briefDescription, { hidden = false } = {}) {
+    if (!['SETTLEMENT', 'DUNGEON', 'INTERIOR'].includes(normalizeMapSiteKind(hostDocument.kind))) {
+        throw new Error(`Host "${hostDocument.site}" is not a supported mapped site.`);
+    }
+    const area = (hostDocument.areas || []).find(item => item.id === areaId);
+    if (!area) throw new Error(`Could not resolve the host map cell for "${site}".`);
+    const matches = (hostDocument.assets || []).filter(asset => dungeonLabelIdentitiesMatch(asset.name, site) && asset.state !== 'REMOVED' && asset.state !== 'LEFT');
+    if (matches.length > 1) throw new Error(`Host map contains more than one active asset named "${site}".`);
+    let asset = matches[0] || null;
+    if (asset) {
+        if (![expectedKind, 'BUILDING', 'OBJECT'].includes(asset.kind)) {
+            throw new Error(`Host-map asset "${site}" is ${asset.kind}; expected ${expectedKind}.`);
+        }
+        asset.kind = expectedKind;
+        asset.location = area.id;
+    } else {
+        asset = {
+            id: allocateHostedAssetId(hostDocument, site),
+            kind: expectedKind,
+            name: site,
+            location: area.id,
+            state: 'ACTIVE',
+            knowledge: hidden ? 'UNREVEALED' : 'KNOWN',
+            detail: String(briefDescription || '').trim(),
+            origin: 'NARRATOR_ESTABLISHED',
+        };
+        hostDocument.assets.push(asset);
+    }
+    return asset;
+}
+
+function findArchitectMapEntry(entries, canonicalSite, requestedSite, hostContext) {
+    const rows = Object.values(entries || {});
+    const mapped = rows.filter(entry => getDungeonMapAttachment(entry));
+    const canonical = mapped.find(entry => {
+        const attachment = getDungeonMapAttachment(entry);
+        return dungeonSiteRootsMatch(attachment.siteRoot, canonicalSite);
+    });
+    if (canonical) return canonical;
+    if (hostContext) {
+        const compatibleLegacy = mapped.find(entry => {
+            const attachment = getDungeonMapAttachment(entry);
+            if (!dungeonSiteRootsMatch(attachment.siteRoot, requestedSite)) return false;
+            const document = parseDungeonMapDocument(attachment.content, attachment.siteRoot).document;
+            return !document.hostSite || document.hostSite === hostContext.hostSite;
+        });
+        if (compatibleLegacy) return compatibleLegacy;
+        return rows.find(entry => String(entry?.comment || '').trim() === canonicalSite) || null;
+    }
+    return rows.find(entry => {
+        const label = String(entry?.comment || '').trim();
+        return label && !label.includes('::') && dungeonSiteRootsMatch(label, canonicalSite);
+    }) || null;
+}
+
+/**
+ * Atomically attach a validated Map Architect document to its root Location.
+ * Existing maps always win: concurrent/repeated tool calls never overwrite canon.
+ */
+export async function persistArchitectDungeonMap(siteRoot, mapDocument, {
+    requireNew = false,
+    locationKeys = null,
+    locationCore = '',
+    includeManifest = [],
+    hostContext = null,
+    canCommit,
+} = {}) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId, { canCommit });
+    assertChatCommit(ownsChat);
+    const ctx = SillyTavern.getContext();
+    const settings = getSettings();
+    const prefix = getLivePrefix();
+    const requestedSite = String(siteRoot || '').trim();
+    const site = String(hostContext?.peerSite || requestedSite).trim();
+    if (!prefix) throw new Error('No campaign prefix is available for the Locations lorebook.');
+    if (!requestedSite || !site) throw new Error('Map Architect requires an exact site root.');
+    if (hostContext && Number(hostContext.peerDepth) > MAX_HOSTED_MAP_DEPTH) {
+        throw new Error(`Nested maps are limited to ${MAX_HOSTED_MAP_DEPTH} mapped levels.`);
+    }
+
+    const bookName = `${prefix}_Locations`;
+    const bookKnown = chatCommitResult(ownsChat, await isWorldInfoBookKnown(bookName, ctx));
+    let bookData = bookKnown ? chatCommitResult(ownsChat, await loadWorldInfoFresh(bookName, ctx)) : null;
+    // Work on a detached snapshot so validation or a failed backend save cannot
+    // leak partial host/promotion edits through an old cache-backed loader.
+    if (bookData) bookData = cloneRouterValue(bookData, null);
+    if (!bookData) {
+        if (bookKnown) {
+            throw new Error(`Refusing to replace existing Locations lorebook "${bookName}" because it could not be loaded.`);
+        }
+        bookData = {
+            entries: {},
+            name: bookName,
+            scan_depth: 4,
+            token_budget: 400,
+            recursive: false,
+            extensions: {},
+        };
+    }
+
+    let rootEntry = findArchitectMapEntry(bookData.entries, site, requestedSite, hostContext);
+    const existingAttachment = rootEntry ? getDungeonMapAttachment(rootEntry) : null;
+    if (existingAttachment) {
+        if (requireNew) {
+            throw new Error(`A mapped location named "${site}" already exists.`);
+        }
+        if (Array.isArray(includeManifest) && includeManifest.length) {
+            throw new Error('include[] cannot modify a settlement that already has a stored map.');
+        }
+        if (!hostContext) {
+            return {
+                bookName,
+                entryId: `${bookName}::${rootEntry.uid}`,
+                created: false,
+                existing: true,
+                document: parseDungeonMapDocument(existingAttachment.content, existingAttachment.siteRoot).document,
+            };
+        }
+    }
+
+    if (requireNew && rootEntry) {
+        throw new Error(`A location named "${site}" already exists. Use + MAP on that root instead.`);
+    }
+
+    if (rootEntry && String(locationCore || '').trim()) {
+        rootEntry.content = applyMappedSiteLocationCore(rootEntry.content, requestedSite, locationCore);
+    }
+
+    if (!rootEntry) {
+        const uids = Object.keys(bookData.entries || {}).map(Number).filter(Number.isFinite);
+        const nextUid = uids.length ? Math.max(...uids) + 1 : 0;
+        const coreBody = String(locationCore || '').trim();
+        const coreContent = /\[CORE\]/i.test(coreBody)
+            ? coreBody
+            : `[CORE]\n${coreBody || mappedSiteBoilerplateCore(requestedSite)}\n[/CORE]`;
+        rootEntry = {
+            uid: nextUid,
+            key: locationKeysForNewRoot(requestedSite, [
+                site,
+                ...(Array.isArray(locationKeys) ? locationKeys : String(locationKeys || '').split(/[,;\n]/)),
+            ]),
+            keysecondary: [],
+            comment: site,
+            content: coreContent,
+            constant: false,
+            selective: false,
+            selectiveLogic: 0,
+            addMemo: true,
+            order: settings.routerDefaultOrder ?? 100,
+            position: settings.routerDefaultPosition ?? 0,
+            disable: true,
+            probability: 100,
+            useProbability: false,
+            depth: settings.routerDefaultDepth ?? 4,
+            group: '',
+            groupOverride: false,
+            groupWeight: 100,
+            extensions: {},
+        };
+        bookData.entries[nextUid] = rootEntry;
+    }
+
+    let persistedDocument = existingAttachment
+        ? parseDungeonMapDocument(existingAttachment.content, existingAttachment.siteRoot).document
+        : JSON.parse(JSON.stringify(mapDocument));
+
+    if (hostContext) {
+        const hostUid = entryUidFromCompositeId(hostContext.hostEntryId);
+        const hostEntry = bookData.entries?.[hostUid];
+        const hostAttachment = getDungeonMapAttachment(hostEntry);
+        if (!hostEntry || !hostAttachment || String(hostEntry.comment || '').trim() !== hostContext.hostSite) {
+            throw new Error(`Host map "${hostContext.hostSite}" changed before the peer could be saved.`);
+        }
+        const hostDocument = parseDungeonMapDocument(hostAttachment.content, hostContext.hostSite).document;
+        const hostAsset = promoteHostedPeerAsset(
+            hostDocument,
+            requestedSite,
+            hostContext.expectedAssetKind,
+            hostContext.hostAreaId,
+            hostContext.briefDescription,
+            { hidden: !!hostContext.explicit },
+        );
+        const livePeerSite = buildHostedPeerSitePath(hostDocument, hostAsset);
+        if (livePeerSite !== site) {
+            throw new Error(`Host path for "${requestedSite}" changed before the peer could be saved.`);
+        }
+        const peerKind = normalizeMapSiteKind(persistedDocument.kind);
+        const expectedPeerKind = hostContext.expectedAssetKind === 'SUBINTERIOR' ? 'INTERIOR' : 'DUNGEON';
+        if (peerKind !== expectedPeerKind) {
+            throw new Error(`${hostContext.expectedAssetKind} requires a ${expectedPeerKind} peer map, received ${peerKind}.`);
+        }
+        persistedDocument.site = site;
+        persistedDocument = stampHostedPeerDocument(persistedDocument, hostDocument, hostAsset);
+        reparentHostedLocationEntries(bookData.entries, rootEntry, site, requestedSite);
+        hostEntry.content = replaceDungeonMapSection(hostEntry.content, serializeDungeonMapDocument(hostDocument));
+        hostEntry.disable = true;
+    }
+
+    if (existingAttachment) {
+        rootEntry.content = ensureHostCoreMirror(rootEntry.content, persistedDocument.hostSite, persistedDocument.hostBrief);
+        rootEntry.content = replaceDungeonMapSection(rootEntry.content, serializeDungeonMapDocument(persistedDocument));
+    } else {
+        if (persistedDocument.hostSite && persistedDocument.hostBrief) {
+            rootEntry.content = ensureHostCoreMirror(rootEntry.content, persistedDocument.hostSite, persistedDocument.hostBrief);
+        }
+        if (!attachDungeonMapToLocationEntry(rootEntry, {
+            siteRoot: site,
+            content: serializeDungeonMapDocument(persistedDocument),
+        })) {
+            throw new Error(`Could not attach the generated map to "${site}".`);
+        }
+    }
+
+    const includes = Array.isArray(includeManifest) ? includeManifest : [];
+    if (includes.length && normalizeMapSiteKind(persistedDocument.kind) !== 'SETTLEMENT') {
+        throw new Error('include[] is valid only for a new SETTLEMENT map.');
+    }
+    for (const included of includes) {
+        const peerEntry = rootEntryByExactSite(bookData.entries, String(included.site || '').trim());
+        const lockedUid = entryUidFromCompositeId(included.entryId);
+        if (!peerEntry || String(peerEntry.uid) !== String(lockedUid)) {
+            throw new Error(`Included peer "${included.site}" changed identity before the settlement could be saved.`);
+        }
+        const peerAttachment = getDungeonMapAttachment(peerEntry);
+        if (!peerAttachment) throw new Error(`Included peer "${included.site}" no longer exists.`);
+        const peerDocument = parseDungeonMapDocument(peerAttachment.content, included.site).document;
+        if (peerDocument.kind !== included.kind || !['DUNGEON', 'INTERIOR'].includes(peerDocument.kind)) {
+            throw new Error(`Included peer "${included.site}" changed kind before the settlement could be saved.`);
+        }
+        const matchingAssets = (persistedDocument.assets || []).filter(asset => asset.name === included.site && asset.kind === included.assetKind);
+        if (matchingAssets.length !== 1) {
+            throw new Error(`Settlement must contain exactly one ${included.assetKind} asset named "${included.site}".`);
+        }
+        const hostedSite = buildHostedPeerSitePath(persistedDocument, matchingAssets[0]);
+        const stamped = stampHostedPeerDocument(peerDocument, persistedDocument, matchingAssets[0]);
+        stamped.site = hostedSite;
+        reparentHostedLocationEntries(bookData.entries, peerEntry, hostedSite, included.site);
+        peerEntry.content = ensureHostCoreMirror(peerEntry.content, stamped.hostSite, stamped.hostBrief);
+        peerEntry.content = replaceDungeonMapSection(peerEntry.content, serializeDungeonMapDocument(stamped));
+        peerEntry.disable = true;
+    }
+    rootEntry.disable = true;
+    chatCommitResult(ownsChat, await saveWorldInfoSnapshot(bookName, bookData, ctx, 'Map Architect persistence', ownsChat));
+    recordLiveDungeonMapSnapshot(settings, collectDungeonMapHistorySnapshot(bookData.entries, bookName));
+
+    const chatId = ctx.chatId || (typeof globalThis._rpgCurrentChatId === 'function' ? globalThis._rpgCurrentChatId() : '');
+    if (chatId) {
+        settings.chatStates = settings.chatStates || {};
+        settings.chatStates[chatId] = settings.chatStates[chatId] || {};
+        const campaignBooks = new Set(settings.chatStates[chatId].campaignBooks || []);
+        campaignBooks.add(bookName);
+        settings.chatStates[chatId].campaignBooks = [...campaignBooks];
+        void saveSettings();
+    }
+    if (!bookKnown && typeof ctx.updateWorldInfoList === 'function') {
+        try { chatCommitResult(ownsChat, await ctx.updateWorldInfoList()); } catch (_) {
+            assertChatCommit(ownsChat);
+        }
+    }
+    if (typeof ctx.reloadWorldInfoEditor === 'function') ctx.reloadWorldInfoEditor(bookName);
+    document.dispatchEvent(new CustomEvent('rt_lore_agent_updated'));
+
+    return {
+        bookName,
+        entryId: `${bookName}::${rootEntry.uid}`,
+        created: !existingAttachment,
+        existing: !!existingAttachment,
+        document: persistedDocument,
+    };
+}
+
+/**
+ * Replace the root Location's [MAP] from manual JSON editing in the map inspector.
+ * Does not create new roots or overwrite a site that lost its map attachment.
+ */
+export async function persistManualDungeonMapDocument(siteRoot, mapDocument, options = {}) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId, options);
+    assertChatCommit(ownsChat);
+    const ctx = SillyTavern.getContext();
+    const settings = getSettings();
+    const prefix = getLivePrefix();
+    const site = String(siteRoot || '').trim();
+    if (!prefix) throw new Error('No campaign prefix is available for the Locations lorebook.');
+    if (!site) throw new Error('Site root is required.');
+    if (!mapDocument || typeof mapDocument !== 'object') throw new Error('Map document is required.');
+
+    const bookName = `${prefix}_Locations`;
+    const bookData = chatCommitResult(ownsChat, await loadWorldInfoFresh(bookName, ctx));
+    if (!bookData?.entries) {
+        throw new Error(`Locations lorebook "${bookName}" could not be loaded.`);
+    }
+
+    const rootEntry = Object.values(bookData.entries).find(entry => {
+        const attachment = getDungeonMapAttachment(entry);
+        return attachment && dungeonSiteRootsMatch(attachment.siteRoot, site);
+    });
+    if (!rootEntry) throw new Error(`No Location root found for "${site}".`);
+    const existingAttachment = getDungeonMapAttachment(rootEntry);
+    if (!existingAttachment) throw new Error(`"${site}" has no private map to edit.`);
+    const existingDocument = parseDungeonMapDocument(existingAttachment.content, existingAttachment.siteRoot).document;
+    const oldHost = String(existingDocument.hostSite || '').trim();
+    const newHost = String(mapDocument.hostSite || '').trim();
+    const oldBrief = String(existingDocument.hostBrief || '').trim();
+    const newBrief = String(mapDocument.hostBrief || '').trim();
+    if (oldHost !== newHost || oldBrief !== newBrief) {
+        throw new Error('hostSite/hostBrief are runtime-owned and cannot be added, removed, edited, or re-hosted in the manual JSON editor.');
+    }
+
+    if (migrateDungeonMapAttachmentToContent(rootEntry)) {
+        // legacy extension blob upgraded to [MAP] in content
+    }
+    rootEntry.content = replaceDungeonMapSection(
+        rootEntry.content,
+        serializeDungeonMapDocument(mapDocument),
+    );
+    reconcileDungeonMapAreaKnowledge(rootEntry, bookData.entries);
+    rootEntry.disable = true;
+
+    chatCommitResult(ownsChat, await saveWorldInfoSnapshot(bookName, bookData, ctx, 'Manual map JSON edit', ownsChat));
+    recordLiveDungeonMapSnapshot(settings, collectDungeonMapHistorySnapshot(bookData.entries, bookName));
+
+    const chatId = ctx.chatId || (typeof globalThis._rpgCurrentChatId === 'function' ? globalThis._rpgCurrentChatId() : '');
+    if (chatId) {
+        settings.chatStates = settings.chatStates || {};
+        settings.chatStates[chatId] = settings.chatStates[chatId] || {};
+        const campaignBooks = new Set(settings.chatStates[chatId].campaignBooks || []);
+        campaignBooks.add(bookName);
+        settings.chatStates[chatId].campaignBooks = [...campaignBooks];
+        void saveSettings();
+    }
+    if (typeof ctx.reloadWorldInfoEditor === 'function') ctx.reloadWorldInfoEditor(bookName);
+    document.dispatchEvent(new CustomEvent('rt_lore_agent_updated'));
+
+    return {
+        bookName,
+        entryId: `${bookName}::${rootEntry.uid}`,
+        document: mapDocument,
+    };
+}
+
+/** True when a Location root with this site name already exists. */
+export async function locationRootExists(siteRoot) {
+    const site = String(siteRoot || '').trim();
+    const prefix = getLivePrefix();
+    if (!site || !prefix) return false;
+    const ctx = SillyTavern.getContext();
+    const bookName = `${prefix}_Locations`;
+    if (!await isWorldInfoBookKnown(bookName, ctx)) return false;
+    const bookData = await loadWorldInfoFresh(bookName, ctx);
+    if (!bookData?.entries) return false;
+    return Object.values(bookData.entries).some(entry => {
+        const label = String(entry?.comment || '').trim();
+        return label && !label.includes('::') && dungeonSiteRootsMatch(label, site);
+    });
+}
+
+/**
+ * Remove the private [MAP] from a Locations entry without deleting the lore record.
+ * CORE/chronicles stay. Evolution trajectory for that site is dropped so a later
+ * map is not biased by the deleted occupancy clock.
+ */
+export async function deleteDungeonMapFromLocationEntry(id) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+    const raw = String(id || '');
+    const splitAt = raw.indexOf('::');
+    const bookName = splitAt >= 0 ? raw.slice(0, splitAt) : '';
+    const uid = splitAt >= 0 ? raw.slice(splitAt + 2) : '';
+    if (!bookName || !uid) return { ok: false, error: 'Invalid lorebook entry id.' };
+
+    const ctx = SillyTavern.getContext();
+    const bookData = chatCommitResult(ownsChat, await loadWorldInfoFresh(bookName, ctx));
+    const rootEntry = bookData?.entries?.[uid];
+    if (!rootEntry) return { ok: false, error: 'Location entry was not found.' };
+    if (!getDungeonMapAttachment(rootEntry)) return { ok: false, error: 'That Location has no private map.' };
+
+    const siteRoot = String(rootEntry.comment || '').trim();
+    if (!detachDungeonMapFromLocationEntry(rootEntry)) {
+        return { ok: false, error: 'Could not remove the private map.' };
+    }
+    rootEntry.disable = false;
+
+    chatCommitResult(ownsChat, await saveWorldInfoSnapshot(bookName, bookData, ctx, 'Dungeon map removal', ownsChat));
+    recordLiveDungeonMapSnapshot(
+        getSettings(),
+        collectDungeonMapHistorySnapshot(bookData.entries, bookName) || { bookName, maps: [] },
+    );
+
+    const settings = getSettings();
+    const siteKey = normalizeDungeonLabel(siteRoot);
+    const cleared = clearEvolutionHistoryForSite({
+        backlogBySite: settings.mapEvolutionBacklogBySite,
+        threadsBySite: settings.mapEvolutionThreadsBySite,
+        reportApplicationsBySite: settings.mapEvolutionWorldReportApplications,
+    }, siteRoot);
+    if (cleared.cleared) {
+        settings.mapEvolutionBacklogBySite = cleared.backlogBySite;
+        settings.mapEvolutionThreadsBySite = cleared.threadsBySite;
+        settings.mapEvolutionWorldReportApplications = cleared.reportApplicationsBySite;
+    }
+    if (siteKey) {
+        settings.mapEvolutionIntervalHoursBySite = setSiteEvolutionIntervalOverride(
+            settings.mapEvolutionIntervalHoursBySite,
+            siteRoot,
+            null,
+        );
+        if (settings.mapEvolutionLastFiredBySite && typeof settings.mapEvolutionLastFiredBySite === 'object') {
+            delete settings.mapEvolutionLastFiredBySite[siteKey];
+        }
+        if (normalizeDungeonLabel(settings.mapEvolutionLastSiteRoot) === siteKey) {
+            settings.mapEvolutionLastSiteRoot = '';
+        }
+        if (normalizeDungeonLabel(settings.mapEvolutionPendingExitRoot) === siteKey) {
+            settings.mapEvolutionPendingExitRoot = '';
+        }
+        if (Array.isArray(settings.mapEvolutionSelectedRoots)) {
+            settings.mapEvolutionSelectedRoots = settings.mapEvolutionSelectedRoots.filter(
+                root => normalizeDungeonLabel(root) !== siteKey,
+            );
+        }
+    }
+    persistMapEvolutionState();
+
+    if (typeof ctx.reloadWorldInfoEditor === 'function') ctx.reloadWorldInfoEditor(bookName);
+    document.dispatchEvent(new CustomEvent('rt_lore_agent_updated'));
+    return { ok: true, bookName, entryId: raw, siteRoot };
+}
+
+/** Captures the complete current campaign state for lossless redo. */
+export async function captureRouterLoreState() {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+    const settings = getSettings();
+    const ctx = SillyTavern.getContext();
+    const prefix = getLivePrefix();
+    const chatId = getRouterChatId(ctx);
+    const names = prefix
+        ? (chatCommitResult(ownsChat, await getWorldInfoNamesSafe())).filter(name => bookBelongsToPrefix(name, prefix) && !isSkeletonBookName(name))
+        : [];
+    const bookSnapshots = {};
+    for (const name of names) {
+        const book = chatCommitResult(ownsChat, await loadWorldInfoFresh(name, ctx));
+        if (!book) {
+            throw new Error(`Cannot safely snapshot current lorebook "${name}".`);
+        }
+        bookSnapshots[name] = book;
+    }
+    return buildRouterLoreState(settings, { prefix, chatId, bookSnapshots });
+}
+
+/** Snapshot every attached [MAP] in the campaign Locations book. */
+export async function captureActiveDungeonMapHistory(ctx = SillyTavern.getContext()) {
+    const prefix = getLivePrefix();
+    if (!prefix) return null;
+    const bookName = `${prefix}_Locations`;
+    if (!await isWorldInfoBookKnown(bookName, ctx)) return null;
+    const book = await loadWorldInfoFresh(bookName, ctx);
+    if (!book?.entries) return null;
+    return collectDungeonMapHistorySnapshot(book.entries, bookName);
+}
+
+/** Persist a memo-history map snapshot onto the live Locations lorebook. */
+export async function restoreActiveDungeonMapHistory(snapshot, ctx = SillyTavern.getContext()) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+    if (!snapshot?.maps?.length || !snapshot.bookName) return false;
+    if (snapshot.bookName !== `${getLivePrefix()}_Locations`) return false;
+    const book = chatCommitResult(ownsChat, await loadWorldInfoFresh(snapshot.bookName, ctx));
+    if (!book?.entries) return false;
+    if (!applyDungeonMapHistorySnapshotToBook(book, snapshot)) return false;
+    chatCommitResult(ownsChat, await evictWorldInfoCache(snapshot.bookName));
+    chatCommitResult(ownsChat, await saveWorldInfoSnapshot(snapshot.bookName, book, ctx, 'Dungeon map history restore', ownsChat));
+    if (typeof ctx.reloadWorldInfoEditor === 'function') ctx.reloadWorldInfoEditor(snapshot.bookName);
+    document.dispatchEvent(new CustomEvent('rt_lore_agent_updated', { detail: { source: 'map-history-restore' } }));
+    return true;
+}
+
+/** Load the Locations book plus the active mapped-site context, if any. */
+export async function loadActiveDungeonMapContext() {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+    const ctx = SillyTavern.getContext();
+    const prefix = getLivePrefix();
+    if (!prefix) return null;
+    const currentLocation = findLatestDungeonLocation(ctx.chat || []);
+    const synced = chatCommitResult(ownsChat, await syncDungeonMapsToLocationLorebook(ctx.chat || [], { capture: false }));
+    if (!synced.bookName) return { prefix, books: {}, context: null, currentLocation };
+    const book = synced.bookData;
+    if (!book?.entries) return { prefix, books: {}, context: null, currentLocation };
+    const books = { [synced.bookName]: book };
+    return {
+        prefix,
+        books,
+        context: resolveActiveDungeonContext(books, prefix, currentLocation),
+        currentLocation,
+    };
+}
+
+/** Load every attached [MAP] in the campaign Locations book. */
+export async function loadAllMappedSiteContexts() {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+    const ctx = SillyTavern.getContext();
+    const prefix = getLivePrefix();
+    if (!prefix) return null;
+    const currentLocation = findLatestDungeonLocation(ctx.chat || []);
+    const synced = chatCommitResult(ownsChat, await syncDungeonMapsToLocationLorebook(ctx.chat || [], { capture: false }));
+    if (!synced.bookName) return { prefix, books: {}, sites: [], currentLocation };
+    const book = synced.bookData;
+    if (!book?.entries) return { prefix, books: {}, sites: [], currentLocation };
+    const books = { [synced.bookName]: book };
+    const sites = listMappedSiteDocuments(book.entries, synced.bookName).map(site => ({
+        ...site,
+        prefix,
+        bookName: synced.bookName,
+        currentLocation,
+    }));
+    return { prefix, books, sites, currentLocation };
+}
+
+/**
+ * Load one mapped site by root label for manual Map Updater / inspector passes.
+ * @param {string} siteRoot
+ */
+export async function loadDungeonMapContextForSite(siteRoot) {
+    const wanted = normalizeDungeonLabel(siteRoot);
+    if (!wanted) return null;
+    const loaded = await loadAllMappedSiteContexts();
+    if (!loaded) return null;
+    const site = (loaded.sites || []).find(candidate => normalizeDungeonLabel(candidate.siteRoot) === wanted);
+    if (!site) return null;
+    const footer = loaded.currentLocation || '';
+    const isActiveSite = locationContainsSiteRoot(footer, site.siteRoot);
+    return {
+        prefix: loaded.prefix,
+        books: loaded.books,
+        currentLocation: footer,
+        isActiveSite,
+        context: {
+            prefix: loaded.prefix,
+            bookName: site.bookName,
+            uid: site.uid,
+            entryId: site.entryId,
+            siteRoot: site.siteRoot,
+            currentLocation: footer,
+            document: site.document,
+        },
+    };
+}
+
+/** Deep-clone the campaign Locations book for Map Updater swipe restore. */
+export async function snapshotCampaignLocationsBook(ctx = SillyTavern.getContext()) {
+    const prefix = getLivePrefix();
+    if (!prefix) return null;
+    const bookName = `${prefix}_Locations`;
+    if (!await isWorldInfoBookKnown(bookName, ctx)) return null;
+    const book = await loadWorldInfoFresh(bookName, ctx);
+    if (!book) return null;
+    return { bookName, book: JSON.parse(JSON.stringify(book)) };
+}
+
+/** Replace the live Locations book with a prior snapshot. */
+export async function restoreCampaignLocationsBook(snapshot, ctx = SillyTavern.getContext()) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+    if (!snapshot?.bookName || !snapshot?.book) return false;
+    if (snapshot.bookName !== `${getLivePrefix()}_Locations`) return false;
+    chatCommitResult(ownsChat, await evictWorldInfoCache(snapshot.bookName));
+    chatCommitResult(ownsChat, await saveWorldInfoSnapshot(snapshot.bookName, snapshot.book, ctx, 'Map Updater swipe restore', ownsChat));
+    if (typeof ctx.reloadWorldInfoEditor === 'function') ctx.reloadWorldInfoEditor(snapshot.bookName);
+    document.dispatchEvent(new CustomEvent('rt_lore_agent_updated', { detail: { source: 'map-updater-swipe-restore' } }));
+    return true;
+}
+
+async function finalizeRouterHistorySnapshot(runId, canCommit = () => true) {
+    if (!runId || !canCommit()) return;
+    const settings = getSettings();
+    const snapshot = (settings.routerHistory || []).find(entry => entry?.runId === runId);
+    if (!snapshot) return;
+    const prefix = snapshot.campaignPrefix || getLivePrefix();
+    if (!prefix) {
+        snapshot.createdBookNames = [];
+        snapshot.deletedBookNames = [];
+        return;
+    }
+    const chatId = snapshot.chatId || getRouterChatId();
+    const ownedNames = chatId ? (settings.chatStates?.[chatId]?.campaignBooks || []) : [];
+    const registryNames = await getWorldInfoNamesSafe({ fullProbe: false });
+    if (!canCommit()) return;
+    const currentNames = [...new Set([...ownedNames, ...registryNames])]
+        .filter(name => bookBelongsToPrefix(name, prefix) && !isSkeletonBookName(name));
+    const before = new Set(getLorebookSnapshotNames(snapshot));
+    const after = new Set(currentNames);
+    snapshot.createdBookNames = currentNames.filter(name => !before.has(name));
+    snapshot.deletedBookNames = [...before].filter(name => !after.has(name));
+    void saveSettings();
+}
+
+export function resolveActiveDungeonContext(allBooks, prefix, currentLocation) {
+    if (!prefix || !currentLocation) return null;
+    const wantedBookName = `${prefix}_Locations`;
+    const bookName = Object.keys(allBooks || {}).find(name => name.toLowerCase() === wantedBookName.toLowerCase());
+    const book = bookName ? allBooks[bookName] : null;
+    if (!book?.entries) return null;
+    const state = { version: 3, sites: buildDungeonSitesFromLocationEntries(book.entries, bookName) };
+    const site = resolveActiveDungeonSite(state, currentLocation);
+    if (!site?.entryId) return null;
+    const separator = site.entryId.lastIndexOf('::');
+    const uid = separator >= 0 ? site.entryId.slice(separator + 2) : '';
+    const rootEntry = book.entries[uid];
+    const mapBody = extractDungeonMapSection(rootEntry?.content);
+    if (!rootEntry || !mapBody) return null;
+    return {
+        prefix,
+        bookName,
+        uid,
+        entryId: site.entryId,
+        siteRoot: site.siteRoot,
+        currentLocation,
+        document: parseDungeonMapDocument(mapBody, site.siteRoot).document,
+    };
+}
+
+function stripStaticDungeonAgentGuidance(prompt) {
+    return String(prompt || '')
+        .replace(/\n?## DUNGEON LOCATION OWNERSHIP\s*\n[\s\S]*?(?=\n## |$)/gi, '\n')
+        .replace(/^\s*\*\*DUNGEON LOCATION OWNERSHIP:\*\*[^\n]*(?:\n|$)/gim, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+const LOCATION_FOOTER_LAG_NOTE = 'Parsed from the narrator status footer and may lag. If the latest narration clearly entered a named interior (chapel, inn, shop, house, alley) that this line omitted, treat the narration as authoritative — do not wait for the footer.';
+
+function formatCurrentLocationSection(hierarchy) {
+    return `## CURRENT LOCATION\n${hierarchy || 'Unknown'}\n${LOCATION_FOOTER_LAG_NOTE}`;
+}
+
+function formatArchiveIndexSection(keyringText) {
+    return `## ARCHIVE INDEX\nComplete catalog of inactive entries (Book::UID, label, keywords). If a name is not here, in ACTIVE MEMORY, or in NEWLY ACTIVATED, it does not exist — do not grep to confirm.\n${keyringText || 'Empty.'}`;
+}
+
+const LORE_EXISTENCE_RULE = 'ACTIVE MEMORY, NEWLY ACTIVATED THIS TURN, and ARCHIVE INDEX together are the complete catalog of existing entries. ARCHIVE INDEX lists Book::UID, label, and keywords for every inactive entry. If a name is not in that catalog, it does not exist — record it. Do not call grep_lore, inspect_book, or read_entry to check whether an entry exists. Use read_entry only when you need the full body of an archived entry already identified on ARCHIVE INDEX. Use grep_lore only to search entry bodies for a fact that labels/keywords do not answer, with one short query per call.';
+
+function formatMappedSiteAgentNote(context) {
+    if (!context) return '';
+    return `\n\n## MAPPED SITE\nThe party is inside mapped site "${context.siteRoot}". Map occupancy (areas, assets, routes, interiors) is maintained by the Map Updater. Do not emit [MAP_COMMIT], commit.map, inspect_map, or rewrite [MAP]. Record NPCs, factions, quests, events, and readable location lore as usual.`;
+}
+
+function createMappedChildLocationEntry(uid, rootLabel, areaName, chronicle, settings) {
+    return {
+        uid,
+        key: cleanKeys([areaName, rootLabel]),
+        keysecondary: [],
+        comment: `${rootLabel} :: ${areaName}`,
+        content: `[CORE]\n${areaName} is a location within ${rootLabel}; its permanent details are established through play.\n[/CORE]\n${chronicle}`,
+        constant: false,
+        selective: false,
+        selectiveLogic: 0,
+        addMemo: true,
+        order: settings.routerDefaultOrder ?? 100,
+        position: settings.routerDefaultPosition ?? 0,
+        disable: !settings.routerNativeKeywordActivation,
+        probability: 100,
+        useProbability: false,
+        depth: settings.routerDefaultDepth ?? 4,
+        group: '',
+        groupOverride: false,
+        groupWeight: 100,
+    };
+}
+
+function findMappedChildEntry(entries, rootLabel, areaName) {
+    return Object.values(entries || {}).find(entry => {
+        const label = String(entry?.comment || '').trim();
+        const segments = label.split(/\s*::\s*/).filter(Boolean);
+        if (segments.length > 1) {
+            return locationContainsSiteRoot(label, rootLabel)
+                && dungeonLabelsMatch(segments.at(-1), areaName);
+        }
+        const keys = Array.isArray(entry?.key) ? entry.key : [];
+        return dungeonLabelsMatch(label, areaName) && keys.some(key => dungeonSiteRootsMatch(key, rootLabel));
+    }) || null;
+}
+
+function mapTransactionSignature(value) {
+    const canonicalize = item => {
+        if (Array.isArray(item)) return item.map(canonicalize);
+        if (item && typeof item === 'object') {
+            return Object.fromEntries(Object.keys(item).sort().map(key => [key, canonicalize(item[key])]));
+        }
+        return item;
+    };
+    const source = JSON.stringify(canonicalize(value));
+    let hash = 0x811c9dc5;
+    for (let index = 0; index < source.length; index++) {
+        hash ^= source.charCodeAt(index);
+        hash = Math.imul(hash, 0x01000193);
+    }
+    return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+function resolveDungeonContextByUid(book, expectedContext) {
+    const rootEntry = book?.entries?.[expectedContext?.uid];
+    const mapBody = extractDungeonMapSection(rootEntry?.content);
+    if (!rootEntry || !mapBody) return null;
+    return {
+        prefix: expectedContext.prefix,
+        bookName: expectedContext.bookName,
+        uid: expectedContext.uid,
+        entryId: expectedContext.entryId,
+        siteRoot: expectedContext.siteRoot,
+        currentLocation: expectedContext.currentLocation,
+        document: parseDungeonMapDocument(mapBody, expectedContext.siteRoot).document,
+    };
+}
+
+/** Save current [MAP] plus observable child chronicles in one Locations-book write. */
+export async function applyDungeonMapCommit(transaction, expectedContext, allBooks, currentTime, options = {}) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId, options);
+    assertChatCommit(ownsChat);
+    const requireActive = options.requireActive !== false;
+    const frozenAreaIds = Array.isArray(options.frozenAreaIds) ? options.frozenAreaIds : [];
+    if (!expectedContext) {
+        return { ok: false, retryable: false, errors: [{ code: 'MAP_NOT_ACTIVE', path: 'map', received: transaction, hint: 'Map commands are unavailable because no mapped site is currently active.' }] };
+    }
+    const ctx = SillyTavern.getContext();
+    if (expectedContext.bookName !== `${getLivePrefix()}_Locations`) {
+        return { ok: false, retryable: false, errors: [{ code: 'MAP_CONTEXT_CHANGED', path: 'map', hint: 'The mapped site belongs to another campaign.' }] };
+    }
+    const freshBook = chatCommitResult(ownsChat, await loadWorldInfoFresh(expectedContext.bookName, ctx));
+    if (!freshBook?.entries) {
+        return { ok: false, retryable: false, errors: [{ code: 'MAP_CONTEXT_CHANGED', path: 'map', received: expectedContext.siteRoot, hint: 'The mapped site could not be reloaded. Do not retry this map mutation.' }] };
+    }
+
+    let liveContext;
+    if (requireActive) {
+        const latestLocation = findLatestDungeonLocation(ctx.chat || []) || expectedContext.currentLocation;
+        liveContext = resolveActiveDungeonContext({ [expectedContext.bookName]: freshBook }, expectedContext.prefix, latestLocation);
+        if (!liveContext || liveContext.entryId !== expectedContext.entryId) {
+            return { ok: false, retryable: false, errors: [{ code: 'MAP_CONTEXT_CHANGED', path: 'map', received: latestLocation, hint: 'The active mapped site changed during this pass. Do not retry this map mutation.' }] };
+        }
+    } else {
+        liveContext = resolveDungeonContextByUid(freshBook, expectedContext);
+        if (!liveContext) {
+            return { ok: false, retryable: false, errors: [{ code: 'MAP_ENTRY_MISSING', path: 'map', received: expectedContext.siteRoot, hint: 'The mapped root was removed during this pass. Do not retry this map mutation.' }] };
+        }
+    }
+
+    const rootEntry = freshBook.entries[liveContext.uid];
+    const priorOperations = Array.isArray(rootEntry?.extensions?.[DUNGEON_MAP_OPERATION_IDS_KEY])
+        ? rootEntry.extensions[DUNGEON_MAP_OPERATION_IDS_KEY]
+        : [];
+    const operationId = String(transaction?.operation_id || '').trim();
+    const signature = mapTransactionSignature(transaction);
+    const priorOperation = priorOperations.find(item => (typeof item === 'string' ? item : item?.id) === operationId);
+    if (operationId && priorOperation) {
+        if (typeof priorOperation === 'string' || priorOperation.signature === signature) {
+            return { ok: true, alreadyApplied: true, operationId, createdAssets: [], createdAreas: [], chronicles: [] };
+        }
+        return { ok: false, retryable: true, errors: [{ code: 'OPERATION_ID_CONFLICT', path: 'map.operation_id', received: operationId, hint: 'This ID already belongs to a different successful transaction. Retry this new change with a new operation_id.' }] };
+    }
+
+    const mapBody = extractDungeonMapSection(rootEntry.content);
+    const parsed = parseDungeonMapDocument(mapBody, liveContext.siteRoot);
+    const applied = applyDungeonMapTransaction(parsed.document, transaction, { frozenAreaIds, currentTime });
+    if (!applied.ok) return applied;
+
+    const timestampRegex = /(?:\[Day\s+\d+|\[\d{1,2}\/\d{1,2}\/\d+)\b/i;
+    const timePrefix = currentTime ? `[${currentTime}] ` : '';
+    for (const chronicle of applied.chronicles) {
+        let text = sanitizeLorebookRecordContent(chronicle.text).trim();
+        if (text && timePrefix && !timestampRegex.test(text)) text = `${timePrefix}${text}`;
+        if (!text) continue;
+        const area = applied.document.areas.find(item => item.id === chronicle.areaId);
+        if (area) area.knowledge = 'VISITED';
+        let child = findMappedChildEntry(freshBook.entries, liveContext.siteRoot, chronicle.areaName);
+        if (!child) {
+            const uids = Object.keys(freshBook.entries || {}).map(Number).filter(Number.isFinite);
+            const nextUid = uids.length ? Math.max(...uids) + 1 : 0;
+            child = createMappedChildLocationEntry(nextUid, liveContext.siteRoot, chronicle.areaName, text, getSettings());
+            freshBook.entries[nextUid] = child;
+        } else {
+            const existing = String(child.content || '').trimEnd();
+            const delta = deduplicateContent(existing, text);
+            if (delta) child.content = existing ? `${existing}\n${delta}` : delta;
+        }
+    }
+
+    rootEntry.content = replaceDungeonMapSection(rootEntry.content, serializeDungeonMapDocument(applied.document));
+    rootEntry.extensions = rootEntry.extensions || {};
+    rootEntry.extensions[DUNGEON_MAP_OPERATION_IDS_KEY] = [...priorOperations, { id: applied.operationId, signature }].slice(-100);
+    rootEntry.disable = true;
+    chatCommitResult(ownsChat, await saveWorldInfoSnapshot(expectedContext.bookName, freshBook, ctx, 'Dungeon map transaction', ownsChat));
+    allBooks[expectedContext.bookName] = freshBook;
+    recordLiveDungeonMapSnapshot(getSettings(), collectDungeonMapHistorySnapshot(freshBook.entries, expectedContext.bookName));
+    if (typeof ctx.reloadWorldInfoEditor === 'function') ctx.reloadWorldInfoEditor(expectedContext.bookName);
+    document.dispatchEvent(new CustomEvent('rt_lore_agent_updated'));
+    return { ...applied, document: undefined };
+}
+
+/** Occupancy commits require the party to still be inside the mapped site. */
+export async function applyActiveDungeonMapCommit(transaction, expectedContext, allBooks, currentTime, options = {}) {
+    return applyDungeonMapCommit(transaction, expectedContext, allBooks, currentTime, { ...options, requireActive: true });
 }
 
 /**
@@ -324,7 +1475,8 @@ function buildKeyringText(allBooks, activeKeys = []) {
  */
 export async function runRouterPass(narrativeOutput, manualPrompt = null, customLookback = null, isManual = false, newlyTriggeredIds = [], overrideChatLog = null) {
     const settings = getSettings();
-    if (!settings.routerEnabled || _routerRunning) return;
+    const dungeonRealityEnabled = isLocationMappingEnabled(settings);
+    if (!isLorebookAgentRuntimeActive(settings) || _routerRunning) return;
     // routerPaused blocks auto-runs only; manual UI runs always go through
     if (settings.routerPaused && !isManual) return;
 
@@ -333,9 +1485,22 @@ export async function runRouterPass(narrativeOutput, manualPrompt = null, custom
 
     try {
         _routerRunning = true;
-        if (_routerController) _routerController.abort();
+        // Pin chat ownership before any lorebook/LLM await. applyAction routes
+        // records via live getLivePrefix(), and watermark/timestamp helpers
+        // save through getActiveChatId() — both become the arriving chat after
+        // a switch. stopRouterPass() aborts this signal from onChatChanged.
+        const passChatId = getActiveChatId();
+        stopRouterPass();
         _routerController = new AbortController();
         const _routerSignal = _routerController.signal;
+        const ownsChat = createChatCommitGuard(passChatId, getActiveChatId, { signal: _routerSignal });
+        const assertOwnsChat = () => {
+            if (!ownsChat()) {
+                const err = new Error('Active chat changed');
+                err.name = 'AbortError';
+                throw err;
+            }
+        };
         broadcastStep('start', 'Initializing Lorebook Agent...');
 
         const startTime = Date.now();
@@ -352,24 +1517,23 @@ export async function runRouterPass(narrativeOutput, manualPrompt = null, custom
         }
 
         async function fetchArchiveBooks() {
-            return fetchRouterArchiveBooks(prefix, ctx, settings);
+            return fetchRouterArchiveBooks(prefix, ctx);
         }
 
         let archiveBooks = await fetchArchiveBooks();
+        assertOwnsChat();
         let _routerTriggerMsg = null;
         let _routerSnapshotRunId = null;
         let _routerPrePassWatermark = 0;
 
         // ?? Snapshot state BEFORE this pass (for rollback) ??????????????????
         {
-            const snapshot = {
-                timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-                activeRouterKeys: JSON.parse(JSON.stringify(settings.activeRouterKeys || [])),
-                activeWorldKeys: JSON.parse(JSON.stringify(settings.activeWorldKeys || [])),
-                routerLastRunChatLength: settings.routerLastRunChatLength ?? 0,
-                bookSnapshots: {},
-                runId: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
-            };
+            const snapshot = buildRouterLoreState(settings, {
+                prefix,
+                chatId: getRouterChatId(ctx),
+                bookSnapshots: archiveBooks,
+            });
+            snapshot.runId = `${Date.now()}_${Math.random().toString(36).slice(2)}`;
             _routerSnapshotRunId = snapshot.runId;
             _routerPrePassWatermark = snapshot.routerLastRunChatLength;
             _routerTriggerMsg = [...(ctx.chat || [])].reverse().find(m => !m.is_user && !m.is_system);
@@ -378,7 +1542,7 @@ export async function runRouterPass(narrativeOutput, manualPrompt = null, custom
             }
             if (!settings.routerHistory) settings.routerHistory = [];
             settings.routerHistory.unshift(snapshot);
-            if (settings.routerHistory.length > 5) settings.routerHistory.length = 5;
+            if (settings.routerHistory.length > LOREBOOK_ROLLBACK_LIMIT) settings.routerHistory.length = LOREBOOK_ROLLBACK_LIMIT;
             recordSchedulerEvent('la_pass_snapshot', {
                 runId: snapshot.runId,
                 preWm: _routerPrePassWatermark,
@@ -389,6 +1553,8 @@ export async function runRouterPass(narrativeOutput, manualPrompt = null, custom
         }
         let activeEntriesFull = [];
         let newlyTriggeredFull = [];
+        let activeDungeonEntryId = '';
+        let activeDungeonContext = null;
 
         const triggeredSet = new Set(newlyTriggeredIds);
 
@@ -402,7 +1568,10 @@ export async function runRouterPass(narrativeOutput, manualPrompt = null, custom
                     const fullId = `${name}::${uid}`;
                     if (settings.activeRouterKeys?.includes(fullId)) {
                         const label = entry.comment || entry.key?.[0] || fullId;
-                        let block = `### [ACTIVE] ${label}\nID: ${fullId}\nContent: ${entry.content}`;
+                        const entryContent = getDungeonMapAttachment(entry)
+                            ? stripDungeonMapSection(entry.content)
+                            : entry.content;
+                        let block = `### [ACTIVE] ${label}\nID: ${fullId}\nContent: ${entryContent}`;
                         // Append cap-constraint hints for NPC relationship values.
                         // Totals are intentionally hidden so the agent awards deltas from
                         // a consistent baseline, uncorrupted by the existing pool size.
@@ -483,10 +1652,27 @@ export async function runRouterPass(narrativeOutput, manualPrompt = null, custom
         const cleanMemoTime = memoTimeMatch ? extractCurrentTimeStr(memoTimeMatch[1]) : '';
         const currentTime = narrativeTimeMatch ? narrativeTimeMatch[1] : cleanMemoTime;
 
-        const locationRegex = /\(Location:\s*([^)]+)\)/i;
-        const locMatch = recentChatString.match(locationRegex);
-        const currentHierarchy = locMatch ? locMatch[1].trim() : '';
+        const currentHierarchy = extractFooterLocation(recentChatString) || findLatestDungeonLocation(chat);
         const breadcrumb = currentHierarchy ? currentHierarchy.replace(/,\s*/g, ' :: ') : '';
+        /** Commit via applyAction and abort the pass if ownership was lost mid-write. */
+        async function commitOwnedAction(action) {
+            assertOwnsChat();
+            const result = await applyAction(action, archiveBooks, currentTime, breadcrumb, isManual, { canCommit: ownsChat });
+            assertOwnsChat();
+            if (result?.status === 'chat_changed') {
+                const err = new Error('Active chat changed');
+                err.name = 'AbortError';
+                throw err;
+            }
+            return result;
+        }
+        activeDungeonContext = dungeonRealityEnabled
+            ? resolveActiveDungeonContext(archiveBooks, prefix, currentHierarchy)
+            : null;
+        activeDungeonEntryId = activeDungeonContext?.entryId || '';
+        // Rebuild after authoritative location resolution so [MAP] is present only
+        // while its own site is active, even if a mapped root happens to be pinned.
+        updateActiveEntries();
 
         // 2. The Loop
         let turns = 0;
@@ -506,24 +1692,76 @@ export async function runRouterPass(narrativeOutput, manualPrompt = null, custom
             maxTokens: (settings.routerMaxTokens !== undefined && settings.routerMaxTokens !== null && settings.routerMaxTokens !== '') ? Number(settings.routerMaxTokens) : 1000,
         };
 
-        // Budget status — computed once and reused in both basic and agent context
-        const activeCount = settings.activeRouterKeys?.length || 0;
-        const maxActive = settings.routerMaxActivations || 8;
+        // Budget status — computed once and reused in both basic and agent context.
+        // Pinned entries are excluded so user pins never trigger BUDGET VIOLATION
+        // or consume the agent's activation slots.
+        const budgetActiveKeys = (settings.activeRouterKeys || []).filter(id => id !== activeDungeonEntryId);
+        const activeCount = computeUnpinnedActiveCount(budgetActiveKeys, settings.pinnedRouterKeys);
+        const maxActive = settings.routerMaxActivations || 12;
         const overflow = activeCount - maxActive;
         const budgetLine = `Active entries: ${activeCount} / ${maxActive}`;
+        const curationInstruction =
+            `\nCONTEXT OWNERSHIP: You decide the active set. Keyword / NEWLY ACTIVATED hits are provisional, not locks. ` +
+            `Scene and narrative relevance is paramount regardless of what is currently active. ` +
+            `If ARCHIVE INDEX has a more important entry for this scene, deactivate a weaker active entry ` +
+            `(including a recent keyword hit) and activate the better one in this same pass — even when already at the cap. ` +
+            `Do not lazy-prune to the cap and stop.`;
         const overflowInstruction = overflow > 0
             ? `\nBUDGET VIOLATION: ${activeCount} entr${activeCount !== 1 ? 'ies' : 'y'} active, limit is ${maxActive}. ` +
               `You MUST deactivate at least ${overflow} entr${overflow > 1 ? 'ies' : 'y'} ` +
-              `before this pass ends. Eliminate the narratively least relevant entries first. ` +
-              `Justify each deactivation.`
+              `before this pass ends so the count is legal. That is the floor, not the whole job: ` +
+              `if ARCHIVE INDEX has higher-priority scene-relevant entries still inactive, deactivate extra low-value actives ` +
+              `(keyword hits are not protected) and activate those missing entries in this same pass. ` +
+              `Narrative relevance beats whatever is currently active. Justify each deactivation.`
             : '';
 
         const activeCombatBlock = extractActiveCombatBlock(settings.currentMemo);
+        const partyMechanicalBlock = extractPartyBlock(settings.currentMemo);
         const activeCombatSection = activeCombatBlock
             ? `## ACTIVE COMBAT STATE (canonical mechanical stats — use this as the source for NPC Combat Profiles, not the GM prose)\n${activeCombatBlock}\n\n`
             : '';
-        const combatProfileGuidanceBasic = buildCombatProfileRouterGuidance(!!activeCombatBlock, 'basic');
-        const combatProfileGuidanceAgent = buildCombatProfileRouterGuidance(!!activeCombatBlock, 'agent');
+        const partyMechanicalSection = partyMechanicalBlock
+            ? `## PARTY MECHANICAL STATE (canonical companion combat stats — patch existing NPC Combat Profiles after level-up / lasting progression; do not invent new Combat Profiles from this block)\n${partyMechanicalBlock}\n\n`
+            : '';
+        const combatProfileGuidanceBasic = resolveCombatProfileGuidance(settings, !!(activeCombatBlock || partyMechanicalBlock), 'basic');
+        const combatProfileGuidanceAgent = resolveCombatProfileGuidance(settings, !!(activeCombatBlock || partyMechanicalBlock), 'agent');
+
+        // Cold-start: once per chat, seed the LA prompt with the PC [CHARACTER] block so
+        // Equipment updates can be grounded in actual equipped gear/mechanics. Later passes
+        // rely on narrative cues only — no repeated CHARACTER/INVENTORY injection.
+        let pcCharacterSeedSection = '';
+        if (!settings.pcCharacterBlockSeeded) {
+            const characterBlock = extractCharacterBlock(settings.currentMemo);
+            if (characterBlock) {
+                pcCharacterSeedSection =
+                    `## PLAYER CHARACTER SHEET (initial reference — one-time)\n` +
+                    `This is the Player Character's mechanical sheet from chargen / the CHARACTER module. ` +
+                    `Use it as ground truth for what is currently equipped when judging Equipment updates. ` +
+                    `It will NOT be re-injected on later passes — after this, infer gear/look changes from the narrative only.\n` +
+                    `${characterBlock}\n\n`;
+            }
+            settings.pcCharacterBlockSeeded = true;
+            try {
+                const seedChatId = ctx.chatId || SillyTavern.getContext()?.chatId;
+                if (seedChatId) saveChatState(seedChatId);
+                else void saveSettings();
+            } catch (_) {
+                void saveSettings();
+            }
+        }
+
+        // One authoritative runtime list drives schemas, text-mode instructions,
+        // routing, and diagnostics. Disabled stock modules must not leak into a
+        // custom-only setup merely because their category names are built in.
+        const categoryEnum = getEnabledRouterCategoryTags(settings);
+        const categoryChoiceText = categoryEnum.map(tag => `"${tag}"`).join(' | ');
+        const categoryExampleValue = JSON.stringify(categoryEnum[0] || '');
+        const categoryRouteText = categoryEnum
+            .map(tag => `"${tag}" -> "${prefix ? `${prefix}_` : ''}${getRouterCategoryBookSuffix(tag)}"`)
+            .join(', ');
+        const recordCategoryGuidance = categoryEnum.length
+            ? `## AVAILABLE RECORD CATEGORIES (AUTHORITATIVE FOR THIS PASS)\nThe only valid \`record[].category\` values are: ${categoryChoiceText}.\nRoutes: ${categoryRouteText}.\nUse one of these exact values for every new record. Categories not listed here are disabled and must not be used.`
+            : `## AVAILABLE RECORD CATEGORIES (AUTHORITATIVE FOR THIS PASS)\nNo record categories are enabled. Do not create new records this pass.`;
 
         const sysTemplate = adjustPromptTimestamps(settings.routerSystemPromptTemplate || 'You are the Lorebook Agent. Maintain narrative consistency and manage lorebooks.', settings);
         const basePrompt = sysTemplate
@@ -575,7 +1813,7 @@ export async function runRouterPass(narrativeOutput, manualPrompt = null, custom
 
                 for (const [uid, entry] of Object.entries(book.entries)) {
                     const fullId = `${bookName}::${uid}`;
-                    const tokens = estimateTokens(entry.content);
+                    const tokens = estimateTokens(stripDungeonMapSection(entry.content));
                     const useThreshold = settings.routerCleanupUseThreshold !== false;
                     const isTarget = targetEntryId && fullId === targetEntryId;
                     const overThreshold = !useThreshold || tokens >= CLEANUP_TOKEN_THRESHOLD;
@@ -638,7 +1876,7 @@ export async function runRouterPass(narrativeOutput, manualPrompt = null, custom
 8. Do NOT consolidate entries of different categories (e.g., do NOT merge an NPC or Location into a Quest or Event). Consolidation is strictly for true duplicates representing the exact same entity or concept (e.g., two entries for the same NPC).
 9. Do NOT merge multiple distinct chronological events into a single entry to "reduce fragmentation". Each distinct event must remain as a separate entry so it triggers on its own keywords.
 10. NEVER modify, shorten, or delete content within \`[CORE] ... [/CORE]\` blocks under any circumstances. Keep the tags and their inner content completely unchanged. The system programmatically overwrites any modifications to the CORE block with the original, so editing it is useless.
-11. For legacy NPC entries lacking these tags, identify their persistent sections (Appearance/Species, Appearance, Personality, Brief Background, Habits/Behaviors) and wrap them inside a \`[CORE] ... [/CORE]\` block to protect them from future passes. Do not include Relationship, Friendship/Rapport, or Affection/Interest lines inside the block.
+11. For legacy NPC entries lacking these tags, identify their persistent sections (Species, Body, Equipment, Appearance/Species, Appearance, Personality, Brief Background, Habits/Behaviors) and wrap them inside a \`[CORE] ... [/CORE]\` block to protect them from future passes. Do not include Relationship, Friendship/Rapport, or Affection/Interest lines inside the block.
 12. Compress turn-by-turn or granular combat status logs (e.g., creature HP changes, turn-by-turn action lists, temporary conditions mid-fight) into high-level updates: for long combats, preserve the initiation (who/what attacked {{user}}), a progress summary every ~5 rounds (capturing major shifts or stalemates), and the final outcome.
 13. Output your reasoning first, then the tags.`;
 
@@ -660,7 +1898,7 @@ For each flagged entry:
 7. Do NOT consolidate entries of different categories (e.g., do NOT merge an NPC or Location into a Quest or Event). Consolidation is strictly for true duplicates representing the exact same entity (e.g., two entries for the same NPC).
 8. Do NOT merge multiple distinct chronological events into a single entry to "reduce fragmentation". Each distinct historical event must remain as its own entry so it triggers on its specific keywords.
 9. NEVER modify, shorten, or delete content within \`[CORE] ... [/CORE]\` blocks under any circumstances. Keep the tags and their inner content completely unchanged. The system programmatically overwrites any modifications to the CORE block with the original, so editing it is useless.
-10. For legacy NPC entries lacking these tags, identify their persistent sections (Appearance/Species, Appearance, Personality, Brief Background, Habits/Behaviors) and wrap them inside a \`[CORE] ... [/CORE]\` block to protect them from future passes. Do not include Relationship, Friendship/Rapport, or Affection/Interest lines inside the block.
+10. For legacy NPC entries lacking these tags, identify their persistent sections (Species, Body, Equipment, Appearance/Species, Appearance, Personality, Brief Background, Habits/Behaviors) and wrap them inside a \`[CORE] ... [/CORE]\` block to protect them from future passes. Do not include Relationship, Friendship/Rapport, or Affection/Interest lines inside the block.
 11. Compress turn-by-turn or granular combat status logs (e.g., creature HP changes, turn-by-turn action lists, temporary conditions mid-fight) into high-level updates: for long combats, preserve the initiation (who/what attacked {{user}}), a progress summary every ~5 rounds (capturing major shifts or stalemates), and the final outcome.
 12. Call commit exactly once at the end. Do not call it per-entry.`;
 
@@ -702,13 +1940,14 @@ Action: commit({"rewrite": [{"id": "Eldoria_Events::3", "content": "Compressed v
                 const cleanupUserPrompt = cleanupContext;
                 broadcastStep('thought', 'Thinking...');
                 const basicResp = await sendStateRequest(routerSettings, cleanupSystemPrompt, cleanupUserPrompt, _routerSignal);
+                assertOwnsChat();
                 const thoughtMatchC = basicResp.match(/(?:Thought|Reasoning):\s*([\s\S]*?)(?=\[\[|$)/i);
                 if (thoughtMatchC) broadcastStep('thought', thoughtMatchC[1].trim().substring(0, 300));
                 broadcastStep('thought', 'Parsing cleanup tags...');
                 const cleanupAction = parseBasicTags(basicResp, archiveBooks);
                 cleanupAction.reason = targetEntryId ? `Targeted cleanup: ${targetEntryId}.` : 'Cleanup pass (basic mode).';
                 if (cleanupAction.rewrite.length > 0 || cleanupAction.consolidate.length > 0) {
-                    await applyAction(cleanupAction, archiveBooks, currentTime, breadcrumb);
+                    await commitOwnedAction(cleanupAction);
                     const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
                     broadcastStep('finish', `Cleanup done in ${totalTime}s — ${cleanupAction.rewrite.length} rewritten, ${cleanupAction.consolidate.length} consolidated.`);
                 } else {
@@ -818,6 +2057,7 @@ Action: commit({"rewrite": [{"id": "Eldoria_Events::3", "content": "Compressed v
                 cleanupTurns++;
                 broadcastStep('thought', `Cleanup thinking (Turn ${cleanupTurns}/${maxTurns})...`);
                 const result = await sendAgentTurn(routerSettings, cleanupMessages, usesNativeTools ? cleanupAgentTools : null, _routerSignal);
+                assertOwnsChat();
 
                 if (result.content) {
                     const thoughtLine = result.content.match(/(?:Thought|Reasoning):\s*(.*)/i)?.[1]?.trim()
@@ -867,8 +2107,9 @@ Action: commit({"rewrite": [{"id": "Eldoria_Events::3", "content": "Compressed v
                 let observation = '';
                 if (toolName === 'commit') {
                     args.reason = targetEntryId ? `Targeted cleanup: ${targetEntryId}.` : 'Cleanup pass (agent mode).';
-                    const commitResult = await applyAction(args, archiveBooks, currentTime, breadcrumb);
+                    const commitResult = await commitOwnedAction(args);
                     archiveBooks = await fetchArchiveBooks();
+                    assertOwnsChat();
                     if (commitResult.errors.length > 0) {
                         observation = `Committed with warnings: ${commitResult.errors.join(', ')}`;
                     } else {
@@ -884,6 +2125,7 @@ Action: commit({"rewrite": [{"id": "Eldoria_Events::3", "content": "Compressed v
                     } else {
                         const [bookName, id] = uid.split('::');
                         const book = await ctx.loadWorldInfo(bookName);
+                        assertOwnsChat();
                         observation = book?.entries?.[id] ? book.entries[id].content : `Entry "${uid}" not found.`;
                     }
                 } else if (toolName === 'grep_lore') {
@@ -927,6 +2169,19 @@ Action: commit({"rewrite": [{"id": "Eldoria_Events::3", "content": "Compressed v
             coreSections = DEFAULT_NPC_SECTIONS;
         }
         const sectionNamesList = coreSections.map(s => s.name).join(', ');
+        // Body and Worn Equipment are exclusive to their dedicated tools; automatic passes may
+        // only additionally touch Combat Profile via commit.core / UPDATE_CORE. Species and
+        // the other identity fields (Personality, Background, Habits, Strengths, Flaws) only
+        // unlock on a manual/Direct Prompt pass.
+        const eligibleCoreFields = getEligibleCoreFieldNames(coreSections, isManual);
+        const eligibleCoreFieldsList = eligibleCoreFields.join(', ');
+        const autoPassCoreRestriction = resolveAutoPassRestriction(settings, isManual, eligibleCoreFieldsList);
+        const pcAppearanceGuidance = `
+- You may update the Player Character's own Body via \`[[UPDATE_APPEARANCE: {{user}} | new body text]]\` (basic) or \`commit.appearance\` with id \`{{user}}\` / \`player\` / \`pc\` / the PC's name when their signature look permanently changes.
+- You may update the Player Character's own Worn Equipment via \`[[UPDATE_EQUIPMENT: {{user}} | new worn gear text]]\` (basic) or \`commit.equipment\` the same way, whenever their visibly worn/carried gear changes.
+- Never touch the PC's Species/Personality/Background/Habits/Strengths/Flaws, and never create a new PC lorebook entry.
+- Body means signature/default physical look (build, face, hair, features) — not a transient pose. Worn Equipment means currently worn/carried gear only — not Body, coins, loot piles, or inventory lists.`;
+        const existingNpcChronicleNudge = resolveExistingNpcNudge(settings);
 
         // -- Basic Mode (tag-based, one-shot, no tool calling) -----------------
         if (settings.routerBasicMode) {
@@ -953,95 +2208,61 @@ Action: commit({"rewrite": [{"id": "Eldoria_Events::3", "content": "Compressed v
             modularPrompt = modularPrompt.replace(/\{\{#if_world\}\}[\s\S]*?\{\{\/if_world\}\}/g, '');
             modularPrompt = modularPrompt.replace(/\{\{#if_world\}\}|\{\{\/if_world\}\}|\{\{dayStr\}\}|\{\{prevDay\}\}/g, '');
 
-            const relSection = settings.npcRelationshipBars ? `
-${buildRouterRelationshipInstruction(getNpcRelationshipMax(settings))}
-` : '';
+            const relSection = settings.npcRelationshipBars
+                ? buildRouterRelationshipInstruction(getNpcRelationshipMax(settings), settings).trim()
+                : '';
 
-            // coreSections and sectionNamesList are defined above
-            let exampleCoreLines = '';
-            if (coreSections[0]) exampleCoreLines += `${coreSections[0].name}: A burly human blacksmith with a scar on his cheek.\n`;
-            if (coreSections[1]) exampleCoreLines += `${coreSections[1].name}: Gruff but reliable.\n`;
-            if (coreSections[2]) exampleCoreLines += `${coreSections[2].name}: Retired from the militia to open his own forge.\n`;
-            if (coreSections[3]) exampleCoreLines += `${coreSections[3].name}: Wipes his brow with a greasy rag.\n`;
-            exampleCoreLines = exampleCoreLines.trim();
+            // Resolve the Basic Mode system prompt from the editable template.
+            // Runtime-dependent fragments (combat guidance, pass restrictions, etc.) are
+            // expanded from editable settings templates — see defaults.js.
+            const basicRawTemplate = settings.routerBasicSystemPromptTemplate || '';
+            const maxActNum = settings.routerMaxActivations || 12;
+            const basicSystemPrompt = adjustPromptTimestamps(
+                expandLorebookPromptTemplate(
+                    basicRawTemplate
+                    .replace(/You are limited to \*\*\d+ active entries\*\*/gi, `You are limited to **${maxActNum} active entries**`)
+                    .replace(/Maximum Active Entities:\s*\*\*\d+\*\*/gi, `Maximum Active Entities: **${maxActNum}**`),
+                    {
+                        modularPrompt,
+                        formatLines: formatLinesStr,
+                        maxActivations: maxActNum,
+                        sectionNames: sectionNamesList,
+                        relSection,
+                        pcAppearanceGuidance,
+                        eligibleCoreFields: eligibleCoreFieldsList,
+                        autoPassRestriction: autoPassCoreRestriction,
+                        existingNpcNudge: existingNpcChronicleNudge,
+                        combatProfileGuidance: combatProfileGuidanceBasic.trim(),
+                    },
+                ),
+                settings
+            );
 
-            const basicSystemPrompt = `You are the Research Assistant. Your task is to identify and record important narrative entities and events.
-
-${modularPrompt}
-
-## ATTENTION & MEMORY
-1. **NEWLY ACTIVATED THIS TURN**: Entries whose keywords appeared in the latest narrator output are pre-loaded here with full content. You do not need to activate them again — they are already active.
-2. **ACTIVE MEMORY**: Full details of all other currently active entities. You can update them at any time.
-3. **ARCHIVE INDEX**: Inactive entries — labels and keywords only. You CANNOT see their full biography.
-4. **RECALL**: To read or update an archive entry, use [[ACTIVATE: Name]]. Its full content becomes visible next turn.
-5. **LIMIT**: You are limited to **${settings.routerMaxActivations || 8} active entries**. Nothing is archived automatically. If you exceed this limit you will see a **BUDGET VIOLATION** line and you MUST use [[DEACTIVATE: Name]] on the least relevant active entries to return within budget before this pass ends.
-${relSection}
-## [CORE] BY CATEGORY
-- **NPC**: structured \`[CORE]\` with ${sectionNamesList} (see NPC field instructions below).
-- **LOC**: plain \`[CORE]\` with 1–2 sentences describing the place. No field headers.
-- **FAC**: plain \`[CORE]\` wrapping permanent history, ideology, schemes, and members. No field headers.
-- **QUEST, EVENT**: do NOT use \`[CORE]\`. Use timestamped chronicle lines only.
-
-## PLAYER CHARACTER SAFEGUARD
-- Do NOT create a lorebook entry (NPC, Location, Faction, etc.) for the player character under any circumstances.
-- The player character is the speaker labeled "Player" (and prompt replacement "{{user}}"). In the chat logs, pay close attention to what name(s) or alias(es) the other characters use when addressing or referring to the "Player" (e.g., if they call the Player "Dave Davidson" or "Dave", then "Dave Davidson" is the player character).
-- Under no circumstances should you create an NPC entry for these names/aliases, because they refer to the player.
-- Always use the exact macro string \`{{user}}\` when referring to the player. Do NOT write the plain word "user", "player", "Player", or the player's roleplay character name (like "Dave Davidson") in plain text in any entry updates or descriptions.
-
-## NPC CORE UPDATES (NPC only)
-If any field inside the permanent [CORE] block changes, is updated, or new information is revealed (${sectionNamesList}), output:
-  [[UPDATE_CORE: Book::UID or NPC Name | FieldName | New field text]]
-Use the exact FieldName (e.g. ${sectionNamesList}). Do NOT log core updates as normal event/update entries.
-
-## DO NOT RE-RECORD EXISTING ENTITIES
-Before outputting [[NPC:...]], [[LOC:...]], [[FAC:...]], etc. for anyone or anything, check ACTIVE MEMORY and ARCHIVE INDEX for a matching name (they may be listed under a different label — check keywords too).
-- If the entity ALREADY EXISTS (in ACTIVE MEMORY, in NEWLY ACTIVATED, or in the ARCHIVE INDEX): do NOT output a new [[NPC:...]]/[[LOC:...]]/[[FAC:...]] tag with a fresh [CORE] block for them, even if you don't currently see their full content. Instead:
-  - To change/add a [CORE] field: use [[UPDATE_CORE: Name | FieldName | new text]].
-  - To append a chronicle/timeline note: use the module's normal update format (e.g. re-use the [[EVENT:...]] name to accumulate, or update the existing entry) — never a second [CORE] block.
-  - To bring an archived entry into full view first: use [[ACTIVATE: Name]].
-- Only use a fresh [[NPC:...]]/[[LOC:...]]/[[FAC:...]] record for entities that are BRAND NEW and have never appeared in ACTIVE MEMORY or ARCHIVE INDEX before.
-${combatProfileGuidanceBasic}
-## RULES
-1. Only record persistent or significant entities/events.
-2. Use ACTIVATE to bring an existing entry into the current scene context.
-3. Use DEACTIVATE to remove an entry that is no longer relevant to the scene.
-4. Use DELETE to permanently remove duplicate or redundant entries.
-5. Do NOT create any entry for the player character (e.g. "Player" or "Dave Davidson").
-6. CRITICAL: Do NOT blindly copy the formatting or sections of other characters found in ACTIVE MEMORY. You MUST strictly use ONLY the sections instructed below (${sectionNamesList}) for NPCs and ignore any other sections.
-7. Output your thoughts first, then the tags.
-
-Example:
-Thought: I see a new NPC named Barnaby in Khelt's Rust-Lantern District. I will record him and the tavern.
-[[NPC: Barnaby | [CORE]
-${exampleCoreLines}
-[/CORE] | Barnaby, blacksmith, ally]]
-[[LOC: Khelt :: Rust-Lantern District :: Barnaby's Forge | [CORE]
-A squat iron building managing mining contracts; soot-stained walls and a clanging workshop floor.
-[/CORE] | Barnaby's Forge, forge, Khelt, Rust-Lantern]]
-[[FAC: Iron Syndicate | Wary of outsiders after the forge raid; still dominant in the industrial quarter. | [CORE]Founded by ex-mercenaries forty years ago; controls scrap tariffs and smuggling. Lieutenant Marna Voss handles street enforcement.[/CORE] | Iron Syndicate, Khelt, faction, smuggling]]`;
-
-            const finalBasicSystemPrompt = basicSystemPrompt;
+            const finalBasicSystemPrompt = `${stripStaticDungeonAgentGuidance(basicSystemPrompt)}${formatMappedSiteAgentNote(activeDungeonContext)}`;
 
             const questMatchB = settings.currentMemo?.match(/\[QUESTS\]([\s\S]*?)\[\/QUESTS\]/i);
             const questBlockB = questMatchB ? `[QUESTS]${questMatchB[1].trim()}[/QUESTS]` : 'None';
-            const basicUserPrompt = `## BUDGET STATUS\n${budgetLine}${overflowInstruction}\n\n## NEWLY ACTIVATED THIS TURN\n${newlyTriggeredFull.join('\n\n') || 'None.'}\n\n## ACTIVE MEMORY (Lore)\n${activeEntriesFull.join('\n\n') || 'None.'}\n\n## ARCHIVE INDEX\n${keyringText || 'Empty.'}\n\n## CURRENT LOCATION\n${currentHierarchy || 'Unknown'}\n\n## ACTIVE QUESTS\n${questBlockB}\n\n${activeCombatSection}## NARRATIVE\n${recentChatString}\n\n${manualPrompt ? `## INSTRUCTION\n${manualPrompt}\n\n` : ''}`;
+            const basicUserPrompt = `## BUDGET STATUS\n${budgetLine}${curationInstruction}${overflowInstruction}\n\n## NEWLY ACTIVATED THIS TURN\n${newlyTriggeredFull.join('\n\n') || 'None.'}\n\n## ACTIVE MEMORY (Lore)\n${activeEntriesFull.join('\n\n') || 'None.'}\n\n${formatArchiveIndexSection(keyringText)}\n\n${formatCurrentLocationSection(currentHierarchy)}${formatMappedSiteAgentNote(activeDungeonContext)}\n\n## ACTIVE QUESTS\n${questBlockB}\n\n${pcCharacterSeedSection}${activeCombatSection}${partyMechanicalSection}## NARRATIVE\n${recentChatString}\n\n${manualPrompt ? `## INSTRUCTION\n${manualPrompt}\n\n` : ''}`;
 
             broadcastStep('thought', 'Thinking...');
             const basicResp = await sendStateRequest(routerSettings, finalBasicSystemPrompt, basicUserPrompt, _routerSignal);
+            assertOwnsChat();
 
             const thoughtMatchB = basicResp.match(/Thought:\s*([\s\S]*?)(?=\[\[|$)/i);
             if (thoughtMatchB) broadcastStep('thought', thoughtMatchB[1].trim());
             broadcastStep('thought', 'Parsing tags...');
             const basicAction = parseBasicTags(basicResp, archiveBooks);
 
-            if (basicAction.record.length > 0 || basicAction.update.length > 0 || basicAction.activate.length > 0 || basicAction.delete_ids?.length > 0 || basicAction.rel?.length > 0 || basicAction.appearance?.length > 0 || basicAction.core?.length > 0) {
+            const hasOrdinaryActions = basicAction.record.length > 0 || basicAction.update.length > 0 || basicAction.activate.length > 0 || basicAction.deactivate.length > 0 || basicAction.delete_ids?.length > 0 || basicAction.rel?.length > 0 || basicAction.appearance?.length > 0 || basicAction.equipment?.length > 0 || basicAction.core?.length > 0;
+            if (hasOrdinaryActions) {
                 const summaries = [];
                 if (basicAction.record.length) summaries.push(`New: ${basicAction.record.length}`);
                 if (basicAction.update.length) summaries.push(`Updates: ${basicAction.update.length}`);
                 if (basicAction.activate.length) summaries.push(`Activations: ${basicAction.activate.length}`);
-                if (basicAction.core?.length || basicAction.appearance?.length) summaries.push(`Core: ${(basicAction.core?.length || 0) + (basicAction.appearance?.length || 0)}`);
+                if (basicAction.deactivate.length) summaries.push(`Deactivations: ${basicAction.deactivate.length}`);
+                if (basicAction.core?.length || basicAction.appearance?.length || basicAction.equipment?.length) summaries.push(`Core: ${(basicAction.core?.length || 0) + (basicAction.appearance?.length || 0) + (basicAction.equipment?.length || 0)}`);
                 basicAction.reason = (thoughtMatchB ? thoughtMatchB[1].trim() : 'Tag-based update.') + ` (${summaries.join(', ')})`;
-                await applyAction(basicAction, archiveBooks, currentTime, breadcrumb);
+                await commitOwnedAction(basicAction);
                 basicSummaryText = summaries.join(', ');
             } else {
                 broadcastStep('finish', 'Basic Mode: No tags found.');
@@ -1050,16 +2271,9 @@ A squat iron building managing mining contracts; soot-stained walls and a clangi
         } else {
             // -- Agent Mode (native tool calling, multi-turn messages) ----------
 
-            // Build the commit tool's category enum from enabled modules + custom tags
-            const validCategories = [
-                ...Object.values(settings.routerModules || {}).filter(m => m.enabled).map(m => m.tag.toUpperCase()),
-                ...(settings.routerCustomTags || []).map(t => t.tag.toUpperCase()),
-            ];
-            const categoryEnum = validCategories.length ? validCategories : ['NPC', 'LOC', 'QUEST', 'FAC', 'EVENT'];
-
             // Dynamically build the commit tool parameters based on settings
             const commitProperties = {
-                record: {
+                ...(categoryEnum.length ? { record: {
                     type: 'array',
                     description: 'Creates a BRAND-NEW entry only. Never use this for a name that already appears in ACTIVE MEMORY, NEWLY ACTIVATED THIS TURN, or the ARCHIVE INDEX — that would duplicate their [CORE] block. For an existing entity, use "core" (identity/Combat Profile fields) or "update" (chronicle text) instead.',
                     items: {
@@ -1067,12 +2281,12 @@ A squat iron building managing mining contracts; soot-stained walls and a clangi
                         properties: {
                             label: { type: 'string', description: 'Entity name only. NO tag prefix (e.g. "Iron Syndicate", NOT "FAC: Iron Syndicate"). Do NOT record the player character under any name (including "Player" or their roleplay character name/alias like "Dave Davidson").' },
                             keys:  { type: 'array', items: { type: 'string' }, description: 'Search keywords. Include the entity name/title itself (without timestamps like "[Day 1]") as a keyword, plus any ancestor location names.' },
-                            content:  { type: 'string', description: `Full entry body. NPC: structured [CORE] with ${sectionNamesList}. LOC: plain [CORE] with 1–2 sentences (no field headers). FAC: plain [CORE] wrapping permanent history, ideology, schemes. QUEST/EVENT: no [CORE]; use chronicle format.` },
-                            category: { type: 'string', enum: categoryEnum, description: 'Determines which lorebook the entry goes into.' }
+                            content:  { type: 'string', description: `Full entry body. Follow the FIELD INSTRUCTIONS for the selected enabled category. Stock-category formatting, when enabled: NPC uses structured [CORE] with ${sectionNamesList}; LOC/FAC use plain [CORE]; QUEST/EVENT use chronicle format.` },
+                            category: { type: 'string', enum: categoryEnum, description: `REQUIRED. Use exactly one category enabled for this pass: ${categoryChoiceText || '(none)'}. ${categoryRouteText ? `Routes: ${categoryRouteText}. ` : ''}Labels and "::" paths do not choose the book.` }
                         },
                         required: ['label', 'keys', 'content', 'category']
                     }
-                },
+                } } : {}),
                 update: {
                     type: 'array',
                     description: 'Append new information to existing entries.',
@@ -1151,12 +2365,25 @@ A squat iron building managing mining contracts; soot-stained walls and a clangi
 
             commitProperties.appearance = {
                 type: 'array',
-                description: 'Surgically update the Appearance field inside an NPC\'s [CORE] block. Only use when the NPC\'s physical appearance changes significantly.',
+                description: 'Surgically update Body (signature/default physical look) for an NPC [CORE] or the linked Player Character card. Not for worn gear — use commit.equipment for that. For the PC, set id to "{{user}}", "player", "pc", or the PC\'s name.',
                 items: {
                     type: 'object',
                     properties: {
-                        id:      { type: 'string', description: 'Book::UID of the NPC entry.' },
-                        content: { type: 'string', description: 'New appearance text. Replaces only the Appearance field inside [CORE].' }
+                        id:      { type: 'string', description: 'Book::UID / NPC name, or "{{user}}" / "player" / "pc" / PC name for the Player Character card.' },
+                        content: { type: 'string', description: 'New Body text. Replaces only the Body field.' }
+                    },
+                    required: ['id', 'content']
+                }
+            };
+
+            commitProperties.equipment = {
+                type: 'array',
+                description: 'Surgically update Equipment (currently worn/carried gear) for an NPC [CORE] or the linked Player Character card. Use whenever the narrative explicitly shows their equipped weapons/armor/clothing changing. For the PC, set id to "{{user}}", "player", "pc", or the PC\'s name.',
+                items: {
+                    type: 'object',
+                    properties: {
+                        id:      { type: 'string', description: 'Book::UID / NPC name, or "{{user}}" / "player" / "pc" / PC name for the Player Character card.' },
+                        content: { type: 'string', description: 'New Equipment text. Replaces only the Equipment field.' }
                     },
                     required: ['id', 'content']
                 }
@@ -1164,13 +2391,13 @@ A squat iron building managing mining contracts; soot-stained walls and a clangi
 
             commitProperties.core = {
                 type: 'array',
-                description: `Surgically update one of the fields inside an NPC's [CORE] block (${sectionNamesList}). Only use when new information is revealed or permanent changes occur.`,
+                description: `Surgically update an eligible [CORE] field on an NPC (${eligibleCoreFieldsList}). Body/Equipment use commit.appearance/commit.equipment instead. ${!isManual ? 'AUTOMATIC PASS: Combat Profile only.' : 'DIRECT PROMPT PASS: identity fields (including Species) unlocked when the user instruction warrants it.'}`,
                 items: {
                     type: 'object',
                     properties: {
-                        id:      { type: 'string', description: 'Book::UID or plain NPC name (from ACTIVE MEMORY).' },
-                        field:   { type: 'string', enum: coreSections.map(s => s.name), description: 'The exact field inside [CORE] to update.' },
-                        content: { type: 'string', description: 'New field content text.' }
+                        id:      { type: 'string', description: 'Book::UID or plain NPC name from ACTIVE MEMORY, NEWLY ACTIVATED, or ARCHIVE INDEX. Not used for the Player Character — PC Body/Equipment use commit.appearance/commit.equipment.' },
+                        field:   { type: 'string', enum: eligibleCoreFields, description: 'The exact eligible [CORE] field to update this pass.' },
+                        content: { type: 'string', description: 'New field content. To color text, write <font color=#RRGGBB>text</font> with an UNQUOTED hex (never color="#RRGGBB" — quotes break JSON). Preserve existing font/hex color markup.' }
                     },
                     required: ['id', 'field', 'content']
                 }
@@ -1182,10 +2409,10 @@ A squat iron building managing mining contracts; soot-stained walls and a clangi
                     type: 'function',
                     function: {
                         name: 'grep_lore',
-                        description: `Search all lorebooks in scope ("${prefix || 'All'}") for entries whose content or label contains the query.`,
+                        description: `Search entry bodies in scope ("${prefix || 'All'}") for one keyword or phrase. Do not use this to check whether a named entity exists — scan ARCHIVE INDEX instead.`,
                         parameters: {
                             type: 'object',
-                            properties: { query: { type: 'string', description: 'Keyword or phrase to search for.' } },
+                            properties: { query: { type: 'string', description: 'One keyword or short phrase. Not a list of names.' } },
                             required: ['query']
                         }
                     }
@@ -1194,7 +2421,7 @@ A squat iron building managing mining contracts; soot-stained walls and a clangi
                     type: 'function',
                     function: {
                         name: 'inspect_book',
-                        description: 'List all entry labels and UIDs in a specific lorebook.',
+                        description: 'List UIDs in one lorebook. Usually unnecessary: ARCHIVE INDEX already lists every inactive entry as Book::UID.',
                         parameters: {
                             type: 'object',
                             properties: { book_name: { type: 'string', description: 'Exact lorebook name (e.g. "Eldoria_Factions").' } },
@@ -1206,10 +2433,10 @@ A squat iron building managing mining contracts; soot-stained walls and a clangi
                     type: 'function',
                     function: {
                         name: 'read_entry',
-                        description: 'Read the full content of a lorebook entry.',
+                        description: 'Read the full body of an archived entry using Book::UID from ARCHIVE INDEX. Not for existence checks.',
                         parameters: {
                             type: 'object',
-                            properties: { uid: { type: 'string', description: 'Entry UID in "BookName::0" format.' } },
+                            properties: { uid: { type: 'string', description: 'Entry UID in "BookName::0" format from ARCHIVE INDEX.' } },
                             required: ['uid']
                         }
                     }
@@ -1233,52 +2460,57 @@ A squat iron building managing mining contracts; soot-stained walls and a clangi
             // text-format (Action:/Observation:) system prompt and text-based parsing instead.
             const usesNativeTools = ['openai', 'ollama'].includes(routerSettings.connectionSource);
 
-            const sharedContext = `
-## MEMORY LIMIT
-Maximum Active Entities: **${settings.routerMaxActivations || 8}**.
-- Entries you record are ACTIVATED AUTOMATICALLY. Do NOT also include them in activate.
-- Nothing is archived automatically. If you exceed the limit you will receive a **BUDGET VIOLATION** in the context and you MUST deactivate enough entries in that same commit call to return within budget. Choose the narratively least relevant entries.
-- Entries whose keywords appeared in the latest narrator output may already appear under **NEWLY ACTIVATED THIS TURN** with full content — you do not need to activate those again.
-- Always use exact Book::UID format (e.g. "Eldoria_NPCs::0") for activate/update/deactivate/delete_ids.
+            // Build field instructions for the {{fieldInstructions}} token
+            const fieldInstructionLines = [
+                ...Object.values(settings.routerModules || {}).filter(m => m.enabled).map(m => `- ${m.tag}: ${m.instruction}`),
+                ...((settings.routerCustomTags || []).length
+                    ? ['', '### CUSTOM CATEGORIES', ...(settings.routerCustomTags || []).map(m => `- ${m.tag.toUpperCase()}: ${m.instruction}`)]
+                    : []),
+            ].join('\n');
 
-## DO NOT RE-RECORD EXISTING ENTITIES
-Before using \`record\` for anyone or anything, check ACTIVE MEMORY, NEWLY ACTIVATED THIS TURN, and the ARCHIVE INDEX for a matching name (check keywords too, they may be listed under a different label).
-- If the entity ALREADY EXISTS anywhere in that context — even if you only see its label in the ARCHIVE INDEX with no full content — do NOT call \`record\` for it. Instead:
-  - To change/add a [CORE] field (identity, appearance, or Combat Profile): use \`commit({"core": [{"id": "Book::UID or Name", "field": "...", "content": "..."}]})\`.
-  - To append new chronicle text: use \`commit({"update": [{"id": "Book::UID or Name", "content": "..."}]})\`.
-  - To see its full content first: use \`read_entry\` or \`grep_lore\`, or \`activate\` it.
-- Only use \`record\` for entities that are BRAND NEW and have never appeared in ACTIVE MEMORY, NEWLY ACTIVATED, or the ARCHIVE INDEX before.
+            // Resolve the Agent Mode shared context from the editable template.
+            // All previously-hardcoded sharedContext sections now live in
+            // routerAgentSharedContextTemplate (see defaults.js).
+            const agentRawTemplate = settings.routerAgentSharedContextTemplate || '';
+            const agentRelSection = settings.npcRelationshipBars
+                ? buildNpcRelationshipInstruction(getNpcRelationshipMax(settings), settings).trim()
+                : '';
+            const maxActNumAgent = settings.routerMaxActivations || 12;
+            const sharedContext = adjustPromptTimestamps(
+                expandLorebookPromptTemplate(
+                    agentRawTemplate
+                    .replace(/Maximum Active Entities:\s*\*\*\d+\*\*/gi, `Maximum Active Entities: **${maxActNumAgent}**`)
+                    .replace(/You are limited to \*\*\d+ active entries\*\*/gi, `You are limited to **${maxActNumAgent} active entries**`),
+                    {
+                        maxActivations: maxActNumAgent,
+                        pcAppearanceGuidance,
+                        eligibleCoreFields: eligibleCoreFieldsList,
+                        autoPassRestriction: autoPassCoreRestriction,
+                        existingNpcNudge: existingNpcChronicleNudge,
+                        campaignRoot: prefix || 'World Archive',
+                        campaignNpcBook: prefix ? `${prefix}_NPCs` : 'NPCs',
+                        campaignLocBook: prefix ? `${prefix}_Locations` : 'Locations',
+                        fieldInstructions: fieldInstructionLines,
+                        combatProfileGuidance: combatProfileGuidanceAgent.trim(),
+                        relSection: agentRelSection,
+                    },
+                ),
+                settings
+            );
 
-## WORLD SKELETON (OFF-LIMITS)
-World Skeleton lorebooks (names ending in _Skeleton) are hidden seed data for World Progression only. They are NOT in your archive, tools cannot access them, and you must NEVER activate, read, update, or commit changes to Skeleton entries.
-
-## CAMPAIGN CONTEXT
-Campaign Root: "${prefix || 'World Archive'}"
-  NPCs -> "${prefix ? prefix + '_NPCs' : 'NPCs'}"
-  Locations -> "${prefix ? prefix + '_Locations' : 'Locations'}" (etc.)
-Location hierarchy: use " :: " separator in labels (e.g. "Khelt :: Rust-Lantern District :: The Guilded Anvil").
-Include the entity name/title itself (without timestamps like "[Day 1]") as a keyword, plus any ancestor location names (e.g. keys: ["The Guilded Anvil", "Khelt", "Rust-Lantern District", "tavern"]).
-**Keyword cap: maximum 6 per entry.** Keep only the most essential trigger words.
-
-## CONTENT FORMAT
-- Each time-stamped event must start on its own line. Do NOT chain multiple '[Day X, ...]' entries on the same line.
-- Correct: '[Day 2, 10:42] Corruption manifests.\n[Day 2, 10:44] Sentry targets Rozach.'
-- Wrong:   '[Day 2, 10:42] Corruption manifests. [Day 2, 10:44] Sentry targets Rozach.'
-- **[CORE] by category:** NPC = structured fields inside [CORE] (see NPC instructions). LOC = plain [CORE], 1–2 sentences, no field headers. FAC = plain [CORE] wrapping permanent history/ideology, no field headers. QUEST/EVENT = no [CORE].
-- CRITICAL: Do NOT blindly copy the formatting or sections of other characters found in ACTIVE MEMORY. You MUST strictly use ONLY the sections instructed below for NPCs and ignore any other sections.
-
-## FIELD INSTRUCTIONS
-${Object.values(settings.routerModules || {}).filter(m => m.enabled).map(m => `- ${m.tag}: ${m.instruction}`).join('\n')}${(settings.routerCustomTags || []).length ? '\n\n### CUSTOM CATEGORIES\n' + (settings.routerCustomTags || []).map(m => `- ${m.tag.toUpperCase()}: ${m.instruction}`).join('\n') : ''}${combatProfileGuidanceAgent}`;
-
-            const commitActionSchema = settings.npcRelationshipBars
-                ? `commit({"record": [...], "update": [...], "rename": [...], "activate": [...], "deactivate": [...], "delete_ids": [...], "rel": [...], "core": [...]}) — write all changes and finish`
-                : `commit({"record": [...], "update": [...], "rename": [...], "activate": [...], "deactivate": [...], "delete_ids": [...], "core": [...]}) — write all changes and finish`;
+            const commitFieldNames = [
+                ...(categoryEnum.length ? ['"record": [...]'] : []),
+                '"update": [...]', '"rename": [...]', '"activate": [...]',
+                '"deactivate": [...]', '"delete_ids": [...]',
+                ...(settings.npcRelationshipBars ? ['"rel": [...]'] : []),
+                '"appearance": [...]', '"equipment": [...]', '"core": [...]',
+            ].join(', ');
 
             const commitRelDescription = settings.npcRelationshipBars
                 ? `\ncommit rel items: {"id": "Book::UID or NPC Name", "field": "friendship"|"affection", "delta": ±N} — set INITIAL relationship values for newly recorded NPCs only (signed integer delta)`
                 : ``;
 
-            const adjustedSharedContext = adjustPromptTimestamps(sharedContext, settings);
+            const adjustedSharedContext = `${stripStaticDungeonAgentGuidance(sharedContext)}${formatMappedSiteAgentNote(activeDungeonContext)}`;
 
             const agentSystemPrompt = usesNativeTools
                 // Clean prompt for native tool calling ? model gets schemas via the API
@@ -1286,15 +2518,16 @@ ${Object.values(settings.routerModules || {}).filter(m => m.enabled).map(m => `-
 
 ## YOUR ROLE
 You are a lorebook research agent. Maintain the campaign lorebook using the provided tools.
-Use grep_lore / inspect_book / read_entry to look up existing data before recording.
+${LORE_EXISTENCE_RULE}
 When research is complete, call commit once to write all changes. Stop immediately after.
-${adjustedSharedContext}`
+${adjustedSharedContext}
+${recordCategoryGuidance}`
                 // Text-format prompt for profile/default ? model outputs Action:/Observation: text
                 : `${basePrompt}
 
 ## YOUR ROLE
 You are a lorebook research agent. Maintain the campaign lorebook using the actions below.
-Use grep_lore / inspect_book / read_entry to look up existing data before recording.
+${LORE_EXISTENCE_RULE}
 When research is complete, output commit once to write all changes, then stop.
 
 ## ACTIONS
@@ -1302,24 +2535,30 @@ Output exactly ONE action per turn in this format (do NOT use markdown bold/ital
   Action: toolname({"arg": "value"})
 
 Available actions:
-- grep_lore({"query": "..."}) ? search lorebooks for entries matching a keyword
-- inspect_book({"book_name": "..."}) ? list UIDs in a lorebook
-- read_entry({"uid": "Book::0"}) ? read full content of an entry
-- commit({${settings.npcRelationshipBars ? '"record": [...], "update": [...], "rename": [...], "activate": [...], "deactivate": [...], "delete_ids": [...], "rel": [...], "core": [...]' : '"record": [...], "update": [...], "rename": [...], "activate": [...], "deactivate": [...], "delete_ids": [...], "core": [...]'}}) ? write all changes and finish
+- grep_lore({"query": "..."}) — search entry bodies for one keyword/phrase; not an existence check
+- inspect_book({"book_name": "..."}) — list UIDs in a lorebook (usually unnecessary; ARCHIVE INDEX has Book::UID)
+- read_entry({"uid": "Book::0"}) — read full body of an archived entry already on ARCHIVE INDEX
+- commit({${commitFieldNames}}) ? write all changes and finish
 
-commit record items: {"label": "Name only (NO tag prefix)", "keys": ["kw1","kw2"], "content": "...", "category": "NPC|LOC|FAC|QUEST|EVENT"}
+${categoryEnum.length
+    ? `commit record items: {"label": "Name only (NO tag prefix)", "keys": ["kw1","kw2"], "content": "...", "category": ${categoryExampleValue}} — category is REQUIRED and must use one of these enabled values: ${categoryChoiceText}.`
+    : `commit record items: unavailable because no record categories are enabled.`}
 commit update items: {"id": "Book::UID", "content": "new text to append"}
 commit rename items: {"id": "Book::UID", "label": "New Name (optional)", "keys": ["kw1","kw2"] (optional, max 6)}${commitRelDescription}
-commit core items: {"id": "Book::UID or NPC Name", "field": "${coreSections.map(s => s.name).join('|')}", "content": "new field content"} — surgically updates a field inside [CORE] on NPC entries only (prefer over re-recording the full NPC)
+commit appearance items: {"id": "Book::UID or NPC Name or {{user}}", "content": "new body text"} — surgically updates Body (NPC [CORE] or linked PC card)
+commit equipment items: {"id": "Book::UID or NPC Name or {{user}}", "content": "new equipment text"} — surgically updates Equipment (NPC [CORE] or linked PC card)
+commit core items: {"id": "Book::UID or NPC Name", "field": "${eligibleCoreFields.join('|')}", "content": "new field content"} — surgically updates an eligible [CORE] field on NPC entries only (Body/Equipment use commit.appearance/commit.equipment; automatic passes = Combat Profile only)
 
 ## EXAMPLE
-Thought: I see a new faction called Iron Syndicate. I will record it.
-Action: commit({"record": [{"label": "Iron Syndicate", "keys": ["Khelt", "faction"], "content": "The dominant industrial authority.", "category": "FAC"}]})
-${adjustedSharedContext}`;
+${categoryEnum.length
+    ? `Thought: New Entity is not in ACTIVE MEMORY or ARCHIVE INDEX, so it does not exist yet. I will record it with an enabled category.\nAction: commit({"record": [{"label": "New Entity", "keys": ["New Entity"], "content": "Persistent details about the entity.", "category": "${categoryEnum[0]}"}]})`
+    : `Thought: No record categories are enabled, so I will not create a record.\nAction: commit({})`}
+${adjustedSharedContext}
+${recordCategoryGuidance}`;
 
             const questMatchA = settings.currentMemo?.match(/\[QUESTS\]([\s\S]*?)\[\/QUESTS\]/i);
             const questBlockA = questMatchA ? `[QUESTS]${questMatchA[1].trim()}[/QUESTS]` : 'None';
-            const contextMessage = `## BUDGET STATUS\n${budgetLine}${overflowInstruction}\n\n## NEWLY ACTIVATED THIS TURN\n${newlyTriggeredFull.join('\n\n') || 'None.'}\n\n## ACTIVE MEMORY (Lore)\n${activeEntriesFull.join('\n\n') || 'None yet.'}\n\n## ARCHIVE INDEX\n${keyringText || 'Empty.'}\n\n## CURRENT LOCATION\n${currentHierarchy || 'Unknown'}\n\n## ACTIVE QUESTS\n${questBlockA}\n\n${activeCombatSection}## NARRATIVE\n${recentChatString}${manualPrompt ? `\n\n## INSTRUCTION\n${manualPrompt}` : ''}`;
+            const contextMessage = `## BUDGET STATUS\n${budgetLine}${curationInstruction}${overflowInstruction}\n\n## NEWLY ACTIVATED THIS TURN\n${newlyTriggeredFull.join('\n\n') || 'None.'}\n\n## ACTIVE MEMORY (Lore)\n${activeEntriesFull.join('\n\n') || 'None yet.'}\n\n${formatArchiveIndexSection(keyringText)}\n\n${formatCurrentLocationSection(currentHierarchy)}${formatMappedSiteAgentNote(activeDungeonContext)}\n\n## ACTIVE QUESTS\n${questBlockA}\n\n${pcCharacterSeedSection}${activeCombatSection}${partyMechanicalSection}## NARRATIVE\n${recentChatString}${manualPrompt ? `\n\n## INSTRUCTION\n${manualPrompt}` : ''}`;
 
             /** @type {Array<{role:string, content:string|null, tool_calls?:any[], tool_call_id?:string}>} */
             const messages = [
@@ -1329,6 +2568,9 @@ ${adjustedSharedContext}`;
 
             let agentRetries = 0;
             const MAX_AGENT_RETRIES = 2;
+            let jsonCorrectionRetries = 0;
+            const MAX_JSON_CORRECTION_RETRIES = 2;
+            let terminalCommitRejection = '';
             while (turns < maxTurns) {
                 turns++;
                 broadcastStep('thought', `Thinking (Turn ${turns}/${maxTurns})...`);
@@ -1336,6 +2578,7 @@ ${adjustedSharedContext}`;
                 // Only pass tool schemas to connections that support native tool calling.
                 // Profile/default connections ignore or mishandle the tools parameter.
                 const result = await sendAgentTurn(routerSettings, messages, usesNativeTools ? agentTools : null, _routerSignal);
+                assertOwnsChat();
 
                 // Show any inline thought the model included alongside the tool call
                 if (result.content) {
@@ -1364,16 +2607,25 @@ ${adjustedSharedContext}`;
                             // Model produced text but no parseable Action — nudge it.
                             broadcastStep('thought', `No action in response, nudging model (retry ${agentRetries}/${MAX_AGENT_RETRIES})...`);
                             messages.push({ role: 'assistant', content: result.content });
-                            messages.push({ role: 'user', content: 'Please output your Action now. Remember: Action: toolname({...})' });
+                            const jsonHint = /\bAction\s*:/i.test(result.content)
+                                ? 'Your Action JSON could not be parsed. Output one corrected action using strict JSON with double-quoted keys/strings and no trailing commas: Action: toolname({...})'
+                                : 'Please output your Action now. Remember: Action: toolname({...})';
+                            messages.push({ role: 'user', content: jsonHint });
                         }
                         continue;
                     }
                     // No tool call and no parseable action after retries — model is done
+                    if (result.content && /\bAction\s*:/i.test(result.content)) {
+                        throw new Error('Lorebook Agent repeatedly returned malformed Action JSON. Nothing was written.');
+                    }
                     break;
                 }
                 agentRetries = 0; // reset on a successful action
 
-                const { name: toolName, args } = resolvedToolCall;
+                const { name: toolName, args: parsedArgs, argumentError } = resolvedToolCall;
+                const argsAreObject = parsedArgs && typeof parsedArgs === 'object' && !Array.isArray(parsedArgs);
+                const args = argsAreObject ? parsedArgs : {};
+                const effectiveArgumentError = argumentError || (!argsAreObject ? 'Tool arguments must be a JSON object.' : null);
                 const callId = /** @type {any} */ (resolvedToolCall).id || `call_${Date.now()}_${turns}`;
                 broadcastStep('tool', `${toolName}(...)`);
 
@@ -1392,20 +2644,40 @@ ${adjustedSharedContext}`;
                 messages.push(_asstMsg);
 
                 let observation = '';
+                let commitAccepted = false;
+                let retryRejectedJson = false;
 
-                if (toolName === 'commit') {
-                    const commitResult = await applyAction(args, archiveBooks, currentTime, breadcrumb);
+                if (effectiveArgumentError) {
+                    jsonCorrectionRetries++;
+                    observation = JSON.stringify({
+                        ok: false,
+                        retryable: jsonCorrectionRetries <= MAX_JSON_CORRECTION_RETRIES,
+                        code: 'MALFORMED_JSON',
+                        path: `${toolName}.arguments`,
+                        received: effectiveArgumentError,
+                        hint: 'Retry the same action with strict JSON: double-quoted keys/strings, no comments, and no trailing commas. For color markup write <font color=#RRGGBB>text</font> with UNQUOTED hex — never color="#RRGGBB". Nothing was written.',
+                    }, null, 2);
+                    retryRejectedJson = jsonCorrectionRetries <= MAX_JSON_CORRECTION_RETRIES;
+                } else if (toolName === 'commit') {
+                    const ordinaryAction = { ...args };
+                    delete ordinaryAction.map;
+                    const commitResult = await commitOwnedAction(ordinaryAction);
+                    commitAccepted = true;
+                    jsonCorrectionRetries = 0;
+                    const details = [];
+                    if (commitResult.recordedIds?.length > 0) details.push(`Recorded/Updated: ${commitResult.recordedIds.join(', ')}`);
+                    if (args.activate?.length > 0) details.push(`Activated: ${args.activate.join(', ')}`);
+                    observation = commitResult.errors.length > 0
+                        ? `Committed with warnings: ${commitResult.errors.join(', ')}${details.length ? ` | ${details.join(' | ')}` : ''}`
+                        : `Committed successfully. ${details.join(' | ')}`;
                     archiveBooks = await fetchArchiveBooks();
+                    assertOwnsChat();
                     keyringText = buildKeyringText(archiveBooks, settings.activeRouterKeys);
+                    activeDungeonContext = dungeonRealityEnabled
+                        ? resolveActiveDungeonContext(archiveBooks, prefix, currentHierarchy)
+                        : null;
+                    activeDungeonEntryId = activeDungeonContext?.entryId || '';
                     updateActiveEntries();
-                    if (commitResult.errors.length > 0) {
-                        observation = `Committed with warnings: ${commitResult.errors.join(', ')}`;
-                    } else {
-                        const details = [];
-                        if (commitResult.recordedIds?.length > 0) details.push(`Recorded/Updated: ${commitResult.recordedIds.join(', ')}`);
-                        if (args.activate?.length > 0) details.push(`Activated: ${args.activate.join(', ')}`);
-                        observation = `Committed successfully. ${details.join(' | ')}`;
-                    }
                 } else if (toolName === 'grep_lore') {
                     const hits = grepLoreInBooks(archiveBooks, args.query);
                     observation = hits.length > 0 ? hits.join('\n') : `No entries found for "${args.query}".`;
@@ -1427,6 +2699,7 @@ ${adjustedSharedContext}`;
                     } else {
                         const [bookName, id] = uid.split('::');
                         const book = await ctx.loadWorldInfo(bookName);
+                        assertOwnsChat();
                         observation = book?.entries?.[id] ? book.entries[id].content : `Entry "${uid}" not found.`;
                     }
                 } else {
@@ -1442,14 +2715,28 @@ ${adjustedSharedContext}`;
                     content: observation
                 });
 
-                // commit always ends the research pass
-                if (toolName === 'commit') break;
+                if (effectiveArgumentError || (toolName === 'commit' && !commitAccepted)) {
+                    if (retryRejectedJson) {
+                        broadcastStep('thought', `Invalid JSON, nudging model (retry ${jsonCorrectionRetries}/${MAX_JSON_CORRECTION_RETRIES})...`);
+                        continue;
+                    }
+                    terminalCommitRejection = 'Lorebook Agent correction limit reached. The rejected action wrote nothing.';
+                    break;
+                }
+                // A validated commit ends the research pass. Rejected commits do not.
+                if (toolName === 'commit' && commitAccepted) break;
             }
+            if (terminalCommitRejection) throw new Error(terminalCommitRejection);
         } // end agent mode
 
         const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
         const finishMsg = basicSummaryText ? `Finished in ${totalTime}s -- ${basicSummaryText}` : `Finished in ${totalTime}s`;
         broadcastStep('finish', finishMsg, { time: totalTime, turns });
+
+        // Refuse watermark / stamp / history finalization once ownership is lost.
+        // Aborted/errored passes already jump to catch; this covers the post-LLM
+        // window where the AbortSignal fired after the response was already in hand.
+        assertOwnsChat();
 
         // Advance the "since last run" watermark only when this pass actually used that lookback mode.
         // Aborted/errored passes never reach here (they go to catch), so the watermark is safe.
@@ -1482,6 +2769,11 @@ ${adjustedSharedContext}`;
         // Cleanup passes never reach this line (they return earlier), so no extra guard is needed.
         persistRouterLastRunTimestamp();
 
+        // Record the exact book-level delta while the pass is still the newest action.
+        // Rollback can then remove only books proven to have been created by this pass.
+        await finalizeRouterHistorySnapshot(_routerSnapshotRunId, ownsChat);
+        assertOwnsChat();
+
         // Manual passes don't go through onGenerationEnded's throttle reset — treat like an auto run.
         if (typeof globalThis._rpgResetRouterAutoTick === 'function') {
             globalThis._rpgResetRouterAutoTick('lore_agent_pass_complete');
@@ -1500,7 +2792,7 @@ ${adjustedSharedContext}`;
             const CLEANUP_TOKEN_THRESHOLD = settings.routerCleanupTokenThreshold || 300;
             const bloatedCount = Object.values(archiveBooks)
                 .flatMap(b => Object.values(b.entries || {}))
-                .filter(e => estimateTokens(e.content) >= CLEANUP_TOKEN_THRESHOLD).length;
+                .filter(e => estimateTokens(stripDungeonMapSection(e.content)) >= CLEANUP_TOKEN_THRESHOLD).length;
 
             _routerNormalRunCount++;
             const cleanupEvery = settings.routerCleanupEvery || 0;
@@ -1509,7 +2801,10 @@ ${adjustedSharedContext}`;
             if (shouldAutoCleanup) {
                 broadcastStep('thought', `🧹 Auto-cleanup: ${bloatedCount} bloated entr${bloatedCount > 1 ? 'ies' : 'y'} found. Scheduling cleanup pass...`);
                 // Queue non-blockingly so the current pass finishes cleanly first
-                setTimeout(() => runRouterPass(null, '__CLEANUP__', null, true), 200);
+                _routerCleanupTimer = setTimeout(() => {
+                    _routerCleanupTimer = null;
+                    if (ownsChat()) void runRouterPass(null, '__CLEANUP__', null, true);
+                }, 200);
             } else if (bloatedCount > 0) {
                 broadcastStep('thought', `💡 ${bloatedCount} entr${bloatedCount > 1 ? 'ies' : 'y'} may benefit from cleanup (>${CLEANUP_TOKEN_THRESHOLD} tokens). Use the 🧹 button to compress.`);
             }
@@ -1518,8 +2813,11 @@ ${adjustedSharedContext}`;
         return true;
     } catch (e) {
         if (e?.name === 'AbortError') {
-            console.log('[Lorebook Agent] Pass aborted by user.');
-            broadcastStep('error', 'Stopped by user.');
+            const chatChanged = /chat changed/i.test(e?.message || '');
+            console.log(chatChanged
+                ? '[Lorebook Agent] Pass aborted: active chat changed.'
+                : '[Lorebook Agent] Pass aborted by user.');
+            broadcastStep('error', chatChanged ? 'Stopped: active chat changed.' : 'Stopped by user.');
         } else {
             console.error("[Lorebook Agent] Run failed:", e);
             broadcastStep('error', e.message);
@@ -1537,15 +2835,22 @@ ${adjustedSharedContext}`;
  * @param {object} allBooks - The cached archive books for verification.
  * @param {string} [currentTime=''] - The current time string for timestamping.
  * @param {string} [breadcrumb=''] - The current location hierarchy string (Main :: Sub).
+ * @param {boolean} [isManual=false]
+ * @param {{ canCommit?: () => boolean }} [options] Rechecked after I/O before further writes.
  * @returns {Promise<{success: boolean, errors: string[], recordedIds: string[]}>}
  */
-async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb = '') {
+async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb = '', isManual = false, options = {}) {
+    const canCommit = createChatCommitGuard(getActiveChatId(), getActiveChatId, options);
+    const staleResult = { success: false, status: 'chat_changed', errors: ['Active chat changed'], recordedIds: [] };
+    if (!canCommit()) return staleResult;
     const settings = getSettings();
     const ctx = SillyTavern.getContext();
     let changed = false;
     const errors = [];
     const allBookNames = Object.keys(allBooks);
     const TIMESTAMP_REGEX = /(?:\[Day\s+\d+|\[\d{1,2}\/\d{1,2}\/\d+)\b/i;
+    const linkedPc = getLinkedPlayerCharacter();
+    const linkedPcName = linkedPc?.name || '';
 
     const timePrefix = currentTime ? `[${currentTime}] ` : '';
 
@@ -1554,10 +2859,11 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
     const deactivate = action.deactivate || [];
     let newActive = [...(settings.activeRouterKeys || [])];
     let newWorldActive = [...(settings.activeWorldKeys || [])];
+    const pinnedSet = new Set(settings.pinnedRouterKeys || []);
     
-    // Remove deactivations
-    newActive = newActive.filter(k => !deactivate.includes(k));
-    newWorldActive = newWorldActive.filter(k => !deactivate.includes(k));
+    // Remove deactivations — pinned entries are immune (silent no-op)
+    newActive = newActive.filter(k => !deactivate.includes(k) || pinnedSet.has(k));
+    newWorldActive = newWorldActive.filter(k => !deactivate.includes(k) || pinnedSet.has(k));
     
     // Add activations
     for (const k of activate) {
@@ -1618,6 +2924,7 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
         }
         const [bookName, uid] = up.id.split('::');
         const book = await ctx.loadWorldInfo(bookName);
+        if (!canCommit()) return staleResult;
         if (book?.entries?.[uid]) {
             // Strip [ID:] stamp from anywhere in the delta (model sometimes echoes it)
             let delta = (up.content || '').replace(/\[ID:[^\]]+\]\n?/gi, '').trim();
@@ -1632,6 +2939,7 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
             }
             book.entries[uid].content = existing && delta ? `${existing}\n${delta}` : (existing || delta);
             await ctx.saveWorldInfo(bookName, book);
+            if (!canCommit()) return staleResult;
             changed = true;
         }
     }
@@ -1650,10 +2958,12 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
         }
         const [bookName, uid] = rw.id.split('::');
         const book = await ctx.loadWorldInfo(bookName);
+        if (!canCommit()) return staleResult;
         if (book?.entries?.[uid]) {
             const originalContent = book.entries[uid].content || '';
             book.entries[uid].content = protectCoreBlock(originalContent, rw.content);
             await ctx.saveWorldInfo(bookName, book);
+            if (!canCommit()) return staleResult;
             rewriteIds.push(rw.id);
             changed = true;
         } else {
@@ -1675,15 +2985,19 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
         }
         const [bookName, uid] = rn.id.split('::');
         const book = await ctx.loadWorldInfo(bookName);
+        if (!canCommit()) return staleResult;
         if (book?.entries?.[uid]) {
             const oldLabel = book.entries[uid].comment || '';
             if (rn.label !== undefined) book.entries[uid].comment = rn.label;
             if (rn.keys  !== undefined) book.entries[uid].key = cleanKeys(rn.keys);
             await ctx.saveWorldInfo(bookName, book);
+            if (!canCommit()) return staleResult;
             if (rn.label !== undefined && oldLabel && rn.label !== oldLabel) {
                 // Dynamic import avoids a static cycle (index → router → portraits → index).
                 const { renamePortraitEntity } = await import('./portraits.js');
-                await renamePortraitEntity(oldLabel, rn.label);
+                if (!canCommit()) return staleResult;
+                await renamePortraitEntity(oldLabel, rn.label, { canCommit });
+                if (!canCommit()) return staleResult;
             }
             renameIds.push(rn.id);
             changed = true;
@@ -1707,10 +3021,12 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
         // Update the survivor with merged content
         const [sBook, sUid] = op.survivor.split('::');
         const sBookData = await ctx.loadWorldInfo(sBook);
+        if (!canCommit()) return staleResult;
         if (sBookData?.entries?.[sUid]) {
             const originalContent = sBookData.entries[sUid].content || '';
             sBookData.entries[sUid].content = protectCoreBlock(originalContent, op.content);
             await ctx.saveWorldInfo(sBook, sBookData);
+            if (!canCommit()) return staleResult;
             consolidateIds.push(op.survivor);
         } else {
             errors.push(`Consolidate survivor not found: ${op.survivor}`);
@@ -1723,15 +3039,19 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
             if (typeof targetId !== 'string' || !targetId.includes('::')) continue;
             const [tBook, tUid] = targetId.split('::');
             const tBookData = await ctx.loadWorldInfo(tBook);
+            if (!canCommit()) return staleResult;
             if (tBookData?.entries?.[tUid]) {
                 delete tBookData.entries[tUid];
                 await ctx.saveWorldInfo(tBook, tBookData);
+                if (!canCommit()) return staleResult;
             } else {
                 errors.push(`Consolidate target not found: ${targetId}`);
             }
             settings.activeRouterKeys = (settings.activeRouterKeys || [])
                 .filter(k => k !== targetId);
             settings.activeWorldKeys = (settings.activeWorldKeys || [])
+                .filter(k => k !== targetId);
+            settings.pinnedRouterKeys = (settings.pinnedRouterKeys || [])
                 .filter(k => k !== targetId);
             newActive = newActive.filter(k => k !== targetId);
             newWorldActive = newWorldActive.filter(k => k !== targetId);
@@ -1748,24 +3068,33 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
     // Group entries by target book and commit once per book to avoid UID collisions
     const records = action.record || [];
     const prefix = getLivePrefix();
-    const baseBook = prefix || 'World Chronicle';
     const recordedIds = [];
 
     // -- Phase A: Route each record to its target book --
-    const catMap = { 'NPC': 'NPCs', 'LOC': 'Locations', 'QUEST': 'Quests', 'FAC': 'Factions', 'EVENT': 'Events', 'WORLD': 'World' };
-    // Extend with user-defined custom tags so they get their own books (e.g. WEATHER ? prefix_Weather)
-    for (const ct of (settings.routerCustomTags || [])) {
-        const t = ct.tag.toUpperCase();
-        if (!catMap[t]) catMap[t] = t.charAt(0) + t.slice(1).toLowerCase();
-    }
+    const writableCategoryMap = buildRouterCategoryMap(settings);
+    // WORLD is an internal World Progression target, not an implicit Agent category.
+    const catMap = { ...writableCategoryMap, WORLD: 'World' };
     /** @type {Map<string, Array>} */
     const bookQueue = new Map();
 
     const knownBookNames = Object.keys(allBooks);
+    const knownCatTags = Object.keys(catMap);
+    const writableCatTags = Object.keys(writableCategoryMap);
+    const unambiguousFallbackTag = writableCatTags.length === 1 ? writableCatTags[0] : null;
     for (const rec of records) {
-        const cat = (rec.category || rec.comment || '').toUpperCase();
-        const catName = Object.keys(catMap).find(k => cat.includes(k));
-        const idealTargetBook = catName ? (prefix ? `${prefix}_${catMap[catName]}` : catMap[catName]) : baseBook;
+        const resolved = resolveRecordCategoryTag(rec, knownCatTags, unambiguousFallbackTag);
+        if (!resolved.tag) {
+            const who = rec.label || '(untitled)';
+            const expected = writableCatTags.length ? writableCatTags.join('|') : '(no record categories enabled)';
+            errors.push(`Skipped record "${who}": missing or unrecognized category. Expected ${expected}. Re-commit with "category" set.`);
+            continue;
+        }
+        if (resolved.inferred) {
+            rec.category = resolved.tag;
+        }
+        const cat = resolved.tag;
+        const catName = cat;
+        const idealTargetBook = prefix ? `${prefix}_${catMap[catName]}` : catMap[catName];
         
         let targetBook = idealTargetBook;
         const idealLower = idealTargetBook.toLowerCase();
@@ -1834,6 +3163,7 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
         try {
             bookData = await ctx.loadWorldInfo(targetBook);
         } catch (_) { }
+        if (!canCommit()) return staleResult;
 
         if (!bookData) {
             try {
@@ -1842,13 +3172,16 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
                     headers: getRequestHeaders(),
                     body: JSON.stringify({ name: targetBook })
                 });
+                if (!canCommit()) return staleResult;
                 if (res.ok) {
                     const data = await res.json();
+                    if (!canCommit()) return staleResult;
                     if (data && typeof data === 'object' && data.entries) {
                         bookData = data;
                     }
                 }
             } catch (_) {}
+            if (!canCommit()) return staleResult;
         }
 
         if (!bookData) {
@@ -1886,10 +3219,21 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
                     // delta ALSO contains a full [CORE] block, replace the old one in place
                     // (last write wins) rather than duplicating it, and only append whatever
                     // chronicle text (if any) remains outside that block.
-                    const newCoreMatch = delta.match(/\[CORE\][\s\S]*?\[\/CORE\]/i);
+                    const newCoreMatch = delta.match(/\[CORE\]([\s\S]*?)\[\/CORE\]/i);
                     const existingHasCore = /\[CORE\][\s\S]*?\[\/CORE\]/i.test(existing);
                     if (newCoreMatch && existingHasCore) {
-                        existing = existing.replace(/\[CORE\][\s\S]*?\[\/CORE\]/i, newCoreMatch[0]);
+                        const oldCoreMatch = existing.match(/\[CORE\]([\s\S]*?)\[\/CORE\]/i);
+                        const newCoreInner = newCoreMatch[1];
+                        const oldCoreInner = oldCoreMatch ? oldCoreMatch[1] : '';
+                        let extraHeaders = [];
+                        try {
+                            const coreSecs = (settings.npcCoreSections && Array.isArray(settings.npcCoreSections) && settings.npcCoreSections.length > 0)
+                                ? settings.npcCoreSections
+                                : DEFAULT_NPC_SECTIONS;
+                            extraHeaders = coreSecs.map(sec => sec.name).filter(Boolean);
+                        } catch (_) {}
+                        const mergedInner = mergePreservedColorMarkup(oldCoreInner, newCoreInner, { extraHeaders });
+                        existing = existing.replace(/\[CORE\][\s\S]*?\[\/CORE\]/i, `[CORE]${mergedInner}[/CORE]`);
                         delta = delta.replace(newCoreMatch[0], '').trim();
                         if (settings.debugMode) console.warn(`[RPG Tracker] Record targeted existing entry "${rec.label}" with a full [CORE] block — replaced in place instead of duplicating (agent should have used UPDATE_CORE/commit core).`);
                     }
@@ -1957,6 +3301,7 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
             headers: getRequestHeaders(),
             body: JSON.stringify({ name: targetBook, data: bookData })
         });
+        if (!canCommit()) return staleResult;
         if (!saveRes.ok) {
             console.error(`[RPG Tracker] Failed to save ${targetBook}: HTTP ${saveRes.status}`);
         } else {
@@ -1966,20 +3311,25 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
             // (the raw HTTP API bypasses the in-memory cache; this syncs them up).
             if (typeof ctx.saveWorldInfo === 'function') {
                 try { await ctx.saveWorldInfo(targetBook, bookData); } catch (_) { /* non-fatal */ }
+                if (!canCommit()) return staleResult;
             }
             booksWritten.add(targetBook);
         }
     }
 
     // Bulk-activate all written books after all disk writes are done.
-    // Doing this once at the end avoids race conditions where ST's world info
-    // list hasn't re-indexed yet when the first /world command fires.
+    // Re-index only if this pass actually created a new book. Re-indexing an
+    // already-known book downloads the complete settings payload for no benefit.
     if (booksWritten.size > 0 && typeof ctx.executeSlashCommandsWithOptions === 'function') {
-        await new Promise(r => setTimeout(r, 400));
-        if (typeof ctx.updateWorldInfoList === 'function') await ctx.updateWorldInfoList();
+        const knownBefore = new Set(allBookNames.map(name => String(name || '').toLowerCase()));
+        const createdNewBook = [...booksWritten].some(name => !knownBefore.has(String(name || '').toLowerCase()));
+        if (createdNewBook && typeof ctx.updateWorldInfoList === 'function') {
+            await ctx.updateWorldInfoList();
+            if (!canCommit()) return staleResult;
+        }
         for (const bookName of booksWritten) {
             await ctx.executeSlashCommandsWithOptions(`/world state=on silent=true "${bookName}"`);
-            await new Promise(r => setTimeout(r, 100));
+            if (!canCommit()) return staleResult;
         }
         if (settings.debugMode) console.log(`[RPG Tracker] Activated books: ${[...booksWritten].join(', ')}`);
     }
@@ -2000,12 +3350,15 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
         if (parts.length < 2) continue;
         const [bookName, uid] = parts;
         const book = await ctx.loadWorldInfo(bookName);
+        if (!canCommit()) return staleResult;
         if (book?.entries?.[uid]) {
             delete book.entries[uid];
             await ctx.saveWorldInfo(bookName, book);
+            if (!canCommit()) return staleResult;
             // Also remove from active keys if present
             settings.activeRouterKeys = settings.activeRouterKeys.filter(k => k !== id);
             settings.activeWorldKeys = (settings.activeWorldKeys || []).filter(k => k !== id);
+            settings.pinnedRouterKeys = (settings.pinnedRouterKeys || []).filter(k => k !== id);
             changed = true;
         }
     }
@@ -2023,7 +3376,7 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
             rename: renameIds,
             reason: action.reason || (settings.routerBasicMode ? "Tag-based update." : "Agent tool update.")
         });
-        if (settings.routerLog.length > 50) settings.routerLog.length = 50;
+        if (settings.routerLog.length > HISTORY_ENTRY_LIMIT) settings.routerLog.length = HISTORY_ENTRY_LIMIT;
 
         // Track campaign lorebooks per chat_id so they auto-activate on chat switch
         if (booksWritten.size > 0) {
@@ -2085,6 +3438,7 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
                 try {
                     npcBook = await ctx.loadWorldInfo(npcBookName);
                 } catch (_) {}
+                if (!canCommit()) return staleResult;
                 
                 let foundUid = null;
                 if (npcBook && npcBook.entries) {
@@ -2132,7 +3486,7 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
         if (!settings.npcRelationshipLog[resolvedId]) settings.npcRelationshipLog[resolvedId] = [];
         const relLogTimestamp = Date.now();
         settings.npcRelationshipLog[resolvedId].unshift({ timestamp: relLogTimestamp, field: f, delta, newValue, source: 'agent' });
-        if (settings.npcRelationshipLog[resolvedId].length > 50) settings.npcRelationshipLog[resolvedId].length = 50;
+        if (settings.npcRelationshipLog[resolvedId].length > HISTORY_ENTRY_LIMIT) settings.npcRelationshipLog[resolvedId].length = HISTORY_ENTRY_LIMIT;
         changed = true;
 
         // Record rollback data so a swipe on this AI message can undo this delta (see comment above).
@@ -2148,8 +3502,10 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
     }
 
     // 6. Core identity updates — surgical replacement of specified fields inside [CORE]
+    //    (or the linked Player Character card for Body/Equipment only).
     const coreUpdates = [
-        ...(action.appearance || []).map(item => ({ id: item.id, field: 'Appearance/Species', content: item.content })),
+        ...(action.appearance || []).map(item => ({ id: item.id, field: 'Body', content: item.content })),
+        ...(action.equipment || []).map(item => ({ id: item.id, field: 'Worn Equipment', content: item.content })),
         ...(action.core || [])
     ];
 
@@ -2159,7 +3515,27 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
             errors.push(`Invalid core update item: ${JSON.stringify(item)}`);
             continue;
         }
+
+        // PC sentinel — Body/Equipment only, patches chatStates[chatId].playerCharacter.bio
+        if (isPcCoreTarget(id, linkedPcName)) {
+            const pcResult = applyPcCoreUpdate(linkedPc, field, newContent);
+            if (!pcResult.ok) {
+                errors.push(`PC core update failed for "${id}": ${pcResult.error}`);
+            } else {
+                changed = true;
+            }
+            continue;
+        }
+
+        // Automatic passes may only mutate Combat Profile via commit.core / UPDATE_CORE.
+        // Body/Equipment arrive via action.appearance/action.equipment (mapped above) and are always allowed.
+        if (!isManual && !isAppearanceField(field) && !isEquipmentField(field) && !isCombatProfileField(field)) {
+            errors.push(`Automatic pass rejected core update of "${field}" on "${id}" — only Combat Profile (and Body/Equipment via their dedicated tools) are allowed without a Direct Prompt.`);
+            continue;
+        }
+
         const resolvedId = await resolveLoreEntryId(id, allBooks, newlyCreatedMap);
+        if (!canCommit()) return staleResult;
         if (!resolvedId) {
             errors.push(`Could not resolve core update target "${id}" to a Book::UID`);
             continue;
@@ -2170,96 +3546,108 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
         }
         const [bookName, uid] = resolvedId.split('::');
         const book = await ctx.loadWorldInfo(bookName);
+        if (!canCommit()) return staleResult;
         if (!book?.entries?.[uid]) {
             errors.push(`Core update target not found: ${resolvedId}`);
             continue;
         }
         const entryContent = book.entries[uid].content || '';
-        
+
         // Match the [CORE]...[/CORE] block
         const coreMatch = entryContent.match(/\[CORE\]([\s\S]*?)\[\/CORE\]/i);
         if (!coreMatch) {
             errors.push(`[CORE] block not found for ${id} — no update made.`);
             continue;
         }
-        
-        const coreBody = coreMatch[1];
-        
-        // Define field aliases for matching
-        let fieldPatterns = [];
-        const normField = field.trim().toLowerCase();
-        if (normField.includes('appearance') || normField.includes('species')) {
-            fieldPatterns = ['Appearance/Species', 'Appearance'];
-        } else if (normField.includes('personality')) {
-            fieldPatterns = ['Personality'];
-        } else if (normField.includes('background')) {
-            fieldPatterns = ['Brief Background', 'Background'];
-        } else if (normField.includes('habit') || normField.includes('behavior')) {
-            fieldPatterns = ['Habits/Behaviors', 'Habits', 'Behaviors'];
-        } else if (normField.includes('combat')) {
-            fieldPatterns = ['Combat Profile'];
-        } else {
-            fieldPatterns = [field];
-        }
 
-        const escapedPatterns = fieldPatterns.map(p => p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
-        const otherHeaders = ['Appearance/Species', 'Appearance', 'Personality', 'Brief Background', 'Background', 'Habits/Behaviors', 'Habits', 'Behaviors', 'Relationship'];
+        const coreBody = coreMatch[1];
+        let extraHeaders = [];
         try {
             const s = getSettings();
             const coreSecs = (s.npcCoreSections && Array.isArray(s.npcCoreSections) && s.npcCoreSections.length > 0) ? s.npcCoreSections : DEFAULT_NPC_SECTIONS;
-            coreSecs.forEach(sec => {
-                if (!otherHeaders.includes(sec.name)) otherHeaders.push(sec.name);
-            });
+            extraHeaders = coreSecs.map(sec => sec.name).filter(Boolean);
         } catch (_) {}
-        // Also discover any lazily-appended fields present in the actual coreBody (e.g. "Combat Profile")
-        for (const rawLine of coreBody.split('\n')) {
-            const hm = rawLine.trim().match(/^([A-Z][A-Za-z0-9 \/&]+?)\s*:/);
-            if (hm) {
-                const nm = hm[1].trim();
-                if (!otherHeaders.includes(nm)) otherHeaders.push(nm);
-            }
-        }
-        // Escape headers; prevent short aliases from matching inside longer ones
-        // (e.g. "Background" inside "Brief Background", "Behaviors" inside "Habits/Behaviors").
-        const otherHeadersRegexStr = otherHeaders.map(h => {
-            const esc = h.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            if (h === 'Background') return '(?<!Brief\\s)Background';
-            if (h === 'Behaviors') return '(?<!Habits\\/)(?<!Habits & )(?<!Habits and )Behaviors';
-            if (h === 'Appearance') return '(?<!/)Appearance(?!\\/Species)';
-            return esc;
-        }).join('|');
 
-        // Match from the target field's colon to the next core field header or the end of the string
-        const targetFieldRegex = new RegExp(`(?:(${escapedPatterns.join('|')})\\s*:)([\\s\\S]*?)(?=(?:${otherHeadersRegexStr})\\s*:|$)`, 'i');
-        const fieldMatch = coreBody.match(targetFieldRegex);
-        
-        if (!fieldMatch) {
-            // Lazily append the field to the end of the [CORE] block (e.g. first-time Combat Profile)
-            const fieldName = fieldPatterns[0] || field.trim();
-            const replacement = `${fieldName}: ${newContent.trim()}\n`;
-            let newCoreBody = coreBody.trimEnd();
-            newCoreBody = newCoreBody ? `${newCoreBody}\n${replacement}` : replacement;
-
-            book.entries[uid].content = entryContent.replace(coreMatch[0], `[CORE]\n${newCoreBody}[/CORE]`);
-            await ctx.saveWorldInfo(bookName, book);
-            changed = true;
+        const patched = patchLabeledSection(coreBody, field, newContent, { extraHeaders });
+        if (!patched.ok) {
+            errors.push(`Core field patch failed for ${id}: ${patched.error || 'unknown error'}`);
             continue;
         }
 
-        const matchedFieldName = fieldMatch[1];
-        const targetSubstring = `${matchedFieldName}:${fieldMatch[2]}`;
-        
-        // Perform replacement
-        const replacement = `${matchedFieldName}: ${newContent.trim()}\n`;
-        const newCoreBody = coreBody.replace(targetSubstring, replacement);
-        
-        // Update entry content
-        book.entries[uid].content = entryContent.replace(coreMatch[0], `[CORE]${newCoreBody}[/CORE]`);
+        book.entries[uid].content = entryContent.replace(coreMatch[0], `[CORE]${patched.text}[/CORE]`);
         await ctx.saveWorldInfo(bookName, book);
+        if (!canCommit()) return staleResult;
         changed = true;
     }
 
     return { success: true, errors, recordedIds };
+}
+
+function restoreRouterLoreMetadata(settings, snapshot, removedBookNames = []) {
+    const has = key => Object.prototype.hasOwnProperty.call(snapshot || {}, key);
+    const restore = (key, fallback) => {
+        if (has(key)) settings[key] = cloneRouterValue(snapshot[key], fallback);
+    };
+
+    restore('activeRouterKeys', []);
+    restore('activeWorldKeys', []);
+    restore('keywordActivatedKeys', []);
+    restore('pinnedRouterKeys', []);
+    restore('routerLog', []);
+    if (has('pcCharacterBlockSeeded')) settings.pcCharacterBlockSeeded = !!snapshot.pcCharacterBlockSeeded;
+    if (has('routerLastRunAt')) settings.routerLastRunAt = snapshot.routerLastRunAt ?? 0;
+
+    const chatId = snapshot.chatId || getRouterChatId();
+    if (chatId) {
+        if (!settings.chatStates) settings.chatStates = {};
+        if (!settings.chatStates[chatId]) settings.chatStates[chatId] = {};
+        const chatState = settings.chatStates[chatId];
+        const removed = new Set(removedBookNames);
+        const priorOwnership = has('campaignBooks')
+            ? cloneRouterValue(snapshot.campaignBooks, [])
+            : getLorebookSnapshotNames(snapshot);
+        chatState.campaignBooks = [...new Set([
+            ...(chatState.campaignBooks || []).filter(name => !removed.has(name)),
+            ...priorOwnership,
+        ])];
+    }
+}
+
+async function recoverRouterLoreState(recoveryState, attemptedState, originalHistory, settings, ctx) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+    if (!recoveryState) return;
+    const prefix = recoveryState.campaignPrefix || attemptedState?.campaignPrefix || getLivePrefix();
+    const recoveryNames = new Set(Object.keys(recoveryState.bookSnapshots || {}));
+
+    // A failed restore may have recreated a book that did not exist in the state
+    // being recovered. Only those attempted snapshot names are eligible for deletion.
+    for (const name of Object.keys(attemptedState?.bookSnapshots || {})) {
+        if (recoveryNames.has(name)) continue;
+        if (!prefix || !bookBelongsToPrefix(name, prefix) || isSkeletonBookName(name)) continue;
+        const currentNames = chatCommitResult(ownsChat, await getWorldInfoNamesSafe());
+        if (currentNames.includes(name)) chatCommitResult(ownsChat, await deleteWorldInfoFresh(name));
+    }
+
+    for (const [name, book] of Object.entries(recoveryState.bookSnapshots || {})) {
+        chatCommitResult(ownsChat, await saveWorldInfoSnapshot(name, book, ctx, 'Rollback recovery', ownsChat));
+    }
+    restoreRouterLoreMetadata(settings, recoveryState);
+    const chatId = recoveryState.chatId || getRouterChatId(ctx);
+    if (chatId && Object.prototype.hasOwnProperty.call(recoveryState, 'campaignBooks')) {
+        if (!settings.chatStates) settings.chatStates = {};
+        if (!settings.chatStates[chatId]) settings.chatStates[chatId] = {};
+        settings.chatStates[chatId].campaignBooks = cloneRouterValue(recoveryState.campaignBooks, []);
+    }
+    settings.routerHistory = originalHistory;
+    if (recoveryState.routerLastRunChatLength !== undefined) {
+        settings.routerLastRunChatLength = recoveryState.routerLastRunChatLength;
+    }
+    if (typeof ctx.updateWorldInfoList === 'function') {
+        try { chatCommitResult(ownsChat, await ctx.updateWorldInfoList()); } catch (_) {
+            assertChatCommit(ownsChat);
+        }
+    }
+    void saveSettings();
 }
 
 /**
@@ -2267,9 +3655,11 @@ async function applyAction(action, allBooks = {}, currentTime = '', breadcrumb =
  * - Deletes any lorebook that was CREATED during the pass (wasn't in snapshot).
  * - Overwrites any lorebook that was MODIFIED during the pass back to its pre-pass content.
  * @param {number} index - 0 = most recent pre-pass snapshot.
+ * @param {object|null} recoveryState - Optional caller-captured post-pass state.
  * @returns {Promise<boolean>}
  */
-export async function rollbackRouterPass(index = 0) {
+export async function rollbackRouterPass(index = 0, recoveryState = null) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     const settings = getSettings();
     const ctx = SillyTavern.getContext();
     const history = settings.routerHistory || [];
@@ -2281,88 +3671,89 @@ export async function rollbackRouterPass(index = 0) {
 
     const snapshot = history[index];
     if (!snapshot) return false;
+    const activeChatId = getRouterChatId(ctx);
+    const livePrefix = getLivePrefix();
+    if (!isLoreHistoryEntryForChat(snapshot, { chatId: activeChatId, campaignPrefix: livePrefix })) {
+        console.warn('[RPG Tracker] Rollback refused: history entry belongs to a different chat/campaign.', {
+            entryChatId: snapshot.chatId ?? null,
+            activeChatId,
+            entryPrefix: snapshot.campaignPrefix || '',
+            livePrefix,
+        });
+        return false;
+    }
+    let safeRecoveryState = recoveryState;
 
     try {
-        const prePassBooks = new Set(Object.keys(snapshot.bookSnapshots || {}));
-        const prefix = getLivePrefix();
+        const prefix = snapshot.campaignPrefix || livePrefix;
 
-        // -- Step 1: Delete lorebooks that were CREATED during the pass --------
-        // Only consider books under the live campaign prefix. If the prefix is missing,
-        // scanning "all" lorebooks would treat every unrelated book as newly created
-        // and delete or wipe anything not present in this pass's snapshot.
-        const allCurrentNames = await getWorldInfoNamesSafe();
-        const scopedCurrent = prefix
-            ? allCurrentNames.filter(n => bookBelongsToPrefix(n, prefix))
+        // -- Step 1: Delete lorebooks proven to be CREATED during the pass ------
+        // The stored campaign prefix and exact modern delta keep unrelated books
+        // out of scope. Legacy snapshots use recorded entry IDs conservatively.
+        const allCurrentNames = chatCommitResult(ownsChat, await getWorldInfoNamesSafe());
+        const createdBookNames = prefix
+            ? getCreatedLorebookNames({
+                snapshot,
+                currentNames: allCurrentNames,
+                currentRouterLog: settings.routerLog || [],
+                historyIndex: index,
+                prefix,
+            }).filter(name => !isSkeletonBookName(name))
             : [];
         if (!prefix && allCurrentNames.length) {
-            console.warn('[RPG Tracker] Rollback: no campaign prefix — skipping delete-new-books step (would otherwise touch the entire lore library).');
+            console.warn('[RPG Tracker] Rollback: no campaign prefix; no lorebooks will be deleted.');
         }
 
-        for (const bookName of scopedCurrent) {
-            if (prePassBooks.has(bookName)) continue; // Pre-existed ? restore below, don't delete
-            // This book was CREATED during the pass ? permanently delete it
-            let deleted = false;
-            try {
-                const delRes = await fetch('/api/worldinfo/delete', {
-                    method: 'POST',
-                    headers: getRequestHeaders(),
-                    body: JSON.stringify({ name: bookName })
-                });
-                deleted = delRes.ok;
-            } catch (_) { /* endpoint may not exist on older ST builds */ }
+        // Take a complete disk-backed recovery copy before the first mutation.
+        safeRecoveryState = safeRecoveryState || chatCommitResult(ownsChat, await captureRouterLoreState());
 
-            if (!deleted) {
-                // Fallback: clear all entries so the book is effectively empty
-                const emptyBook = { entries: {}, name: bookName, scan_depth: 4, token_budget: 400, recursive: false, extensions: {} };
-                await fetch('/api/worldinfo/edit', {
-                    method: 'POST',
-                    headers: getRequestHeaders(),
-                    body: JSON.stringify({ name: bookName, data: emptyBook })
-                });
-                if (typeof ctx.saveWorldInfo === 'function') {
-                    try { await ctx.saveWorldInfo(bookName, emptyBook); } catch (_) {}
-                }
-            }
+        for (const bookName of createdBookNames) {
+            chatCommitResult(ownsChat, await deleteWorldInfoFresh(bookName));
         }
 
         // Re-index so ST knows about deletions before we start restoring
         if (typeof ctx.updateWorldInfoList === 'function') {
-            try { await ctx.updateWorldInfoList(); } catch (_) {}
+            try { chatCommitResult(ownsChat, await ctx.updateWorldInfoList()); } catch (_) {
+                if (!ownsChat()) return false;
+        }
         }
 
         // -- Step 2: Restore pre-pass lorebooks to their snapshotted state -----
         for (const [bookName, bookData] of Object.entries(snapshot.bookSnapshots || {})) {
-            const saveRes = await fetch('/api/worldinfo/edit', {
-                method: 'POST',
-                headers: getRequestHeaders(),
-                body: JSON.stringify({ name: bookName, data: bookData })
-            });
-            if (!saveRes.ok) {
-                console.error(`[RPG Tracker] Rollback: failed to restore ${bookName}: HTTP ${saveRes.status}`);
-                continue;
-            }
-            // Bust ST in-memory cache so the UI sees the restored data immediately
-            if (typeof ctx.saveWorldInfo === 'function') {
-                try { await ctx.saveWorldInfo(bookName, bookData); } catch (_) { /* non-fatal */ }
-            }
+            chatCommitResult(ownsChat, await evictWorldInfoCache(bookName));
+            chatCommitResult(ownsChat, await saveWorldInfoSnapshot(bookName, bookData, ctx, 'Rollback', ownsChat));
         }
 
-        // -- Step 3: Restore active keys ---------------------------------------
-        settings.activeRouterKeys = JSON.parse(JSON.stringify(snapshot.activeRouterKeys || []));
-        settings.activeWorldKeys = JSON.parse(JSON.stringify(snapshot.activeWorldKeys || []));
+        // -- Step 3: Restore all Lorebook Agent-owned state --------------------
+        if (!Object.prototype.hasOwnProperty.call(snapshot, 'routerLog') && createdBookNames.length > 0) {
+            // Compatibility for pre-7.10.5 snapshots. Removing the pass log is
+            // essential because old UI fast paths used it as a book-name fallback.
+            settings.routerLog = (settings.routerLog || []).slice(Math.max(1, index + 1));
+        }
+        restoreRouterLoreMetadata(settings, snapshot, createdBookNames);
 
         // -- Step 4: Restore "since last run" watermark and trim history --------
-        settings.routerHistory = history.slice(index + 1);
+        settings.routerHistory = trimLoreHistoryForRollback(history, index);
         if (snapshot.routerLastRunChatLength !== undefined) {
             persistRouterLastRunWatermark(snapshot.routerLastRunChatLength);
         } else {
             void saveSettings();
         }
 
-        document.dispatchEvent(new CustomEvent('rt_lore_agent_updated'));
+        recordLiveDungeonMapSnapshot(settings, chatCommitResult(ownsChat, await captureActiveDungeonMapHistory(ctx)));
+        document.dispatchEvent(new CustomEvent('rt_lore_agent_updated', { detail: { source: 'rollback' } }));
         return true;
     } catch (e) {
+        if (!ownsChat()) return false;
+
         console.error('[RPG Tracker] Rollback failed:', e);
+        try {
+            chatCommitResult(ownsChat, await recoverRouterLoreState(safeRecoveryState, snapshot, [...history], settings, ctx));
+        } catch (recoveryError) {
+            if (!ownsChat()) return false;
+
+            console.error('[RPG Tracker] Rollback recovery also failed:', recoveryError);
+        }
         return false;
     }
 }
@@ -2375,38 +3766,57 @@ export async function rollbackRouterPass(index = 0) {
  * @returns {Promise<boolean>}
  */
 export async function reapplyRouterPass(prePassSnapshot, postPassState) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     const settings = getSettings();
     const ctx = SillyTavern.getContext();
+    const originalHistory = [...(settings.routerHistory || [])];
+    let safeRecoveryState = null;
+    const activeChatId = getRouterChatId(ctx);
+    const livePrefix = getLivePrefix();
+    const redoEntry = { prePassSnapshot, postPassState };
+    if (!isLoreRedoEntryForChat(redoEntry, { chatId: activeChatId, campaignPrefix: livePrefix })) {
+        console.warn('[RPG Tracker] Redo refused: history entry belongs to a different chat/campaign.', {
+            prePassChatId: prePassSnapshot?.chatId ?? null,
+            postPassChatId: postPassState?.chatId ?? null,
+            activeChatId,
+            prePassPrefix: prePassSnapshot?.campaignPrefix || '',
+            postPassPrefix: postPassState?.campaignPrefix || '',
+            livePrefix,
+        });
+        return false;
+    }
 
     try {
+        safeRecoveryState = chatCommitResult(ownsChat, await captureRouterLoreState());
         // Step 1: Put the pre-pass snapshot back so the user can undo again
         if (!settings.routerHistory) settings.routerHistory = [];
         settings.routerHistory.unshift(prePassSnapshot);
-        if (settings.routerHistory.length > 5) settings.routerHistory.length = 5;
+        if (settings.routerHistory.length > LOREBOOK_ROLLBACK_LIMIT) settings.routerHistory.length = LOREBOOK_ROLLBACK_LIMIT;
+
+        // Re-delete only books the original pass is known to have deleted.
+        const prefix = postPassState.campaignPrefix || prePassSnapshot.campaignPrefix || livePrefix;
+        const deletedBookNames = Array.isArray(prePassSnapshot.deletedBookNames)
+            ? prePassSnapshot.deletedBookNames.filter(name => prefix && bookBelongsToPrefix(name, prefix) && !isSkeletonBookName(name))
+            : [];
+        const currentNames = new Set(chatCommitResult(ownsChat, await getWorldInfoNamesSafe()));
+        for (const bookName of deletedBookNames) {
+            if (currentNames.has(bookName)) chatCommitResult(ownsChat, await deleteWorldInfoFresh(bookName));
+        }
 
         // Step 2: Restore lorebooks to the post-pass state
         for (const [bookName, bookData] of Object.entries(postPassState.bookSnapshots || {})) {
-            const saveRes = await fetch('/api/worldinfo/edit', {
-                method: 'POST',
-                headers: getRequestHeaders(),
-                body: JSON.stringify({ name: bookName, data: bookData })
-            });
-            if (!saveRes.ok) {
-                console.error(`[RPG Tracker] Redo: failed to restore ${bookName}: HTTP ${saveRes.status}`);
-                continue;
-            }
-            if (typeof ctx.saveWorldInfo === 'function') {
-                try { await ctx.saveWorldInfo(bookName, bookData); } catch (_) {}
-            }
+            chatCommitResult(ownsChat, await evictWorldInfoCache(bookName));
+            chatCommitResult(ownsChat, await saveWorldInfoSnapshot(bookName, bookData, ctx, 'Redo', ownsChat));
         }
 
         if (typeof ctx.updateWorldInfoList === 'function') {
-            try { await ctx.updateWorldInfoList(); } catch (_) {}
+            try { chatCommitResult(ownsChat, await ctx.updateWorldInfoList()); } catch (_) {
+                if (!ownsChat()) return false;
+            }
         }
 
-        // Step 3: Restore active keys to the post-pass state
-        settings.activeRouterKeys = JSON.parse(JSON.stringify(postPassState.activeRouterKeys || []));
-        settings.activeWorldKeys = JSON.parse(JSON.stringify(postPassState.activeWorldKeys || []));
+        // Step 3: Restore all Agent-owned metadata to the post-pass state.
+        restoreRouterLoreMetadata(settings, postPassState, deletedBookNames);
 
         if (postPassState.routerLastRunChatLength !== undefined) {
             persistRouterLastRunWatermark(postPassState.routerLastRunChatLength);
@@ -2414,10 +3824,20 @@ export async function reapplyRouterPass(prePassSnapshot, postPassState) {
             void saveSettings();
         }
 
-        document.dispatchEvent(new CustomEvent('rt_lore_agent_updated'));
+        recordLiveDungeonMapSnapshot(settings, chatCommitResult(ownsChat, await captureActiveDungeonMapHistory(ctx)));
+        document.dispatchEvent(new CustomEvent('rt_lore_agent_updated', { detail: { source: 'redo' } }));
         return true;
     } catch (e) {
+        if (!ownsChat()) return false;
+
         console.error('[RPG Tracker] Redo failed:', e);
+        try {
+            chatCommitResult(ownsChat, await recoverRouterLoreState(safeRecoveryState, postPassState, originalHistory, settings, ctx));
+        } catch (recoveryError) {
+            if (!ownsChat()) return false;
+
+            console.error('[RPG Tracker] Redo recovery also failed:', recoveryError);
+        }
         return false;
     }
 }
@@ -2427,7 +3847,7 @@ export async function reapplyRouterPass(prePassSnapshot, postPassState) {
  * Parses basic narrative tags [[TAG: ...]]
  */
 function parseBasicTags(text, archiveBooks) {
-    const action = { record: [], update: [], activate: [], deactivate: [], delete_ids: [], rewrite: [], consolidate: [], rel: [], appearance: [], core: [] };
+    const action = { record: [], update: [], activate: [], deactivate: [], delete_ids: [], rewrite: [], consolidate: [], rel: [], appearance: [], equipment: [], core: [] };
     const settings = getSettings();
 
     // REWRITE tag parser
@@ -2461,7 +3881,7 @@ function parseBasicTags(text, archiveBooks) {
         }
     }
 
-    // UPDATE_APPEARANCE tag parser: [[UPDATE_APPEARANCE: Book::UID | new appearance text]]
+    // UPDATE_APPEARANCE tag parser: [[UPDATE_APPEARANCE: Book::UID | new appearance text]] (patches Body)
     const appearRegex = /\[\[UPDATE_APPEARANCE:\s*([^|]+)\|([\s\S]*?)\]\]/gi;
     let am;
     while ((am = appearRegex.exec(text)) !== null) {
@@ -2469,6 +3889,17 @@ function parseBasicTags(text, archiveBooks) {
         const content = am[2].trim();
         if (id && content) {
             action.appearance.push({ id, content });
+        }
+    }
+
+    // UPDATE_EQUIPMENT tag parser: [[UPDATE_EQUIPMENT: Book::UID | new worn gear text]] (patches Worn Equipment)
+    const equipRegex = /\[\[UPDATE_EQUIPMENT:\s*([^|]+)\|([\s\S]*?)\]\]/gi;
+    let eqm;
+    while ((eqm = equipRegex.exec(text)) !== null) {
+        const id      = eqm[1].trim();
+        const content = eqm[2].trim();
+        if (id && content) {
+            action.equipment.push({ id, content });
         }
     }
 
@@ -2516,7 +3947,7 @@ function parseBasicTags(text, archiveBooks) {
 
     while ((match = tagRegex.exec(text)) !== null) {
         const tagName = match[1].toUpperCase();
-        if (tagName === 'REWRITE' || tagName === 'CONSOLIDATE' || tagName === 'REL' || tagName === 'UPDATE_APPEARANCE' || tagName === 'UPDATE_CORE') continue; // Collision protection
+        if (tagName === 'REWRITE' || tagName === 'CONSOLIDATE' || tagName === 'REL' || tagName === 'UPDATE_APPEARANCE' || tagName === 'UPDATE_EQUIPMENT' || tagName === 'UPDATE_CORE') continue; // Collision protection
 
         const inner = match[2];
         const parts = inner.split('|').map(p => p.trim());
@@ -2552,29 +3983,34 @@ function parseBasicTags(text, archiveBooks) {
 /**
  * Shared helper to add an entry to a specific lorebook.
  */
-async function addLorebookEntry(lorebookName, entryData, allNames) {
+async function addLorebookEntry(lorebookName, entryData, allNames, canCommit = createChatCommitGuard(getActiveChatId(), getActiveChatId)) {
+    assertChatCommit(canCommit);
     const ctx = SillyTavern.getContext();
-    if (!allNames) allNames = await getWorldInfoNamesSafe();
+    if (!allNames) allNames = chatCommitResult(canCommit, await getWorldInfoNamesSafe());
     
     let bookData = null;
     if (allNames.includes(lorebookName)) {
-        try { bookData = await ctx.loadWorldInfo(lorebookName); } catch (_) {}
+        try { bookData = chatCommitResult(canCommit, await ctx.loadWorldInfo(lorebookName)); } catch (_) {
+            assertChatCommit(canCommit);
+        }
     }
     
     if (!bookData) {
         try {
-            const res = await fetch('/api/worldinfo/get', {
+            const res = chatCommitResult(canCommit, await fetch('/api/worldinfo/get', {
                 method: 'POST',
                 headers: getRequestHeaders(),
                 body: JSON.stringify({ name: lorebookName })
-            });
+            }));
             if (res.ok) {
-                const data = await res.json();
+                const data = chatCommitResult(canCommit, await res.json());
                 if (data && typeof data === 'object' && data.entries) {
                     bookData = data;
                 }
             }
-        } catch (_) {}
+        } catch (_) {
+            assertChatCommit(canCommit);
+        }
     }
 
     if (!bookData) {
@@ -2617,7 +4053,7 @@ async function addLorebookEntry(lorebookName, entryData, allNames) {
         groupWeight: 100,
     };
     
-    await ctx.saveWorldInfo(lorebookName, writeTarget);
+    chatCommitResult(canCommit, await ctx.saveWorldInfo(lorebookName, writeTarget));
     
     // Update allNames cache so subsequent calls know this book now exists
     if (!allNames.includes(lorebookName)) allNames.push(lorebookName);
@@ -2633,11 +4069,19 @@ async function addLorebookEntry(lorebookName, entryData, allNames) {
 
 /**
  * Manual scene archiving tool.
+ * Pins chat + campaign prefix before the LLM await so a mid-flight chat switch
+ * cannot archive into the arriving campaign or activate keys on its live projection.
  */
 export async function saveSceneToLorebook(hint = "") {
     const settings = getSettings();
     const ctx = SillyTavern.getContext();
     if (!ctx.generateRaw) return;
+
+    // Pin before any await: getLivePrefix() and live settings become the arriving chat after switch.
+    const passChatId = getActiveChatId();
+    const prefix = getLivePrefix();
+    const ownsChat = createChatCommitGuard(passChatId, getActiveChatId);
+    if (!prefix || !ownsChat()) return;
 
     try {
         (/** @type {any} */ (toastr)).info("Saving scene...", "Lorebook Agent");
@@ -2664,25 +4108,37 @@ Output a JSON object:
         };
 
         const result = await sendStateRequest(routerSettings, systemPrompt, userPrompt);
-        const match = result.match(/\{[\s\S]*\}/);
+        if (!ownsChat()) {
+            (/** @type {any} */ (toastr)).warning('Scene not saved: active chat changed.', 'Lorebook Agent');
+            return;
+        }
+        const match = typeof result === 'string' ? result.match(/\{[\s\S]*\}/) : null;
         if (match) {
             const data = JSON.parse(match[0]);
             
-            const prefix = getLivePrefix();
-            const lorebookName = prefix ? `${prefix}World_Chronicle` : 'World Chronicle';
+            const lorebookName = `${prefix}_Chronicle`;
             const newId = await addLorebookEntry(lorebookName, {
                 id: data.id,
                 keys: data.keys,
                 content: data.content,
                 comment: 'LORE_SCENE'
-            });
+            }, undefined, ownsChat);
+            // Lorebook write used the pinned prefix; refuse live activation if ownership was lost mid-save.
+            if (!ownsChat()) {
+                (/** @type {any} */ (toastr)).warning('Scene archived, but activation skipped: active chat changed.', 'Lorebook Agent');
+                return;
+            }
             
             const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+            rememberCampaignBook(lorebookName, settings);
+            settings.routerLog = settings.routerLog || [];
+            settings.activeRouterKeys = settings.activeRouterKeys || [];
             settings.routerLog.unshift({
                 time: timestamp,
                 activate: [newId], deactivate: [],
                 reason: `Saved scene: ${data.desc} -> ${lorebookName} (${data.id})`
             });
+            if (settings.routerLog.length > HISTORY_ENTRY_LIMIT) settings.routerLog.length = HISTORY_ENTRY_LIMIT;
             settings.activeRouterKeys.push(newId);
             void saveSettings();
             document.dispatchEvent(new CustomEvent('rt_lore_agent_updated'));
@@ -2690,6 +4146,7 @@ Output a JSON object:
             (/** @type {any} */ (toastr)).success(`Saved scene: ${data.desc}`, 'Lorebook Agent');
         }
     } catch (e) {
+        if (!ownsChat()) return;
         console.error("[Lorebook Agent] Save scene failed:", e);
         (/** @type {any} */ (toastr)).error('Failed to save scene.', 'Lorebook Agent');
     }
@@ -2697,59 +4154,78 @@ Output a JSON object:
 
 /**
  * Fetches a manifest of all campaign-scoped lorebook entries for the UI.
- * @param {boolean} skipUpdate When true, skips updateWorldInfoList and backend name probes (fast path).
+ * @param {boolean} skipUpdate When true, skips backend name probes (fast path).
  */
 export async function getLorebookManifest(skipUpdate = false) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     const settings = getSettings();
     const ctx = SillyTavern.getContext();
     const prefix = getLivePrefix();
     sanitizeRouterState(settings);
     
-    // Always flush ST's registry from disk first so books written via HTTP API are visible,
-    // unless skipUpdate is explicitly requested for speed.
-    if (!skipUpdate && typeof ctx.updateWorldInfoList === 'function') {
-        try { await ctx.updateWorldInfoList(); } catch (_) {}
-    }
-
-    const names = await getWorldInfoNamesSafe({ fullProbe: !skipUpdate });
+    const names = chatCommitResult(ownsChat, await getWorldInfoNamesSafe({ fullProbe: !skipUpdate }));
     // With no prefix, show nothing ? the user hasn't set a campaign yet.
     if (!prefix) return [];
     const scopedSet = new Set(names.filter(n => bookBelongsToPrefix(n, prefix)));
     
-    // Fallback 1: books referenced in activeRouterKeys (not yet in registry)
-    const activeBookNames = (settings.activeRouterKeys || [])
-        .map(k => k.split('::')[0])
-        .filter(Boolean);
-    for (const n of activeBookNames) {
-        if (isSkeletonBookName(n)) continue;
-        if (!scopedSet.has(n) && bookBelongsToPrefix(n, prefix)) {
-            scopedSet.add(n);
-        }
-    }
-    
-    // Fallback 2: books referenced in routerLog records (catches deactivated entries
-    // whose books are no longer in activeRouterKeys nor in ST's registry yet)
-    const logBookNames = (settings.routerLog || [])
-        .flatMap(e => [...(e.record || []), ...(e.activate || [])].map(id => id.split('::')[0]))
-        .filter(Boolean);
-    for (const n of logBookNames) {
-        if (isSkeletonBookName(n)) continue;
-        if (!scopedSet.has(n) && bookBelongsToPrefix(n, prefix)) {
-            scopedSet.add(n);
+    // The fast path may supplement a lagging frontend registry with active IDs.
+    // Full refreshes use backend names only; historical fallbacks there would
+    // resurrect books that rollback already deleted.
+    if (skipUpdate) {
+        const activeBookNames = (settings.activeRouterKeys || [])
+            .map(k => k.split('::')[0])
+            .filter(Boolean);
+        for (const n of activeBookNames) {
+            if (isSkeletonBookName(n)) continue;
+            if (!scopedSet.has(n) && bookBelongsToPrefix(n, prefix)) {
+                scopedSet.add(n);
+            }
         }
     }
 
     const activeRouterSet = new Set(settings.activeRouterKeys || []);
     const activeWorldSet = new Set(settings.activeWorldKeys || []);
+    const pinnedSet = new Set(settings.pinnedRouterKeys || []);
+
+    // Reconcile pinned entries into the active pools so pins survive manual pill
+    // removal, rollbacks, or any other path that drops them from activeRouterKeys.
+    let pinReconciled = false;
+    for (const id of pinnedSet) {
+        if (isSkeletonEntryId(id)) continue;
+        const [bookName] = id.split('::');
+        if (!bookName) continue;
+        const isWorld = bookName.toLowerCase().endsWith('_world') || bookName.toLowerCase() === 'world';
+        if (isWorld) {
+            if (!activeWorldSet.has(id)) {
+                activeWorldSet.add(id);
+                if (!settings.activeWorldKeys) settings.activeWorldKeys = [];
+                if (!settings.activeWorldKeys.includes(id)) settings.activeWorldKeys.push(id);
+                pinReconciled = true;
+            }
+        } else if (!activeRouterSet.has(id)) {
+            activeRouterSet.add(id);
+            if (!settings.activeRouterKeys) settings.activeRouterKeys = [];
+            if (!settings.activeRouterKeys.includes(id)) settings.activeRouterKeys.push(id);
+            pinReconciled = true;
+        }
+    }
+    if (pinReconciled) void saveSettings();
+
     const booksToLoad = [...scopedSet].filter(n => !isSkeletonBookName(n));
-    const loadedBooks = await Promise.all(booksToLoad.map(async (n) => {
+    const loadedBooks = chatCommitResult(ownsChat, await Promise.all(booksToLoad.map(async (n) => {
         try {
-            const b = await ctx.loadWorldInfo(n);
-            return b?.entries ? { bookName: n, entries: b.entries } : null;
+            const b = skipUpdate ? chatCommitResult(ownsChat, await ctx.loadWorldInfo(n)) : chatCommitResult(ownsChat, await loadWorldInfoFresh(n, ctx));
+            if (!b?.entries) return null;
+            // Full refreshes read disk; write that back so the interceptor's
+            // ctx.loadWorldInfo() sees the same entries the Agent UI just showed.
+            if (!skipUpdate) chatCommitResult(ownsChat, await updateWorldInfoCache(n, b));
+            return { bookName: n, entries: b.entries };
         } catch (_) {
+            assertChatCommit(ownsChat);
+
             return null;
         }
-    }));
+    })));
 
     const manifest = [];
     for (const row of loadedBooks) {
@@ -2764,7 +4240,9 @@ export async function getLorebookManifest(skipUpdate = false) {
                 label: entry.comment || (entry.key?.[0]) || uid,
                 keys: entry.key || [],
                 content: entry.content,
-                is_active: activeRouterSet.has(id) || activeWorldSet.has(id)
+                is_active: activeRouterSet.has(id) || activeWorldSet.has(id),
+                is_pinned: pinnedSet.has(id),
+                has_dungeon_map: !!getDungeonMapAttachment(entry),
             });
         }
     }
@@ -2775,17 +4253,18 @@ export async function getLorebookManifest(skipUpdate = false) {
  * Deletes a lorebook entry by ID (Book::UID).
  */
 export async function deleteLorebookEntry(id) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     const [bookName, uid] = id.split('::');
     if (!bookName || !uid) return false;
     
     const ctx = SillyTavern.getContext();
-    const book = await ctx.loadWorldInfo(bookName);
+    const book = chatCommitResult(ownsChat, await ctx.loadWorldInfo(bookName));
     if (!book?.entries || !book.entries[uid]) return false;
     
     delete book.entries[uid];
-    await ctx.saveWorldInfo(bookName, book);
+    chatCommitResult(ownsChat, await ctx.saveWorldInfo(bookName, book));
     
-    // Also remove from active list if it was there
+    // Also remove from active/pinned lists if it was there
     const settings = getSettings();
     if (settings.activeRouterKeys?.includes(id)) {
         settings.activeRouterKeys = settings.activeRouterKeys.filter(k => k !== id);
@@ -2793,7 +4272,50 @@ export async function deleteLorebookEntry(id) {
     if (settings.activeWorldKeys?.includes(id)) {
         settings.activeWorldKeys = settings.activeWorldKeys.filter(k => k !== id);
     }
+    if (settings.pinnedRouterKeys?.includes(id)) {
+        settings.pinnedRouterKeys = settings.pinnedRouterKeys.filter(k => k !== id);
+    }
     
+    return true;
+}
+
+/**
+ * Pin or unpin a lorebook entry so it stays permanently active for the Lorebook Agent.
+ * Pinning always activates the entry immediately. Unpinning only removes the pin —
+ * it does not force-deactivate the entry.
+ * @param {string} id Book::uid
+ * @param {boolean} pinned
+ * @returns {boolean}
+ */
+export function setLorebookEntryPinned(id, pinned) {
+    if (typeof id !== 'string' || !id.includes('::') || isSkeletonEntryId(id)) return false;
+    const settings = getSettings();
+    if (!Array.isArray(settings.pinnedRouterKeys)) settings.pinnedRouterKeys = [];
+
+    const [bookName] = id.split('::');
+    const isWorld = bookName.toLowerCase().endsWith('_world') || bookName.toLowerCase() === 'world';
+
+    if (pinned) {
+        if (!settings.pinnedRouterKeys.includes(id)) {
+            settings.pinnedRouterKeys.push(id);
+        }
+        // Pin implies active
+        if (isWorld) {
+            if (!Array.isArray(settings.activeWorldKeys)) settings.activeWorldKeys = [];
+            if (!settings.activeWorldKeys.includes(id)) settings.activeWorldKeys.push(id);
+        } else {
+            if (!Array.isArray(settings.activeRouterKeys)) settings.activeRouterKeys = [];
+            if (!settings.activeRouterKeys.includes(id)) settings.activeRouterKeys.push(id);
+        }
+        // Agent/user ownership — remove from keyword auto-expire pool
+        if (Array.isArray(settings.keywordActivatedKeys)) {
+            settings.keywordActivatedKeys = settings.keywordActivatedKeys.filter(k => k !== id);
+        }
+    } else {
+        settings.pinnedRouterKeys = settings.pinnedRouterKeys.filter(k => k !== id);
+    }
+
+    void saveSettings();
     return true;
 }
 
@@ -2805,11 +4327,12 @@ export async function deleteLorebookEntry(id) {
  * @returns {Promise<boolean>}
  */
 export async function updateLorebookEntry(id, fields) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     const [bookName, uid] = id.split('::');
     if (!bookName || !uid) return false;
 
     const ctx = SillyTavern.getContext();
-    const book = await ctx.loadWorldInfo(bookName);
+    const book = chatCommitResult(ownsChat, await ctx.loadWorldInfo(bookName));
     if (!book?.entries || !book.entries[uid]) return false;
 
     const entry = book.entries[uid];
@@ -2818,9 +4341,11 @@ export async function updateLorebookEntry(id, fields) {
     if (fields.key      !== undefined) entry.key     = cleanKeys(fields.key);
 
     try {
-        await ctx.saveWorldInfo(bookName, book);
+        chatCommitResult(ownsChat, await ctx.saveWorldInfo(bookName, book));
         return true;
     } catch (e) {
+        assertChatCommit(ownsChat);
+
         console.error('[RPG Tracker] updateLorebookEntry failed:', e);
         return false;
     }
@@ -2838,47 +4363,27 @@ export async function updateLorebookEntry(id, fields) {
  * @returns {Promise<string[]>} IDs (Book::uid) of entries newly activated this pass.
  */
 export async function scanAssistantOutputForKeywords(narrativeText, opts = {}) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     if (!narrativeText) return [];
     const sweepEnabled = opts.sweepEnabled !== false; // default true
     const settings = getSettings();
-    if (!settings.routerEnabled) return [];
+    if (!isLorebookAgentRuntimeActive(settings)) return [];
 
     const ctx = SillyTavern.getContext();
     const prefix = getLivePrefix();
     if (!prefix) return [];
 
-    // Fast Path: use the campaignBooks ownership list if available.
-    // This avoids calling updateWorldInfoList() — the same 90-second registry scan
-    // that was causing the chat-switch latency — on EVERY generation.
+    // Fast path: campaignBooks avoids a disk re-index on every send. Union it
+    // with the in-memory registry so a newly created NPCs book that is not yet
+    // on the ownership list is still scanned (the exclusive fast path used to
+    // skip those books until Activate / Refresh Manifest).
     const chatId = typeof globalThis._rpgCurrentChatId === 'function' ? globalThis._rpgCurrentChatId() : null;
     const knownBooks = chatId ? (settings.chatStates?.[chatId]?.campaignBooks || []) : [];
-
-    let booksToScan;
-    if (knownBooks.length > 0) {
-        // We know exactly which books belong to this campaign — no registry scan needed.
-        booksToScan = [...knownBooks];
-    } else {
-        // Fallback for first-time chats: discover books via in-memory registry.
-        // updateWorldInfoList() is intentionally NOT called here — it triggers a
-        // full disk re-index on every message send, causing multi-second latency
-        // for users whose chatStates.campaignBooks is empty (new campaigns, no
-        // lorebook entries yet). The routerLog fallback below already catches any
-        // books not yet visible in the in-memory registry at zero I/O cost.
-        // runRouterPass calls updateWorldInfoList() after actual book writes (line ~1298),
-        // so the registry is already current by the time the next scan fires.
-        const allNames = await getWorldInfoNamesSafe();
-        const scoped = allNames.filter(n => bookBelongsToPrefix(n, prefix));
-
-        // Also sweep books referenced in routerLog (catches books not yet re-indexed)
-        const logBookNames = (settings.routerLog || [])
-            .flatMap(e => [...(e.record || []), ...(e.activate || [])].map(id => id.split('::')[0]))
-            .filter(Boolean);
-        const scopedSet = new Set(scoped);
-        for (const n of logBookNames) {
-            if (bookBelongsToPrefix(n, prefix) && !isSkeletonBookName(n)) scopedSet.add(n);
-        }
-        booksToScan = [...scopedSet];
-    }
+    const registryNames = chatCommitResult(ownsChat, await getWorldInfoNamesSafe({ fullProbe: knownBooks.length === 0 }));
+    const logBookNames = (settings.routerLog || [])
+        .flatMap(e => [...(e.record || []), ...(e.activate || [])].map(id => id.split('::')[0]))
+        .filter(Boolean);
+    const booksToScan = resolveBooksToScan(knownBooks, registryNames, prefix, logBookNames);
 
     // ── Forward pass: activate entries whose keywords appear in the new narrative ──
     // ── or in the recent history window (Retroactive Lookback).            ──
@@ -2888,6 +4393,9 @@ export async function scanAssistantOutputForKeywords(narrativeText, opts = {}) {
 
     const currentActive = new Set((settings.activeRouterKeys || []).filter(id => !isSkeletonEntryId(id)));
     const currentKeyword = new Set(settings.keywordActivatedKeys || []);
+    const pinnedSet = new Set((settings.pinnedRouterKeys || []).filter(id => !isSkeletonEntryId(id)));
+    // Ensure pinned entries stay in the active pool for the duration of this scan
+    for (const id of pinnedSet) currentActive.add(id);
     const newlyTriggered = [];
 
     const directMatches = [];
@@ -2899,11 +4407,14 @@ export async function scanAssistantOutputForKeywords(narrativeText, opts = {}) {
 
     for (const bookName of booksToScan) {
         if (isSkeletonBookName(bookName)) continue;
-        const book = await ctx.loadWorldInfo(bookName);
+        const book = chatCommitResult(ownsChat, await ctx.loadWorldInfo(bookName));
         if (!book?.entries) continue;
         bookCache.set(bookName, book);
 
         for (const [uid, entry] of Object.entries(book.entries)) {
+            // Mapped roots are activated exclusively by the authoritative
+            // current-location hierarchy, never by incidental keyword mentions.
+            if (getDungeonMapAttachment(entry)) continue;
             const fullId = `${bookName}::${uid}`;
             const keywords = Array.isArray(entry.key) ? entry.key : [];
             if (keywords.length === 0) continue;
@@ -2964,7 +4475,7 @@ export async function scanAssistantOutputForKeywords(narrativeText, opts = {}) {
     {
         const kwOverflowCap = settings.routerMaxKeywordOverflow || 0;
         if (kwOverflowCap > 0) {
-            const maxActive   = settings.routerMaxActivations || 8;
+            const maxActive   = settings.routerMaxActivations || 12;
             const hardCeiling = maxActive + kwOverflowCap;
             const totalActive = currentActive.size;
             if (totalActive > hardCeiling) {
@@ -2973,6 +4484,7 @@ export async function scanAssistantOutputForKeywords(narrativeText, opts = {}) {
                 let evicted = 0;
                 for (const id of currentKeyword) {
                     if (evicted >= toEvict) break;
+                    if (pinnedSet.has(id)) continue; // never evict user-pinned entries
                     currentActive.delete(id);
                     currentKeyword.delete(id);
                     evicted++;
@@ -2995,13 +4507,14 @@ export async function scanAssistantOutputForKeywords(narrativeText, opts = {}) {
 
         for (const id of currentKeyword) {
             if (newlyTriggered.includes(id)) continue;
+            if (pinnedSet.has(id)) continue; // user-pinned entries never auto-expire
 
             const [bookName, uid] = id.split('::');
             if (!bookName || uid === undefined) { autoExpired.push(id); continue; }
 
             let book = bookCache.get(bookName);
             if (!book) {
-                book = await ctx.loadWorldInfo(bookName);
+                book = chatCommitResult(ownsChat, await ctx.loadWorldInfo(bookName));
                 if (book) bookCache.set(bookName, book);
             }
             const entry = book?.entries?.[uid];
@@ -3033,8 +4546,10 @@ export async function scanAssistantOutputForKeywords(narrativeText, opts = {}) {
     }
 
     // ── Persist ───────────────────────────────────────────────────────────────
+    // Re-assert pins in case any earlier path dropped them
+    for (const id of pinnedSet) currentActive.add(id);
     settings.activeRouterKeys = [...currentActive];
-    settings.keywordActivatedKeys = [...currentKeyword];
+    settings.keywordActivatedKeys = [...currentKeyword].filter(id => !pinnedSet.has(id));
     settings.lastKeywordTriggeredKeys = newlyTriggered;
     void saveSettings();
 
@@ -3073,33 +4588,33 @@ function getRecentlyRecordedNpcIds(settings) {
 }
 
 /**
- * Most recent single assistant/narrator message only (not the whole multi-message turn block).
+ * Most recent single assistant/narrator message only (not the whole multi-message
+ * turn block, and never a user input — Present Now must not empty between replies).
  * @param {boolean} [includeHidden]
  * @returns {string}
  */
 function getMostRecentNarrativeText(includeHidden = false) {
     const { chat } = SillyTavern.getContext();
-    if (!chat?.length) return '';
-    for (let i = chat.length - 1; i >= 0; i--) {
-        const msg = chat[i];
-        if (msg.is_user) break;
-        if (msg.is_system) continue;
-        if (!includeHidden && /** @type {any} */ (msg).is_hidden) continue;
-        if (msg.extra?.['summary'] || msg.extra?.['is_summary'] || msg.extra?.['summary_data']) continue;
-        const mes = cleanMessageContent(msg);
-        if (!mes) continue;
-        if (mes.startsWith('[Summary') || mes.startsWith('(Summary') || mes.includes('Summary of past events:')) continue;
-        return mes;
-    }
-    return '';
+    const msg = findMostRecentNarratorMessage(chat, { includeHidden });
+    if (!msg) return '';
+    const raw = String(msg.mes || msg.content || '');
+    const withoutChoices = stripCyoaChoiceBlocks(raw);
+    const mes = cleanMessageContent({ ...msg, mes: withoutChoices, content: withoutChoices });
+    if (!mes) return '';
+    if (mes.startsWith('[Summary') || mes.startsWith('(Summary') || mes.includes('Summary of past events:')) return '';
+    return mes;
 }
 
 /**
  * Present-Now name scanner — separate from the Lorebook Agent keyword scanner.
  * Scans ONLY the latest single narrator message for NPC names (entry comment/label).
- * First/last name tokens are enough for established NPCs; NPCs the agent just
- * recorded this pass require a full-name match so loose tokens/keys do not
- * instantly populate Present Now. Lorebook key[] arrays are never scanned.
+ * CYOA choice/button blocks are stripped first so hypothetical
+ * names in action options do not count as scene presence.
+ * User messages are never scanned: a player turn without explicit NPC names must
+ * not clear Present Now. First/last name tokens are enough for established NPCs;
+ * NPCs the agent just recorded this pass require a full-name match so loose
+ * tokens/keys do not instantly populate Present Now. Lorebook key[] arrays are
+ * never scanned.
  *
  * Call immediately before location scene image generation (and when building Present Now UI).
  *
@@ -3108,9 +4623,10 @@ function getMostRecentNarrativeText(includeHidden = false) {
  */
 export async function scanRecentOutputForPresentNpcs(narrativeText) {
     const settings = getSettings();
-    const text = (narrativeText != null && narrativeText !== '')
+    const rawText = (narrativeText != null && narrativeText !== '')
         ? String(narrativeText)
         : getMostRecentNarrativeText(!!settings.routerIncludeHidden);
+    const text = stripCyoaChoiceBlocks(rawText);
     if (!text.trim()) return [];
 
     const ctx = SillyTavern.getContext();
@@ -3119,16 +4635,9 @@ export async function scanRecentOutputForPresentNpcs(narrativeText) {
 
     const chatId = typeof globalThis._rpgCurrentChatId === 'function' ? globalThis._rpgCurrentChatId() : null;
     const knownBooks = chatId ? (settings.chatStates?.[chatId]?.campaignBooks || []) : [];
-
-    let booksToScan;
-    if (knownBooks.length > 0) {
-        booksToScan = knownBooks.filter(n => isNpcBookName(n) && !isSkeletonBookName(n));
-    } else {
-        const allNames = await getWorldInfoNamesSafe({ fullProbe: false });
-        booksToScan = allNames.filter(n =>
-            bookBelongsToPrefix(n, prefix) && isNpcBookName(n) && !isSkeletonBookName(n),
-        );
-    }
+    const registryNames = await getWorldInfoNamesSafe({ fullProbe: knownBooks.length === 0 });
+    const booksToScan = resolveBooksToScan(knownBooks, registryNames, prefix)
+        .filter(n => isNpcBookName(n));
     if (!booksToScan.length) return [];
 
     const recentlyRecordedNpcIds = getRecentlyRecordedNpcIds(settings);
@@ -3219,8 +4728,9 @@ function narrativeMentionsNpcName(narrativeText, npcLabel, opts = {}) {
  * Idempotent — safe to call on every init / chat-change.
  */
 export async function disableManagedEntries() {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     const settings = getSettings();
-    if (!settings.routerEnabled) return;
+    if (!isLorebookAgentRuntimeActive(settings)) return;
     // In native keyword mode, entries are left enabled for ST's keyword scanner to manage.
     if (settings.routerNativeKeywordActivation) return;
     const ctx = SillyTavern.getContext();
@@ -3235,13 +4745,13 @@ export async function disableManagedEntries() {
         if (savedBooks?.length) {
             scoped = savedBooks.filter(n => bookBelongsToPrefix(n, prefix) && !isSkeletonBookName(n));
         } else {
-            const allNames = await getWorldInfoNamesSafe({ fullProbe: false });
+            const allNames = chatCommitResult(ownsChat, await getWorldInfoNamesSafe({ fullProbe: false }));
             scoped = allNames.filter(n => bookBelongsToPrefix(n, prefix) && !isSkeletonBookName(n));
         }
 
-        await Promise.all(scoped.map(async (bookName) => {
+        chatCommitResult(ownsChat, await Promise.all(scoped.map(async (bookName) => {
             try {
-                const book = await ctx.loadWorldInfo(bookName);
+                const book = chatCommitResult(ownsChat, await ctx.loadWorldInfo(bookName));
                 if (!book?.entries) return;
                 let changed = false;
                 for (const entry of Object.values(book.entries)) {
@@ -3251,11 +4761,17 @@ export async function disableManagedEntries() {
                     }
                 }
                 if (changed) {
-                    try { await ctx.saveWorldInfo(bookName, book); } catch (_) {}
+                    try { chatCommitResult(ownsChat, await ctx.saveWorldInfo(bookName, book)); } catch (_) {
+                        if (!ownsChat()) return;
                 }
-            } catch (_) { /* book may not exist yet */ }
-        }));
+                }
+            } catch (_) {
+                if (!ownsChat()) return;
+         /* book may not exist yet */ }
+        })));
     } catch (e) {
+        if (!ownsChat()) return;
+
         console.warn('[RPG Tracker] disableManagedEntries failed:', e);
     }
 }
@@ -3267,6 +4783,12 @@ function cleanKeys(keys) {
     if (!Array.isArray(keys)) return [];
     const unique = [...new Set(keys.map(k => k?.trim()).filter(Boolean))];
     return unique.slice(0, 6); // Hard cap: max 6 keywords per entry to prevent keyword bloat
+}
+
+/** Site name first, then user keywords, still capped at 6. */
+function locationKeysForNewRoot(site, keys) {
+    const extra = Array.isArray(keys) ? keys : String(keys || '').split(/[,;\n]/);
+    return cleanKeys([site, ...extra]);
 }
 
 /**
@@ -3297,20 +4819,30 @@ function deduplicateContent(existing, delta) {
  * @returns {string}
  */
 function protectCoreBlock(originalContent, newContent) {
-    if (!originalContent || !newContent) return newContent;
+    if (!originalContent) return newContent;
+    let protectedContent = String(newContent || '');
     const coreRegex = /\[CORE\]([\s\S]*?)\[\/CORE\]/i;
     const originalCoreMatch = originalContent.match(coreRegex);
-    if (!originalCoreMatch) return newContent;
-
-    const originalCoreBlock = originalCoreMatch[0];
-    const newCoreMatch = newContent.match(coreRegex);
-    if (newCoreMatch) {
-        // Swap out the new core block with the original pristine one
-        return newContent.replace(coreRegex, originalCoreBlock);
-    } else {
-        // Prepend the original pristine core block if omitted
-        return `${originalCoreBlock}\n${newContent}`;
+    if (originalCoreMatch) {
+        const originalCoreBlock = originalCoreMatch[0];
+        const newCoreMatch = protectedContent.match(coreRegex);
+        protectedContent = newCoreMatch
+            ? protectedContent.replace(coreRegex, originalCoreBlock)
+            : `${originalCoreBlock}${protectedContent ? `\n${protectedContent}` : ''}`;
     }
+
+    // [MAP] is objective canon. Generic cleanup/rewrite operations may see it
+    // for context but cannot touch it; only validated map transactions mutate it.
+    const mapRegex = /\[MAP\]([\s\S]*?)\[\/MAP\]/i;
+    const originalMapMatch = originalContent.match(mapRegex);
+    if (originalMapMatch) {
+        const originalMapBlock = originalMapMatch[0];
+        const newMapMatch = protectedContent.match(mapRegex);
+        protectedContent = newMapMatch
+            ? protectedContent.replace(mapRegex, originalMapBlock)
+            : `${protectedContent.trimEnd()}${protectedContent.trim() ? '\n\n' : ''}${originalMapBlock}`;
+    }
+    return protectedContent;
 }
 
 
@@ -3377,11 +4909,14 @@ function countRedundantPairs(content, threshold = 0.6) {
  * @returns {Promise<{ existed: boolean, cleared: number }>}
  */
 async function clearWorldInfoBookEntries(bookName) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     const ctx = SillyTavern.getContext();
     let book = null;
     try {
-        book = await ctx.loadWorldInfo(bookName);
-    } catch (_) { /* book may not exist yet */ }
+        book = chatCommitResult(ownsChat, await ctx.loadWorldInfo(bookName));
+    } catch (_) {
+        assertChatCommit(ownsChat);
+         /* book may not exist yet */ }
 
     const cleared = book?.entries ? Object.keys(book.entries).length : 0;
     if (!book && cleared === 0) {
@@ -3397,16 +4932,20 @@ async function clearWorldInfoBookEntries(bookName) {
         extensions: book?.extensions ?? {},
     };
 
-    await fetch('/api/worldinfo/edit', {
+    chatCommitResult(ownsChat, await fetch('/api/worldinfo/edit', {
         method: 'POST',
         headers: getRequestHeaders(),
         body: JSON.stringify({ name: bookName, data: emptyBook }),
-    });
+    }));
     if (typeof ctx.saveWorldInfo === 'function') {
-        try { await ctx.saveWorldInfo(bookName, emptyBook); } catch (_) { /* non-fatal */ }
+        try { chatCommitResult(ownsChat, await ctx.saveWorldInfo(bookName, emptyBook)); } catch (_) {
+            assertChatCommit(ownsChat);
+         /* non-fatal */ }
     }
     if (typeof ctx.updateWorldInfoList === 'function') {
-        try { await ctx.updateWorldInfoList(); } catch (_) { /* non-fatal */ }
+        try { chatCommitResult(ownsChat, await ctx.updateWorldInfoList()); } catch (_) {
+            assertChatCommit(ownsChat);
+         /* non-fatal */ }
     }
 
     return { existed: true, cleared };
@@ -3420,6 +4959,7 @@ async function clearWorldInfoBookEntries(bookName) {
  * @returns {Promise<{ prefix: string, worldBookName: string, skeletonBookName: string, worldCleared: number, skeletonCleared: number }>}
  */
 export async function purgeWorldHistoryForChat(opts = {}) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     const includeSkeleton = opts.includeSkeleton !== false;
     const settings = getSettings();
     const ctx = SillyTavern.getContext();
@@ -3428,16 +4968,18 @@ export async function purgeWorldHistoryForChat(opts = {}) {
     const worldBookName = prefix ? `${prefix}_World` : 'World';
     const skeletonBookName = prefix ? `${prefix}_Skeleton` : 'World_Skeleton';
 
-    const worldResult = await clearWorldInfoBookEntries(worldBookName);
+    const worldResult = chatCommitResult(ownsChat, await clearWorldInfoBookEntries(worldBookName));
     let skeletonResult = { cleared: 0, existed: false };
     if (includeSkeleton) {
-        skeletonResult = await clearWorldInfoBookEntries(skeletonBookName);
+        skeletonResult = chatCommitResult(ownsChat, await clearWorldInfoBookEntries(skeletonBookName));
     }
 
     settings.activeWorldKeys = [];
     settings.worldProgressionLastFiredAtMinutes = -1;
     settings.worldProgressionLastFiredPeriodLabel = '';
     settings.worldProgressionSkeletonAtmosphereSummary = '';
+    settings.worldProgressionLocationLastAdvanced = {};
+    settings.mapEvolutionWorldReportApplications = {};
 
     if (settings.chatStates && chatId && settings.chatStates[chatId]) {
         const cs = settings.chatStates[chatId];
@@ -3445,6 +4987,8 @@ export async function purgeWorldHistoryForChat(opts = {}) {
         cs.worldProgressionLastFiredAtMinutes = -1;
         cs.worldProgressionLastFiredPeriodLabel = '';
         cs.worldProgressionSkeletonAtmosphereSummary = '';
+        cs.worldProgressionLocationLastAdvanced = {};
+        cs.mapEvolutionWorldReportApplications = {};
     }
 
     persistWorldProgressionTimer();
@@ -3493,6 +5037,27 @@ function computePeriodLabel(startMinutes, endMinutes, intervalHours) {
  */
 export async function runWorldProgressionPass(timeStr, currentMinutes, extraInstructions = null) {
     const settings = getSettings();
+    // Pin chat ownership before any lorebook/LLM await. applyAction routes WORLD
+    // records via live getLivePrefix(), and persistWorldProgressionTimer() saves
+    // through getActiveChatId() — both become the arriving chat after a switch.
+    const passChatId = getActiveChatId();
+    if (_worldProgressionController) {
+        try { _worldProgressionController.abort(); } catch (_) { /* ignore */ }
+    }
+    _worldProgressionController = new AbortController();
+    const signal = _worldProgressionController.signal;
+    const releaseWorldProgressionController = () => {
+        if (_worldProgressionController?.signal === signal) {
+            _worldProgressionController = null;
+        }
+    };
+    const ownsChat = createChatCommitGuard(passChatId, getActiveChatId, { signal });
+    const abortForChatChange = () => {
+        broadcastStep('thought', '🌍 World Progression: stopped because the active chat changed.');
+        releaseWorldProgressionController();
+        return { ok: false, error: 'chat_changed' };
+    };
+
     const prefix = getLivePrefix();
     const worldBookName = prefix ? `${prefix}_World` : 'World';
     const intervalHours = settings.worldProgressionIntervalHours || 24;
@@ -3523,34 +5088,50 @@ export async function runWorldProgressionPass(timeStr, currentMinutes, extraInst
 
     broadcastStep('thought', `\uD83C\uDF0D World Progression: Checking for "${periodLabel}" report...`);
 
+    try {
     // 1. Load ALL campaign lorebooks once.
     //    Used for: duplicate check, full lore context, and applyAction verification.
     //    No double-fetch - archiveBooks is reused throughout the function.
     const ctx = SillyTavern.getContext();
-    if (typeof ctx.updateWorldInfoList === 'function') {
-        try { await ctx.updateWorldInfoList(); } catch (_) {}
-    }
     const allBookNames = await getWorldInfoNamesSafe();
+    if (!ownsChat()) return abortForChatChange();
     const archiveBooks = {};
     for (const n of allBookNames) {
         if (prefix && !bookBelongsToPrefix(n, prefix)) continue;
         try {
             const b = await ctx.loadWorldInfo(n);
+            if (!ownsChat()) return abortForChatChange();
             if (b?.entries) archiveBooks[n] = b;
         } catch (_) {}
     }
 
     // 2. Duplicate check - see if a report for this period already exists in the World book.
+    if (!ownsChat()) return abortForChatChange();
     const worldBook = archiveBooks[worldBookName] ?? null;
     const cleanPeriod = periodLabel.toLowerCase().trim();
     if (worldBook?.entries) {
-        for (const entry of Object.values(worldBook.entries)) {
+        for (const [uid, entry] of Object.entries(worldBook.entries)) {
             const existingLabel = (entry.comment || '').toLowerCase().trim();
             if (existingLabel === cleanPeriod) {
+                if (!ownsChat()) return abortForChatChange();
                 broadcastStep('thought', `\uD83C\uDF0D World Progression: "${periodLabel}" already exists - advancing timer.`);
                 settings.worldProgressionLastFiredPeriodLabel = periodLabel;
+                const metadata = normalizeWorldReportMetadata(entry, worldBookName, uid);
+                settings.worldProgressionLocationLastAdvanced = stampLocationAdvancement(
+                    settings.worldProgressionLocationLastAdvanced,
+                    metadata.selectedLocations,
+                    periodLabel,
+                );
                 persistWorldProgressionTimer();
-                return;
+                releaseWorldProgressionController();
+                return {
+                    ok: true,
+                    skipped: 'duplicate',
+                    periodLabel,
+                    reportContent: String(entry.content || '').trim(),
+                    reportId: metadata.reportId,
+                    selectedLocations: metadata.selectedLocations,
+                };
             }
         }
     }
@@ -3606,7 +5187,7 @@ export async function runWorldProgressionPass(timeStr, currentMinutes, extraInst
 ## RULES
 1. Merge all reports into a single coherent, present-tense narrative.
 2. Always retain temporal context. The summary MUST begin with the overall period label (e.g. "[${consolidatedLabel}]"). Never remove all temporal markers.
-3. Preserve every unique fact — faction developments, NPC actions, location changes, economic shifts, and plot developments. Never replace detailed facts with generic summaries (e.g. writing "Various events occurred" is a critical failure).
+3. Preserve every unique location-scale or wider-current fact — institutional developments, location changes, economic shifts, environmental conditions, public sentiment, and causal reversals. Named entities may remain only where needed to identify historical causes; do not turn them into new simulation subjects. Never replace detailed facts with generic summaries.
 4. Eliminate only true redundancies — if the same fact repeats across multiple reports, write it once.
 5. Target 40–60% of the combined original token count.
 6. Format: dense prose or tight bullet points, no filler, no markdown headers beyond the period label. 1–2 sentences per development.
@@ -3621,15 +5202,18 @@ ${rawDump}`;
 
                 let consolidatedContent = null;
                 try {
-                    consolidatedContent = await sendStateRequest(routerSettings, consolidationSystemPrompt, consolidationUserPrompt);
+                    consolidatedContent = await sendStateRequest(routerSettings, consolidationSystemPrompt, consolidationUserPrompt, signal, { stream: true, debugSource: 'World Progression' });
                 } catch (e) {
+                    if (e?.name === 'AbortError' || !ownsChat()) return abortForChatChange();
                     broadcastStep('error', `World Progression consolidation failed: ${e.message} — continuing without consolidation.`);
                 }
+                if (!ownsChat()) return abortForChatChange();
 
                 if (consolidatedContent && consolidatedContent.trim()) {
                     // Reload the world book from disk for a fresh write
                     let freshBook = null;
                     try { freshBook = await ctx.loadWorldInfo(worldBookName); } catch (_) {}
+                    if (!ownsChat()) return abortForChatChange();
                     if (!freshBook?.entries) freshBook = currentWorldBook;
 
                     // Add the consolidated entry
@@ -3666,7 +5250,9 @@ ${rawDump}`;
                         headers: getRequestHeaders(),
                         body: JSON.stringify({ name: worldBookName, data: freshBook })
                     });
+                    if (!ownsChat()) return abortForChatChange();
                     try { await ctx.saveWorldInfo(worldBookName, freshBook); } catch (_) {}
+                    if (!ownsChat()) return abortForChatChange();
 
                     // Update the in-memory archive so the lore context build step reads fresh data
                     archiveBooks[worldBookName] = freshBook;
@@ -3677,206 +5263,24 @@ ${rawDump}`;
         }
     }
 
-    // 3. Build full lore context from ALL campaign lorebooks, split into three sections.
-    //    _Skeleton books -> Day 0 Baseline (foundational undiscovered entities, never injected
-    //                       into narrative context — only visible to the World Progression engine)
-    //    Regular books   -> Active World Lore (all discovered entities, active or not)
-    //    _World books    -> Historical Reports (all prior periods, incl. deactivated)
-    //
-    //    Segregating the Skeleton into its own timestamped section prevents the LLM from
-    //    treating Day-0 stub data as current events, while still making those entities available
-    //    for off-screen simulation.
-    const skeletonLines = [];
-    const loreGrouped = {}; // categoryHeader -> Array of entry lines
+    // 3. Historical macro context only. Location lore and pertinent read-only
+    //    constraints are assembled below by buildWorldProgressionLocationDossiers().
     const historicalReportLines = [];
-    // Typed entity name pools — skeleton vs. narrative
-    const skeletonNpcNames = [];
-    const narrativeNpcNames = [];
-    const skeletonLocationNames = [];
-    const narrativeLocationNames = [];
-    const skeletonFactionNames = [];
-    const narrativeFactionNames = [];
-    const conflictNames = [];
-    // First-sentence descriptions for the fallback generator context
-    const skeletonFactionDescs = []; // { name, desc }
-    const skeletonLocationDescs = []; // { name, desc }
-
-    // Compute exclusion list (manual, general-purpose — soft: only affects the
-    // randomized designation pool, not raw context visibility, by long-standing design).
-    const excludedTerms = [];
-    if (settings.worldProgressionExclusionList) {
-        settings.worldProgressionExclusionList
-            .split(',')
-            .map(term => term.trim().toLowerCase())
-            .filter(Boolean)
-            .forEach(term => excludedTerms.push(term));
-    }
-
-    // Party presence, unconditional (no toggle) — [PARTY] members are HARD-excluded below
-    // (stripped from context entirely, not just the randomization pool), because they are
-    // physically with {{user}} right now and any off-screen activity for them risks
-    // contradicting the live scene. [BENCHED PARTY] members are the opposite: eligible for
-    // simulation, with their benching note captured as flavor for their designation entry.
-    // See <leaving_vs_benching> in sysprompt.txt / DEFAULT_STOCK_PROMPTS['benched party'] for the
-    // inference contract that keeps these two blocks in sync with the narrative.
-    function extractPartyRoster(memo, tagName) {
-        const roster = [];
-        const re = new RegExp(`\\[${tagName}\\]([\\s\\S]*?)\\[\\/${tagName}\\]`, 'i');
-        const match = memo.match(re);
-        if (!match) return roster;
-        const blockContent = match[1];
-        // Each member starts a new "Name (Class): cur/max HP" line — split on those anchors
-        // rather than every line, so we can carry a member's Status line along with their name.
-        const memberChunks = blockContent.split(/\n(?=[^\n]*\([^)]*\):\s*\d)/);
-        for (const chunk of memberChunks) {
-            const lines = chunk.split('\n').map(l => l.trim()).filter(Boolean);
-            if (!lines.length) continue;
-            const headerLine = lines[0];
-            const colonIdx = headerLine.indexOf(':');
-            const entityPart = colonIdx !== -1 ? headerLine.substring(0, colonIdx).trim() : headerLine;
-            const namePart = entityPart.replace(/\s*\([^)]*\)/g, '').trim();
-            if (!namePart || namePart === '(unnamed)') continue;
-            const statusLine = lines.find(l => l.toLowerCase().startsWith('status:'));
-            const note = statusLine ? statusLine.substring(statusLine.indexOf(':') + 1).trim() : '';
-            roster.push({ name: namePart, note });
-        }
-        return roster;
-    }
-
-    const memoForParty = settings.currentMemo || '';
-    const presentPartyRoster = extractPartyRoster(memoForParty, 'PARTY');
-    const benchedPartyRoster = extractPartyRoster(memoForParty, 'BENCHED PARTY');
-    const presentPartyNames = new Set(presentPartyRoster.map(m => m.name.toLowerCase()));
-
-    function getBookCategoryHeader(bookName, prefix) {
-        let cleanName = bookName;
-        if (prefix && bookName.startsWith(prefix + '_')) {
-            cleanName = bookName.slice(prefix.length + 1);
-        }
-        return cleanName.toUpperCase();
-    }
-
     for (const [bookName, book] of Object.entries(archiveBooks)) {
-        const nameLower = bookName.toLowerCase();
-        const isSkeletonBook = nameLower.endsWith('_skeleton');
+        const nameLower = String(bookName || '').toLowerCase();
         const isWorldBook = nameLower.endsWith('_world') || nameLower === 'world';
-        // Sort by uid (numeric insertion order ≈ chronological)
+        if (!isWorldBook || !book?.entries) continue;
         let sortedEntries = Object.entries(book.entries)
-            .sort(([a], [b]) => Number(a) - Number(b));
-
-        if (isWorldBook) {
-            const historyLookback = settings.worldProgressionHistoryLookback ?? 0;
-            if (historyLookback > 0) {
-                sortedEntries = sortedEntries.slice(-historyLookback);
-            }
-        }
-
+            .sort(([left], [right]) => Number(left) - Number(right));
+        const historyLookback = settings.worldProgressionHistoryLookback ?? 0;
+        if (historyLookback > 0) sortedEntries = sortedEntries.slice(-historyLookback);
         for (const [, entry] of sortedEntries) {
-            if (!entry?.content?.trim()) continue;
-            const label = (entry.comment || entry.key?.[0] || '(unnamed)').trim();
-            if (label === '(unnamed)' || !label) continue;
-
-            const categoryHeader = getBookCategoryHeader(bookName, prefix);
-            const isNpc = (isSkeletonBook && entry.extensions?.rpgCategory === 'NPC') ||
-                          (!isSkeletonBook && (categoryHeader === 'NPC' || categoryHeader === 'NPCS' || nameLower.includes('npc')));
-            const isLoc = (isSkeletonBook && entry.extensions?.rpgCategory === 'LOC') ||
-                          (!isSkeletonBook && (categoryHeader === 'LOC' || categoryHeader === 'LOCATIONS' || nameLower.includes('location') || nameLower.includes('place')));
-            const isFac = (isSkeletonBook && entry.extensions?.rpgCategory === 'FAC') ||
-                          (!isSkeletonBook && (categoryHeader === 'FAC' || categoryHeader === 'FACTIONS' || nameLower.includes('faction') || nameLower.includes('guild')));
-            const isConflict = (isSkeletonBook && entry.extensions?.rpgCategory === 'EVENT') ||
-                               (!isSkeletonBook && (categoryHeader === 'EVENT' || categoryHeader === 'EVENTS' || categoryHeader === 'QUEST' || categoryHeader === 'QUESTS' || nameLower.includes('event') || nameLower.includes('conflict') || nameLower.includes('quest')));
-
-            // HARD exclusion for present party members: skip this entry entirely (never enters
-            // skeletonLines/loreGrouped/any name pool) if it's an NPC-type entry representing
-            // someone currently in [PARTY]. Historical [_World] reports are exempt — they're
-            // archived record of the past, not something being freshly selected now.
-            if (isNpc && !isWorldBook && presentPartyNames.size > 0) {
-                const labelLower = label.toLowerCase();
-                const primaryKeysForParty = Array.isArray(entry.key) ? entry.key.map(k => String(k).trim().toLowerCase()) : [];
-                const matchesPresentParty = [...presentPartyNames].some(name =>
-                    labelLower.includes(name) || primaryKeysForParty.some(k => k.includes(name))
-                );
-                if (matchesPresentParty) continue;
-            }
-
-            // Check exclusion list
-            let isExcluded = false;
-            if (excludedTerms.length > 0) {
-                const labelLower = label.toLowerCase();
-                const primaryKeys = Array.isArray(entry.key) ? entry.key.map(k => String(k).trim().toLowerCase()) : [];
-                const secondaryKeys = Array.isArray(entry.keysecondary) ? entry.keysecondary.map(k => String(k).trim().toLowerCase()) : [];
-
-                isExcluded = excludedTerms.some(term => {
-                    if (labelLower.includes(term)) return true;
-                    if (primaryKeys.some(k => k.includes(term))) return true;
-                    if (secondaryKeys.some(k => k.includes(term))) return true;
-                    return false;
-                });
-            }
-
-            if (isSkeletonBook) {
-                skeletonLines.push(`### ${label}\n${entry.content.trim()}`);
-                if (!isExcluded) {
-                    if (isNpc) skeletonNpcNames.push(label);
-                    else if (isLoc) {
-                        skeletonLocationNames.push(label);
-                        skeletonLocationDescs.push({ name: label, desc: entry.content.trim().split(/[.!?]/)[0].trim() });
-                    } else if (isFac) {
-                        skeletonFactionNames.push(label);
-                        skeletonFactionDescs.push({ name: label, desc: entry.content.trim().split(/[.!?]/)[0].trim() });
-                    } else if (isConflict) conflictNames.push(label);
-                }
-            } else if (isWorldBook) {
-                historicalReportLines.push(`### ${label}\n${entry.content.trim()}`);
-            } else {
-                const isQuestOrEvent = categoryHeader === 'EVENT' || categoryHeader === 'EVENTS' ||
-                                       categoryHeader === 'QUEST' || categoryHeader === 'QUESTS' ||
-                                       nameLower.includes('event') || nameLower.includes('quest');
-                if (isQuestOrEvent) continue;
-
-                if (!loreGrouped[categoryHeader]) {
-                    loreGrouped[categoryHeader] = [];
-                }
-                loreGrouped[categoryHeader].push(`### ${label}\n${entry.content.trim()}`);
-                if (!isExcluded) {
-                    if (isNpc) narrativeNpcNames.push(label);
-                    else if (isLoc) narrativeLocationNames.push(label);
-                    else if (isFac) narrativeFactionNames.push(label);
-                }
-            }
+            const content = String(entry?.content || '').trim();
+            if (!content) continue;
+            const label = String(entry?.comment || entry?.key?.[0] || 'Prior report').trim();
+            historicalReportLines.push(`### ${label}\n${content}`);
         }
     }
-
-    // Benched party members are eligible for simulation regardless of whether they also have
-    // a standalone NPC lorebook entry — synthesize a category so WP has real content to work
-    // with (their benching note as flavor), and make them selectable via the same NPC
-    // designation pool as any other narrative NPC.
-    if (benchedPartyRoster.length > 0) {
-        const benchedLabel = 'PARTY MEMBERS (BENCHED)';
-        loreGrouped[benchedLabel] = benchedPartyRoster.map(m =>
-            `### ${m.name}\n${m.note || 'Currently separated from {{user}}.'}`
-        );
-        for (const m of benchedPartyRoster) {
-            narrativeNpcNames.push(m.name);
-        }
-    }
-
-    const skeletonDump = skeletonLines.length
-        ? skeletonLines.join('\n\n')
-        : '(No skeleton generated — engine will rely solely on discovered lore.)';
-
-    let loreDump = '';
-    const categories = Object.keys(loreGrouped).sort();
-    if (categories.length > 0) {
-        const categoryBlocks = [];
-        for (const cat of categories) {
-            categoryBlocks.push(`## ${cat}\n${loreGrouped[cat].join('\n\n')}`);
-        }
-        loreDump = categoryBlocks.join('\n\n');
-    } else {
-        loreDump = 'No lore entries found.';
-    }
-
     const historicalDump = historicalReportLines.length
         ? historicalReportLines.join('\n\n')
         : 'No prior World Progression reports.';
@@ -3901,6 +5305,23 @@ ${rawDump}`;
         recentNarrative = narrativeBlocks.join('\n\n');
     }
 
+    const locationContext = buildWorldProgressionLocationDossiers(archiveBooks, {
+        prefix,
+        exclusionList: settings.worldProgressionExclusionList || '',
+    });
+    const selectedDossiers = selectWorldProgressionLocations(locationContext.dossiers, {
+        count: settings.worldProgressionLocationsPerReport ?? 3,
+        lastAdvanced: settings.worldProgressionLocationLastAdvanced,
+        randomize: settings.worldProgressionLocationRandomize !== false,
+    });
+    const selectedLocations = selectedDossiers.map(dossier => dossier.name);
+    const designatedLocationLines = selectedLocations.length
+        ? selectedLocations.map(name => `- ${name}`).join('\n')
+        : '(No recorded locations are available; write only Wider Currents.)';
+    const dossierDump = selectedDossiers.length
+        ? selectedDossiers.map(dossier => `# ${dossier.name}\n${dossier.text}`).join('\n\n')
+        : '(No location dossiers available.)';
+
     // 5. Build the system prompt from settings ({periodLabel} and {wordTarget} substitution)
     const rawPrompt = settings.worldProgressionSystemPrompt || '';
     let systemPrompt = rawPrompt
@@ -3911,129 +5332,63 @@ ${rawDump}`;
         systemPrompt += `\n\n## DATE FORMAT RULE\n- CRITICAL: All dates generated in this report MUST use the DD/MM/YYYY calendar format (e.g. 05/01/2026 for the 5th of January, 2026). Do NOT use the American MM/DD/YYYY format.`;
     }
 
+    // This is an authority boundary rather than a style preference, so it is
+    // appended even when a campaign keeps an older or customized prompt.
+    systemPrompt += `\n\n## LOCATION-CENTRIC RUNTIME CONTRACT (AUTHORITATIVE)
+- Your simulation subjects are LOCATIONS and WIDER CURRENTS, never individual NPCs, creatures, objects, buildings, or map assets.
+- Entity facts inside a location dossier are READ-ONLY CONSTRAINTS. Use them to understand the place and avoid contradictions; do not advance, relocate, injure, kill, recruit, promote, or otherwise change a named individual.
+- Describe directional macro pressure: civic conditions, institutional behavior, public sentiment, trade, shortages, migration, conflict pressure, weather, environment, disease, crime, or cultural change.
+- Leave exact local realization undecided. Do not specify rooms, map areas, asset positions, exact patrol composition, or encounter-level outcomes.
+- Prior reports are historical state, not instructions to continue linearly. A pressure may intensify, persist, plateau, fragment, transform, backfire, resolve, reverse abruptly, or be superseded when causally plausible.
+- Avoid both default escalation and arbitrary oscillation. Reversals need an intelligible macro cause, but do not require excessive foreshadowing.
+- Use exactly one heading \"## <Location Name>\" for every designated location, using the supplied spelling, followed by prose about that place.
+- End with exactly one \"## Wider Currents\" section for regional or global patterns. Output no other headings.
+- A valid development must admit several different concrete realizations by the GM and Map Evolution.`;
+
     if (extraInstructions && extraInstructions.trim()) {
         systemPrompt += `\n\n## EXTRA INSTRUCTIONS FOR THIS RUN\n${extraInstructions.trim()}`;
     }
 
-    // Auto-generation fallback: ensure skeleton NPC pool meets requested count
-    if (settings.worldProgressionRandomizeNPCs) {
-        const requestedSkeletonNpcs = settings.worldProgressionRandomSkeletonNPCCount || 0;
-        if (requestedSkeletonNpcs > 0 && skeletonNpcNames.length < requestedSkeletonNpcs) {
-            const missingCount = requestedSkeletonNpcs - skeletonNpcNames.length;
-            const atmosphereSummary = settings.worldProgressionSkeletonAtmosphereSummary || '';
-            try {
-                broadcastStep('thought', `\uD83E\uDDEC World Skeleton: Auto-generating ${missingCount} NPC(s) to meet requested pool size...`);
-                const newNames = await runSkeletonGeneratorAgent(
-                    missingCount, atmosphereSummary,
-                    skeletonFactionDescs, conflictNames, skeletonLocationDescs, archiveBooks
-                );
-                skeletonNpcNames.push(...newNames);
-                if (typeof globalThis._rpgUpdateSkeletonStatus === 'function') {
-                    globalThis._rpgUpdateSkeletonStatus().catch(() => {});
-                }
-            } catch (e) {
-                broadcastStep('error', `World Skeleton auto-generation failed: ${e.message} \u2014 proceeding with existing pool.`);
-            }
-        }
-    }
-
-    // Determine designated entities using typed skeleton/narrative pools
-    const designations = [];
-    const shuffleAndSelect = (arr, count) => {
-        const unique = Array.from(new Set(arr)).filter(Boolean);
-        const clamped = Math.min(Math.max(count, 0), unique.length);
-        if (clamped === 0) return [];
-        const shuffled = [...unique];
-        for (let i = shuffled.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-        }
-        return shuffled.slice(0, clamped);
-    };
-
-    const handleTypedRandomization = (enabled, skeletonNames, narrativeNames, skeletonCount, narrativeCount, category) => {
-        if (!enabled) return;
-        const skelSelected = shuffleAndSelect(skeletonNames, skeletonCount);
-        const narSelected = shuffleAndSelect(narrativeNames, narrativeCount);
-        if (skelSelected.length > 0 || narSelected.length > 0) {
-            let block = `### ${category}`;
-            if (skelSelected.length > 0) {
-                block += `\n#### SKELETON ENTITIES [drawn from skeleton lorebook only]\n` + skelSelected.map(n => `- ${n}`).join('\n');
-            }
-            if (narSelected.length > 0) {
-                block += `\n#### NARRATIVE ENTITIES [drawn from active world lore only]\n` + narSelected.map(n => `- ${n}`).join('\n');
-            }
-            designations.push(block);
-        }
-    };
-
-    handleTypedRandomization(
-        settings.worldProgressionRandomizeNPCs,
-        skeletonNpcNames, narrativeNpcNames,
-        settings.worldProgressionRandomSkeletonNPCCount || 0,
-        settings.worldProgressionRandomNarrativeNPCCount || 0,
-        'NPCs'
-    );
-    handleTypedRandomization(
-        settings.worldProgressionRandomizeLocations,
-        skeletonLocationNames, narrativeLocationNames,
-        settings.worldProgressionRandomSkeletonLocationCount || 0,
-        settings.worldProgressionRandomNarrativeLocationCount || 0,
-        'Locations'
-    );
-    handleTypedRandomization(
-        settings.worldProgressionRandomizeFactions,
-        skeletonFactionNames, narrativeFactionNames,
-        settings.worldProgressionRandomSkeletonFactionCount || 0,
-        settings.worldProgressionRandomNarrativeFactionCount || 0,
-        'Factions'
-    );
-
-
-
-    let selectedNPCsText = '';
-    if (designations.length > 0) {
-        selectedNPCsText = `\n\n## DESIGNATED ENTITIES FOR THIS PERIOD\n` +
-            `The following entities have been pre-selected by the system simulator. Entities listed under SKELETON ENTITIES originate from the hidden background skeleton (off-screen, undiscovered by the player). Entities listed under NARRATIVE ENTITIES originate from the active discovered world lore. You MUST focus on and advance the timeline only for these designated entities:\n\n` +
-            designations.join('\n\n') +
-            `\n\nYou are strictly forbidden from changing the status, advancing the timeline, or creating new narrative beats for entities not listed above. You MAY mention them passively as background context where their prior established actions are a direct catalyst for a designated entity.`;
-    }
-
+    // No raw map or entity pool can enter the World Progression LLM call.
     let userPrompt =
-`## WORLD SKELETON (Day 0 Baseline — Foundational Undiscovered State)
-These entities existed at the start of the campaign. They have been acting off-screen since Day 1.
-They are NOT yet known to the player. Use them freely to generate off-screen activity.
-${skeletonDump}
+`## DESIGNATED LOCATIONS
+Advance only these location-scale subjects during this period:
+${designatedLocationLines}
 
-## ACTIVE WORLD LORE (Discovered Entities — Current Known State)
-${loreDump}
+## LOCATION DOSSIERS
+These dossiers contain the known character, history, sublocations, institutions, and relevant facts for each designated place. Named entities and map-scale facts are context only, not simulation subjects.
+${dossierDump}
 
-## HISTORICAL WORLD REPORTS (Previously Generated Off-Screen Activity)
+## WIDER-WORLD CONTEXT
+Use this only to derive regional or global pressures. Do not advance any named individual found here.
+${locationContext.globalContext || '(No wider-world context recorded.)'}
+
+## HISTORICAL WORLD REPORTS
+These are prior macro conditions. Continue their causal consequences where appropriate, but consider persistence, transformation, resolution, backlash, and reversal rather than assuming linear escalation.
 ${historicalDump}`;
 
     if (recentNarrative) {
         userPrompt += `\n\n## RECENT NARRATIVE (Current Scene Context)\n${recentNarrative}`;
     }
 
-    if (selectedNPCsText) {
-        userPrompt += selectedNPCsText;
-    }
-
-    userPrompt += `\n\nWrite the World Progression report for **${periodLabel}**.`;
+    userPrompt += `\n\nWrite the World Progression report for **${periodLabel}**, with exactly one section for every designated location and a final Wider Currents section.`;
 
     // 6. Send the LLM request using the Lorebook Agent connection settings
-    const loreCount = Object.values(loreGrouped).reduce((sum, arr) => sum + arr.length, 0);
-    broadcastStep('thought', `\uD83C\uDF0D World Progression: Generating report for "${periodLabel}" (${skeletonLines.length} skeleton, ${loreCount} lore, ${historicalReportLines.length} prior reports)...`);
+    broadcastStep('thought', `\uD83C\uDF0D World Progression: Generating report for "${periodLabel}" (${selectedLocations.length} locations, ${historicalReportLines.length} prior reports)...`);
     let reportContent;
     try {
-        reportContent = await sendStateRequest(routerSettings, systemPrompt, userPrompt);
+        reportContent = await sendStateRequest(routerSettings, systemPrompt, userPrompt, signal, { stream: true, debugSource: 'World Progression' });
     } catch (e) {
+        if (e?.name === 'AbortError' || !ownsChat()) return abortForChatChange();
         broadcastStep('error', `World Progression generation failed: ${e.message}`);
-        return;
+        releaseWorldProgressionController();
+        return { ok: false, error: e.message };
     }
+    if (!ownsChat()) return abortForChatChange();
     if (!reportContent || !reportContent.trim()) {
         broadcastStep('error', 'World Progression: LLM returned empty response.');
-        return;
+        releaseWorldProgressionController();
+        return { ok: false, error: 'empty' };
     }
 
     // 7. Store the entry via applyAction (routes to the _World lorebook).
@@ -4045,77 +5400,16 @@ ${historicalDump}`;
     await applyAction({
         record: [{ label: periodLabel, keys: entryKeys, content: reportContent.trim(), category: 'WORLD' }],
         reason: `World Progression: auto-generated report for ${periodLabel}`,
-    }, archiveBooks, timeStr, '');
-
-    // 7b. Breadcrumb write-back: for each benched party member mentioned in this report,
-    // concatenate the matching bullet(s) into their [BENCHED PARTY] Status field as a
-    // period-timestamped "last update" trailer. This keeps a benched companion's thread
-    // alive in the always-injected memo even after the _World book's rolling window
-    // (worldProgressionKeepActive) moves past the report that mentioned them. Bullets in a
-    // single report are synchronous (one shared period timestamp) — there is no ordering to
-    // exploit across multiple matches, so all matches are kept, not just "the last one".
-    if (benchedPartyRoster.length > 0) {
-        const bullets = reportContent
-            .split(/\n\s*\n/)
-            .map(b => b.replace(/^[-*]\s*/, '').trim())
-            .filter(Boolean);
-
-        let memoForBreadcrumbs = settings.currentMemo || '';
-        let anyBreadcrumbWritten = false;
-
-        for (const member of benchedPartyRoster) {
-            const escapedName = member.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-            const nameRx = new RegExp(`\\b${escapedName}\\b`, 'i');
-            const matchingBullets = bullets.filter(b => nameRx.test(b));
-            if (matchingBullets.length === 0) continue;
-
-            const breadcrumb = matchingBullets.join('; ');
-
-            // Locate this member's chunk within [BENCHED PARTY] the same way extractPartyRoster
-            // split it, so we only touch this member's Status line, not the whole block.
-            const blockRe = /\[BENCHED PARTY\]([\s\S]*?)\[\/BENCHED PARTY\]/i;
-            const blockMatch = memoForBreadcrumbs.match(blockRe);
-            if (!blockMatch) break; // block vanished mid-loop (shouldn't happen) — bail safely
-
-            const blockContent = blockMatch[1];
-            const chunks = blockContent.split(/\n(?=[^\n]*\([^)]*\):\s*\d)/);
-            const chunkIdx = chunks.findIndex(c => {
-                const headerLine = c.split('\n').map(l => l.trim()).filter(Boolean)[0] || '';
-                const colonIdx = headerLine.indexOf(':');
-                const entityPart = colonIdx !== -1 ? headerLine.substring(0, colonIdx).trim() : headerLine;
-                const namePart = entityPart.replace(/\s*\([^)]*\)/g, '').trim();
-                return namePart.toLowerCase() === member.name.toLowerCase();
-            });
-            if (chunkIdx === -1) continue;
-
-            let chunk = chunks[chunkIdx];
-            const statusLineRe = /^(\s*Status:\s*)(.*)$/im;
-            if (statusLineRe.test(chunk)) {
-                chunk = chunk.replace(statusLineRe, (full, prefix, value) => {
-                    // Strip any prior "— Last update: ..." trailer before appending the fresh one.
-                    const baseValue = value.replace(/\s*—\s*Last update:.*$/i, '').trim();
-                    return `${prefix}${baseValue} — Last update: ${periodLabel}: ${breadcrumb}`;
-                });
-            } else {
-                chunk = chunk.trim() + `\nStatus: Benched — Last update: ${periodLabel}: ${breadcrumb}`;
-            }
-            chunks[chunkIdx] = chunk;
-
-            const newBlockContent = chunks.join('\n');
-            memoForBreadcrumbs = memoForBreadcrumbs.replace(blockRe, `[BENCHED PARTY]${newBlockContent}[/BENCHED PARTY]`);
-            anyBreadcrumbWritten = true;
-        }
-
-        if (anyBreadcrumbWritten) {
-            settings.currentMemo = memoForBreadcrumbs;
-            void saveSettings();
-        }
-    }
+    }, archiveBooks, timeStr, '', false, { canCommit: ownsChat });
+    if (!ownsChat()) return abortForChatChange();
 
     // 8. Rolling window: keep only the N most recent WORLD entries active.
     await new Promise(r => setTimeout(r, 300));
+    if (!ownsChat()) return abortForChatChange();
     let freshWorldBook = null;
+    let reportId = '';
     try { freshWorldBook = await ctx.loadWorldInfo(worldBookName); } catch (_) {}
+    if (!ownsChat()) return abortForChatChange();
     if (!freshWorldBook?.entries) {
         try {
             const r = await fetch('/api/worldinfo/get', {
@@ -4123,13 +5417,43 @@ ${historicalDump}`;
                 headers: getRequestHeaders(),
                 body: JSON.stringify({ name: worldBookName })
             });
+            if (!ownsChat()) return abortForChatChange();
             if (r.ok) { const d = await r.json(); if (d?.entries) freshWorldBook = d; }
         } catch (_) {}
     }
+    if (!ownsChat()) return abortForChatChange();
 
     if (freshWorldBook?.entries) {
         const sorted = Object.entries(freshWorldBook.entries)
             .sort(([a], [b]) => Number(a) - Number(b));
+        const reportPair = [...sorted].reverse().find(([, entry]) =>
+            String(entry?.comment || '').trim().toLowerCase() === cleanPeriod
+        );
+        if (reportPair) {
+            const [uid, entry] = reportPair;
+            reportId = `${worldBookName}::${uid}`;
+            entry.extensions = {
+                ...(entry.extensions || {}),
+                [WORLD_REPORT_METADATA_KEY]: {
+                    reportId,
+                    periodLabel,
+                    selectedLocations: [...selectedLocations],
+                },
+            };
+            try {
+                const response = await fetch('/api/worldinfo/edit', {
+                    method: 'POST',
+                    headers: getRequestHeaders(),
+                    body: JSON.stringify({ name: worldBookName, data: freshWorldBook }),
+                });
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+            } catch (error) {
+                console.warn('[RPG Tracker] Could not persist World Report routing metadata through the API.', error);
+            }
+            if (!ownsChat()) return abortForChatChange();
+            try { await ctx.saveWorldInfo(worldBookName, freshWorldBook); } catch (_) {}
+            if (!ownsChat()) return abortForChatChange();
+        }
         const allWorldIds = sorted.map(([uid]) => `${worldBookName}::${uid}`);
         const toActivate = allWorldIds.slice(-keepActive);
         const toDeactivate = allWorldIds.slice(0, Math.max(0, allWorldIds.length - keepActive));
@@ -4139,30 +5463,52 @@ ${historicalDump}`;
             const freshArchive = {};
             for (const n of Object.keys(archiveBooks)) {
                 try { const b = await ctx.loadWorldInfo(n); if (b?.entries) freshArchive[n] = b; } catch (_) {}
+                if (!ownsChat()) return abortForChatChange();
             }
             freshArchive[worldBookName] = freshWorldBook;
+            if (!ownsChat()) return abortForChatChange();
             await applyAction({
                 activate: toActivate,
                 deactivate: toDeactivate,
                 reason: `World Progression: rolling window (keep ${keepActive} active)`,
-            }, freshArchive, timeStr, '');
+            }, freshArchive, timeStr, '', false, { canCommit: ownsChat });
+            if (!ownsChat()) return abortForChatChange();
         }
     }
 
     // 9. Advance the timer — only the period label is stored; numeric field is legacy.
+    if (!ownsChat()) return abortForChatChange();
     settings.worldProgressionLastFiredPeriodLabel = periodLabel;
+    settings.worldProgressionLocationLastAdvanced = stampLocationAdvancement(
+        settings.worldProgressionLocationLastAdvanced,
+        selectedLocations,
+        periodLabel,
+    );
     persistWorldProgressionTimer();
 
     broadcastStep('finish', `\uD83C\uDF0D World Progression: "${periodLabel}" report saved.`);
     if (typeof globalThis._rpgRenderRouterUI === 'function') {
         globalThis._rpgRenderRouterUI();
     }
+    releaseWorldProgressionController();
+    return {
+        ok: true,
+        reportContent: reportContent.trim(),
+        periodLabel,
+        reportId,
+        selectedLocations,
+    };
+    } catch (e) {
+        if (e?.name === 'AbortError' || !ownsChat()) return abortForChatChange();
+        releaseWorldProgressionController();
+        throw e;
+    }
 }
 // -- World Skeleton ------------------------------------------------------------------
 
 /**
- * Parses the raw LLM output from the skeleton generation pass into individual
- * lore records, grouped by section header (## FACTIONS, ## LOCATIONS, etc.).
+ * Parses the raw LLM output from the skeleton generation pass into macro
+ * premise records, grouped by section header (## FACTIONS, ## LOCATIONS, etc.).
  * Returns an array of { label, content, category } objects.
  * @param {string} rawText
  * @returns {Array<{label: string, content: string, category: string}>}
@@ -4173,8 +5519,6 @@ function parseSkeletonOutput(rawText) {
         'FACTION': 'FAC',
         'LOCATIONS': 'LOC',
         'LOCATION': 'LOC',
-        'NPCS': 'NPC',
-        'NPC': 'NPC',
         'CONFLICTS': 'EVENT',
         'CONFLICT': 'EVENT',
         'EVENTS': 'EVENT',
@@ -4183,7 +5527,7 @@ function parseSkeletonOutput(rawText) {
     const records = [];
     const lines = rawText.split('\n');
     
-    let currentCategory = 'NPC';
+    let currentCategory = null;
     let currentItem = null;
 
     const sectionRegex = /^##\s+([A-Z]+)/i;
@@ -4203,9 +5547,13 @@ function parseSkeletonOutput(rawText) {
                 currentItem = null;
             }
             const key = secMatch[1].toUpperCase();
-            currentCategory = categoryMap[key] || 'NPC';
+            currentCategory = categoryMap[key] || null;
             continue;
         }
+
+        // Unknown sections — notably the retired NPC/NPCS category emitted by
+        // an old custom prompt — are intentionally ignored.
+        if (!currentCategory) continue;
 
         // 2. Check for ### Sub-header
         const subMatch = line.match(subHeaderRegex);
@@ -4267,136 +5615,19 @@ function parseSkeletonOutput(rawText) {
         }
     }
 
-    return records.filter(r => r.label && r.content);
-}
-
-/**
- * Auto-generates skeleton NPCs when the pool is below the requested count.
- * Operates in informational isolation — receives only the skeleton theme, atmosphere
- * summary, and existing skeleton faction/location/conflict names.
- * Never sees narrative content, active NPC stats, quest details, or player logs.
- *
- * @param {number} missingCount  Number of NPCs to generate
- * @param {string} atmosphere    Atmosphere summary (single paragraph, required foundation for skeleton generation)
- * @param {Array}  factionDescs  Array of {name, desc} from skeleton factions
- * @param {Array}  conflictNames Skeleton conflict/event names (names only)
- * @param {Array}  locationDescs Array of {name, desc} from skeleton locations
- * @param {Object} archiveBooks  Loaded lorebook map for writing back to skeleton
- * @returns {Promise<string[]>}  Names of newly created skeleton NPCs
- */
-async function runSkeletonGeneratorAgent(missingCount, atmosphere, factionDescs, conflictNames, locationDescs, archiveBooks) {
-    const settings = getSettings();
-    const prefix = getLivePrefix();
-    const skeletonBookName = prefix ? `${prefix}_Skeleton` : 'World_Skeleton';
-
-    const factionContext = factionDescs.length > 0
-        ? factionDescs.map(f => `- ${f.name}: ${f.desc}`).join('\n')
-        : '(none defined yet)';
-    const locationContext = locationDescs.length > 0
-        ? locationDescs.map(l => `- ${l.name}: ${l.desc}`).join('\n')
-        : '(none defined yet)';
-    const conflictContext = conflictNames.length > 0
-        ? conflictNames.map(n => `- ${n}`).join('\n')
-        : '(none defined yet)';
-
-    const systemPrompt =
-`You are a World Architect. Generate background skeleton NPCs for an RPG campaign simulation.
-These NPCs are undiscovered background characters — they have never appeared in the narrative.
-Do NOT reference any player characters, recent events, or narrative content.
-Output ONLY structured content:
-
-## NPCS
-### [Name]
-[Role in the world. Current situation or agenda in 1-2 sentences.]`;
-
-    let userPrompt = `## ATMOSPHERE / DESCRIPTION\n${atmosphere || '(No atmosphere description provided)'}\n\n`;
-    userPrompt +=
-`## EXISTING SKELETON CONTEXT (for thematic consistency — do not replicate)
-### Factions
-${factionContext}
-
-### Locations
-${locationContext}
-
-### Active Conflicts
-${conflictContext}
-
-Generate exactly ${missingCount} new skeleton NPC(s). Each must be unique, thematically consistent, and not affiliated with or named after any player character.`;
-
-    const routerSettings = {
-        connectionSource: settings.worldConnectionSource || 'default',
-        connectionProfileId: settings.worldConnectionProfileId,
-        completionPresetId: settings.worldCompletionPresetId,
-        ollamaUrl: settings.worldOllamaUrl,
-        ollamaModel: settings.worldOllamaModel,
-        openaiUrl: settings.worldOpenaiUrl,
-        openaiKey: settings.worldOpenaiKey,
-        openaiModel: settings.worldOpenaiModel,
-    };
-
-    const rawOutput = await sendStateRequest(routerSettings, systemPrompt, userPrompt);
-    if (!rawOutput?.trim()) throw new Error('Skeleton generator agent returned empty response');
-
-    const records = parseSkeletonOutput(rawOutput).filter(r => r.category === 'NPC');
-    if (records.length === 0) throw new Error('Skeleton generator: no NPC records parsed from output');
-
-    // Load or reuse the skeleton book
-    let skeletonBook = (archiveBooks && archiveBooks[skeletonBookName]) || null;
-    if (!skeletonBook || !skeletonBook.entries) {
-        const ctx = SillyTavern.getContext();
-        try { skeletonBook = await ctx.loadWorldInfo(skeletonBookName); } catch (_) {}
-        if (!skeletonBook || !skeletonBook.entries) {
-            skeletonBook = { entries: {}, name: skeletonBookName, scan_depth: 4, token_budget: 400, recursive: false, extensions: {} };
-        }
-    }
-
-    const existingUids = Object.keys(skeletonBook.entries).map(Number).filter(n => !isNaN(n));
-    let nextUid = existingUids.length > 0 ? Math.max(...existingUids) + 1 : 0;
-
-    const newNames = [];
-    for (const rec of records) {
-        skeletonBook.entries[nextUid] = {
-            uid: nextUid,
-            key: [],
-            keysecondary: [],
-            comment: `NPC: ${rec.label}`,
-            content: `[Day 0 Baseline — Auto-generated]\n${rec.content}`,
-            constant: false, selective: false, selectiveLogic: 0, addMemo: true,
-            order: 100, position: 0,
-            disable: true,
-            probability: 100, useProbability: false,
-            depth: 4, group: '', groupOverride: false, groupWeight: 100,
-            extensions: { rpgCategory: 'NPC', rpgSkeleton: true },
-        };
-        newNames.push(rec.label);
-        nextUid++;
-    }
-
-    const saveRes = await fetch('/api/worldinfo/edit', {
-        method: 'POST',
-        headers: getRequestHeaders(),
-        body: JSON.stringify({ name: skeletonBookName, data: skeletonBook })
-    });
-    if (!saveRes.ok) throw new Error(`Skeleton generator save failed: HTTP ${saveRes.status}`);
-
-    const ctx = SillyTavern.getContext();
-    try { await ctx.saveWorldInfo(skeletonBookName, skeletonBook); } catch (_) {}
-
-    if (archiveBooks) archiveBooks[skeletonBookName] = skeletonBook;
-
-    broadcastStep('thought', `\uD83E\uDDEC Skeleton Generator: ${newNames.length} NPC(s) created (${newNames.join(', ')}).`);
-    return newNames;
+    return records.filter(r => r.label && r.content && ['FAC', 'LOC', 'EVENT'].includes(r.category));
 }
 
 /**
  * Generates the World Skeleton: a hidden lorebook of foundational undiscovered
- * entities (factions, locations, NPCs, conflicts) seeded from the user's atmosphere summary.
+ * macro premises (factions, locations, conflicts) seeded from the user's Skeleton Source.
  * Saves all entries to [CampaignPrefix]_Skeleton. Overwrites any existing skeleton.
  *
- * @param {string} atmosphereSummary - User-provided setting/atmosphere summary for the world
+ * @param {string} atmosphereSummary - User-provided Skeleton Source material (legacy setting name retained)
  * @returns {Promise<number>} Number of skeleton entries created
  */
 export async function runSkeletonGenerationPass(atmosphereSummary, append = false, useExisting = true) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     const settings = getSettings();
     const prefix = getLivePrefix();
     const skeletonBookName = prefix ? `${prefix}_Skeleton` : 'World_Skeleton';
@@ -4407,8 +5638,10 @@ export async function runSkeletonGenerationPass(atmosphereSummary, append = fals
     let skeletonBook = null;
     if (append) {
         try {
-            skeletonBook = await ctx.loadWorldInfo(skeletonBookName);
-        } catch (_) {}
+            skeletonBook = chatCommitResult(ownsChat, await ctx.loadWorldInfo(skeletonBookName));
+        } catch (_) {
+            assertChatCommit(ownsChat);
+    }
     }
     if (!skeletonBook || !skeletonBook.entries) {
         skeletonBook = { entries: {}, name: skeletonBookName, scan_depth: 4, token_budget: 400, recursive: false, extensions: {} };
@@ -4416,35 +5649,64 @@ export async function runSkeletonGenerationPass(atmosphereSummary, append = fals
 
     const factionCount = settings.worldProgressionSkeletonFactions ?? 4;
     const locationCount = settings.worldProgressionSkeletonLocations ?? 4;
-    const npcCount = settings.worldProgressionSkeletonNPCs ?? 0;
     const conflictCount = settings.worldProgressionSkeletonConflicts ?? 3;
     const atmosphere = (atmosphereSummary || settings.worldProgressionSkeletonAtmosphereSummary || '').trim();
 
-    const systemPrompt = (settings.worldProgressionSkeletonSystemPrompt || '')
+    let systemPrompt = (settings.worldProgressionSkeletonSystemPrompt || '')
         .replace(/\{factionCount\}/g, String(factionCount))
         .replace(/\{locationCount\}/g, String(locationCount))
-        .replace(/\{npcCount\}/g, String(npcCount))
         .replace(/\{conflictCount\}/g, String(conflictCount));
+
+    systemPrompt += `\n\n## MACRO-ONLY SKELETON CONTRACT (AUTHORITATIVE)
+- The World Skeleton contains only FACTIONS, LOCATIONS, and CONFLICTS/EVENTS.
+- Never create an NPC/NPCS section or a named-individual skeleton entry.
+- Named individuals in source material are canon constraints only. Do not extract, duplicate, or transform them into skeleton entries.
+- World Progression advances locations and wider currents; ordinary NPC lore is created by the GM and Lorebook Agent when an individual becomes real in play.`;
+
+    let sourceLorebooksStr = '';
+    if (settings.worldProgressionSkeletonUseLorebooks) {
+        let sourceBookNames = Array.isArray(settings.worldProgressionSkeletonLorebookFilter)
+            ? settings.worldProgressionSkeletonLorebookFilter
+            : [];
+        if (sourceBookNames.length === 0) {
+            sourceBookNames = chatCommitResult(ownsChat, await getWorldInfoNamesSafe());
+        }
+        sourceLorebooksStr = chatCommitResult(ownsChat, await buildSkeletonLorebookSourceContext(
+            sourceBookNames,
+            bookName => ctx.loadWorldInfo(bookName),
+            { lorebookOnly: !!settings.worldProgressionSkeletonLorebookOnly },
+        ));
+        if (settings.worldProgressionSkeletonLorebookOnly) {
+            if (!sourceLorebooksStr) {
+                throw new Error('Lorebook-only mode is enabled, but the selected source lorebooks contain no usable entries.');
+            }
+            systemPrompt += `\n\n## LOREBOOK-ONLY MODE — OVERRIDES EXACT COUNTS
+Only output factions, locations, and conflicts explicitly mentioned in the supplied lorebook source material. Do not invent, infer, or extrapolate premises. Ignore the requested category counts; output the eligible macro premises established by the source material, and omit an empty category section. Never output named individuals.`;
+        }
+    }
 
     // Gather existing entity details to avoid duplication and provide full context
     let existingEntitiesStr = '';
     if (append && useExisting && skeletonBook.entries) {
         const entries = Object.values(skeletonBook.entries)
-            .filter(e => e.comment && e.content);
+            .filter(e => e.comment && e.content && ['FAC', 'LOC', 'EVENT'].includes(e.extensions?.rpgCategory));
         if (entries.length > 0) {
             const formattedEntries = entries.map(e => {
                 const cleanContent = e.content.replace(/^\[Day 0 Baseline\]\n?/i, '').trim();
                 return `### ${e.comment}\n${cleanContent}`;
             }).join('\n\n');
-            existingEntitiesStr = `Avoid duplicating these or generating similar entities. Build on top of or expand this context with new, unique entities:\n\n${formattedEntries}`;
+            existingEntitiesStr = `Avoid duplicating these or generating similar premises. Build on top of or expand this context with new, unique macro premises:\n\n${formattedEntries}`;
         }
     }
 
-    let userPrompt = `## ATMOSPHERE / DESCRIPTION\n${atmosphere || '(No atmosphere description provided — generate a generic fantasy world skeleton.)'}\n\n`;
-    if (existingEntitiesStr) {
-        userPrompt += `## EXISTING SKELETON ENTITIES\n${existingEntitiesStr}\n\n`;
+    let userPrompt = `## SKELETON SOURCE\n${atmosphere || '(No written Skeleton Source provided — use the other supplied source material.)'}\n\n`;
+    if (sourceLorebooksStr) {
+        userPrompt += `${sourceLorebooksStr}\n\n`;
     }
-    userPrompt += `Generate ${append ? 'additional' : 'the'} world skeleton ${append ? 'entities' : ''} now.`;
+    if (existingEntitiesStr) {
+        userPrompt += `## EXISTING SKELETON PREMISES\n${existingEntitiesStr}\n\n`;
+    }
+    userPrompt += `Generate ${append ? 'additional' : 'the'} world skeleton ${append ? 'premises' : ''} now.`;
 
     const routerSettings = {
         connectionSource: settings.worldConnectionSource || 'default',
@@ -4459,8 +5721,10 @@ export async function runSkeletonGenerationPass(atmosphereSummary, append = fals
 
     let rawOutput;
     try {
-        rawOutput = await sendStateRequest(routerSettings, systemPrompt, userPrompt);
+        rawOutput = chatCommitResult(ownsChat, await sendStateRequest(routerSettings, systemPrompt, userPrompt));
     } catch (e) {
+        assertChatCommit(ownsChat);
+
         broadcastStep('error', `World Skeleton generation failed: ${e.message}`);
         throw e;
     }
@@ -4485,7 +5749,7 @@ export async function runSkeletonGenerationPass(atmosphereSummary, append = fals
     }
 
     for (const rec of records) {
-        const prefixMap = { 'FAC': 'FACTION', 'LOC': 'LOCATION', 'NPC': 'NPC', 'EVENT': 'CONFLICT' };
+        const prefixMap = { 'FAC': 'FACTION', 'LOC': 'LOCATION', 'EVENT': 'CONFLICT' };
         const typePrefix = prefixMap[rec.category] || 'ENTITY';
         const typePrefixedLabel = `${typePrefix}: ${rec.label}`;
 
@@ -4505,18 +5769,20 @@ export async function runSkeletonGenerationPass(atmosphereSummary, append = fals
         uid++;
     }
 
-    const saveRes = await fetch('/api/worldinfo/edit', {
+    const saveRes = chatCommitResult(ownsChat, await fetch('/api/worldinfo/edit', {
         method: 'POST',
         headers: getRequestHeaders(),
         body: JSON.stringify({ name: skeletonBookName, data: skeletonBook })
-    });
+    }));
     if (!saveRes.ok) {
         broadcastStep('error', `World Skeleton: Failed to save lorebook (HTTP ${saveRes.status})`);
         throw new Error(`Save failed: ${saveRes.status}`);
     }
 
     // Register book with ST's in-memory registry
-    try { await ctx.saveWorldInfo(skeletonBookName, skeletonBook); } catch (_) {}
+    try { chatCommitResult(ownsChat, await ctx.saveWorldInfo(skeletonBookName, skeletonBook)); } catch (_) {
+        assertChatCommit(ownsChat);
+    }
 
     // Register in campaignBooks if not already there
     const chatId = typeof globalThis._rpgCurrentChatId === 'function' ? globalThis._rpgCurrentChatId() : null;
@@ -4530,27 +5796,32 @@ export async function runSkeletonGenerationPass(atmosphereSummary, append = fals
     // Refresh the SillyTavern UI so it updates immediately without F5
     if (typeof ctx.executeSlashCommandsWithOptions === 'function') {
         try {
-            await new Promise(r => setTimeout(r, 300));
+            chatCommitResult(ownsChat, await new Promise(r => setTimeout(r, 300)));
             if (typeof ctx.updateWorldInfoList === 'function') {
-                await ctx.updateWorldInfoList();
+                chatCommitResult(ownsChat, await ctx.updateWorldInfoList());
             }
-            await ctx.executeSlashCommandsWithOptions(`/world state=on silent=true "${skeletonBookName}"`);
+            chatCommitResult(ownsChat, await ctx.executeSlashCommandsWithOptions(`/world state=on silent=true "${skeletonBookName}"`));
             if (typeof ctx.reloadWorldInfoEditor === 'function') {
                 ctx.reloadWorldInfoEditor(skeletonBookName, true);
             }
         } catch (uiErr) {
+            if (!ownsChat()) return;
+
             console.warn('[RPG Tracker] UI refresh after skeleton generation failed:', uiErr);
         }
     } else {
         setTimeout(async () => {
+            if (!ownsChat()) return;
             try {
                 if (typeof ctx.updateWorldInfoList === 'function') {
-                    await ctx.updateWorldInfoList();
+                    chatCommitResult(ownsChat, await ctx.updateWorldInfoList());
                 }
                 if (typeof ctx.reloadWorldInfoEditor === 'function') {
                     ctx.reloadWorldInfoEditor(skeletonBookName, true);
                 }
             } catch (uiErr) {
+                assertChatCommit(ownsChat);
+
                 console.warn('[RPG Tracker] UI refresh after skeleton generation failed:', uiErr);
             }
         }, 200);
@@ -4561,106 +5832,12 @@ export async function runSkeletonGenerationPass(atmosphereSummary, append = fals
 }
 
 /**
- * Promotes a skeleton entity to the active lorebook when the player discovers it.
- * Scans Historical World Reports for references to the entity and performs a merge
- * LLM pass to synthesize a cohesive, up-to-date lore entry incorporating both
- * the Day 0 stub and any off-screen history accumulated since then.
- *
- * @param {string} skeletonId     - "BookName::uid" of the skeleton entry to promote
- * @param {string} newLabel       - Label of the newly discovered entry (from Lorebook Agent)
- * @param {string} newContent     - Content of the newly discovered entry
- * @param {Object} archiveBooks   - Loaded lorebook map (from runWorldProgressionPass or applyAction)
- * @returns {Promise<{label: string, content: string, category: string}|null>}
- */
-export async function promoteSkeletonEntity(skeletonId, newLabel, newContent, archiveBooks) {
-    const [skeletonBookName, uid] = skeletonId.split('::');
-    const skeletonBook = archiveBooks[skeletonBookName];
-    if (!skeletonBook?.entries?.[uid]) return null;
-
-    const skeletonEntry = skeletonBook.entries[uid];
-    const skeletonContent = (skeletonEntry.content || '').trim();
-    const category = skeletonEntry.extensions?.rpgCategory || 'NPC';
-
-    // Gather historical world report references to this entity
-    const nameLower = newLabel.toLowerCase();
-    const historySnippets = [];
-    for (const [bookName, book] of Object.entries(archiveBooks)) {
-        if (!bookName.toLowerCase().endsWith('_world') && bookName.toLowerCase() !== 'world') continue;
-        const sorted = Object.entries(book.entries).sort(([a], [b]) => Number(a) - Number(b));
-        for (const [, entry] of sorted) {
-            if ((entry.content || '').toLowerCase().includes(nameLower)) {
-                const reportLabel = entry.comment || '(unknown period)';
-                historySnippets.push(`[${reportLabel}] ${(entry.content || '').trim()}`);
-            }
-        }
-    }
-
-    if (historySnippets.length === 0) {
-        // No off-screen history — simple merge of stub + scene entry
-        const merged = skeletonContent && newContent
-            ? `${newContent}\n\n[Prior State]\n${skeletonContent}`
-            : (newContent || skeletonContent);
-        // Delete skeleton entry
-        await deleteLorebookEntry(skeletonId);
-        return { label: newLabel, content: merged, category };
-    }
-
-    // Run merge LLM pass to synthesize a complete up-to-date entry
-    const settings = getSettings();
-    const systemPrompt = `You are a Lore Synthesizer. You will be given three pieces of information about an entity:
-1. Their original Day 0 background stub (how they were at campaign start)
-2. Their off-screen activity history extracted from World Progression reports
-3. A new scene-based description written after the player has encountered them
-
-Synthesize these into a single, cohesive, up-to-date lore entry. Write in third person.
-Preserve all specific names, facts, and events. Do not invent new information.
-Output ONLY the final lore entry text. No preamble, no labels, no meta-commentary.`;
-
-    const userPrompt = `## ENTITY: ${newLabel}
-
-## DAY 0 SKELETON STUB
-${skeletonContent}
-
-## OFF-SCREEN HISTORY (from World Progression reports)
-${historySnippets.join('\n\n---\n\n')}
-
-## NEW SCENE-BASED DESCRIPTION (player has now encountered this entity)
-${newContent}
-
-Synthesize the above into one complete, up-to-date lore entry.`;
-
-    const routerSettings = {
-        connectionSource: settings.worldConnectionSource || 'default',
-        connectionProfileId: settings.worldConnectionProfileId,
-        completionPresetId: settings.worldCompletionPresetId,
-        ollamaUrl: settings.worldOllamaUrl,
-        ollamaModel: settings.worldOllamaModel,
-        openaiUrl: settings.worldOpenaiUrl,
-        openaiKey: settings.worldOpenaiKey,
-        openaiModel: settings.worldOpenaiModel,
-    };
-
-    let mergedContent;
-    try {
-        mergedContent = await sendStateRequest(routerSettings, systemPrompt, userPrompt);
-    } catch (_) {
-        // Merge failed — fall back to simple concatenation
-        mergedContent = `${newContent}\n\n[Off-screen history]\n${historySnippets.join('\n\n')}`;
-    }
-
-    // Delete skeleton entry
-    await deleteLorebookEntry(skeletonId);
-
-    broadcastStep('thought', `\uD83D\uDDE6 Skeleton Promotion: "${newLabel}" promoted with ${historySnippets.length} history reference(s).`);
-    return { label: newLabel, content: (mergedContent || '').trim(), category };
-}
-
-/**
  * Manually consolidates a specific number of raw World Progression reports.
  * @param {number} targetCount - Number of raw reports to consolidate.
  * @returns {Promise<string>} - The consolidated label (e.g., "Days 1-7").
  */
 export async function runWorldProgressionConsolidationPass(targetCount) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     const settings = getSettings();
     const prefix = getLivePrefix();
     const worldBookName = prefix ? `${prefix}_World` : 'World';
@@ -4677,18 +5854,16 @@ export async function runWorldProgressionConsolidationPass(targetCount) {
     };
 
     const ctx = SillyTavern.getContext();
-    if (typeof ctx.updateWorldInfoList === 'function') {
-        try { await ctx.updateWorldInfoList(); } catch (_) {}
-    }
-
-    const allBookNames = await getWorldInfoNamesSafe();
+    const allBookNames = chatCommitResult(ownsChat, await getWorldInfoNamesSafe());
     const archiveBooks = {};
     for (const n of allBookNames) {
         if (prefix && !bookBelongsToPrefix(n, prefix)) continue;
         try {
-            const b = await ctx.loadWorldInfo(n);
+            const b = chatCommitResult(ownsChat, await ctx.loadWorldInfo(n));
             if (b?.entries) archiveBooks[n] = b;
-        } catch (_) {}
+        } catch (_) {
+            assertChatCommit(ownsChat);
+        }
     }
 
     const currentWorldBook = archiveBooks[worldBookName] ?? null;
@@ -4751,14 +5926,16 @@ ${rawDump}`;
 
     broadcastStep('thought', `\uD83C\uDF0D World Progression: Manually consolidating ${toConsolidate.length} reports into "${consolidatedLabel}"...`);
 
-    const consolidatedContent = await sendStateRequest(routerSettings, consolidationSystemPrompt, consolidationUserPrompt);
+    const consolidatedContent = chatCommitResult(ownsChat, await sendStateRequest(routerSettings, consolidationSystemPrompt, consolidationUserPrompt, null, { stream: true, debugSource: 'World Progression' }));
     if (!consolidatedContent || !consolidatedContent.trim()) {
         throw new Error("LLM returned an empty response during consolidation.");
     }
 
     // Reload for fresh write
     let freshBook = null;
-    try { freshBook = await ctx.loadWorldInfo(worldBookName); } catch (_) {}
+    try { freshBook = chatCommitResult(ownsChat, await ctx.loadWorldInfo(worldBookName)); } catch (_) {
+        assertChatCommit(ownsChat);
+    }
     if (!freshBook?.entries) freshBook = currentWorldBook;
 
     const allUids = Object.keys(freshBook.entries).map(Number).filter(n => !isNaN(n));
@@ -4787,29 +5964,32 @@ ${rawDump}`;
         settings.activeWorldKeys = (settings.activeWorldKeys || []).filter(k => k !== fullId);
     }
 
-    await fetch('/api/worldinfo/edit', {
+    chatCommitResult(ownsChat, await fetch('/api/worldinfo/edit', {
         method: 'POST',
         headers: getRequestHeaders(),
         body: JSON.stringify({ name: worldBookName, data: freshBook })
-    });
-    try { await ctx.saveWorldInfo(worldBookName, freshBook); } catch (_) {}
+    }));
+    try { chatCommitResult(ownsChat, await ctx.saveWorldInfo(worldBookName, freshBook)); } catch (_) {
+        assertChatCommit(ownsChat);
+    }
 
     broadcastStep('finish', `\uD83C\uDF0D World Progression: "${consolidatedLabel}" consolidated — ${toDeleteUids.length} raw reports removed.`);
     return consolidatedLabel;
 }
 
 /**
- * Generates a single paragraph Atmosphere Summary based on a lookback window of the chat.
+ * Generates a generalized single-paragraph Skeleton Source based on a chat lookback.
  * Uses sendStateRequest to execute the generation call.
  * @param {number} lookbackCount
  * @returns {Promise<string>}
  */
 export async function runAtmosphereGenerationPass(lookbackCount) {
+    const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
     const settings = getSettings();
     const ctx = SillyTavern.getContext();
     const chat = ctx.chat || [];
     if (chat.length === 0) {
-        throw new Error('No chat history available to generate atmosphere summary.');
+        throw new Error('No chat history available to generate Skeleton Source material.');
     }
 
     // Grab the last lookbackCount messages
@@ -4845,22 +6025,23 @@ export async function runAtmosphereGenerationPass(lookbackCount) {
     const formattedChatHistory = lines.join('\n\n');
 
     const systemPrompt =
-`You are a World Architect. Analyze the provided chat history segment and extract a concise, thematic Atmosphere Summary of the world setting.
+`You are a World Architect. Analyze the provided chat history segment and extract a concise, generalized Skeleton Source for world generation.
 
-## Atmosphere Summary Definition
-A single paragraph description of the social texture, recurring tensions, and thematic tone of this world.
-- Focus on the atmosphere, environment, social hierarchy, and mood.
-- Do NOT name specific characters or list specific plot events.
-- Keep it generalized to the setting.
-- Example: 'Poverty and desperation define daily life. The nobility maintains control through debt bondage. Corruption is endemic — even the church answers to noble patrons.'
+## Skeleton Source Definition
+A single paragraph describing the world's broad social texture, environment, hierarchy, technology or magic level, recurring tensions, and thematic tone.
+- Generalize from the setting rather than copying story entities verbatim.
+- Do NOT name or identify player characters, party members, NPCs, factions, institutions, locations, quests, or conflicts from the chat.
+- Do NOT list or summarize specific plot events.
+- Never turn a party member or current story participant into Skeleton Source material.
+- Do not invent facts unsupported by the chat.
 
-Output ONLY the single paragraph Atmosphere Summary. No preamble, no meta-commentary.`;
+Output ONLY the single-paragraph Skeleton Source. No preamble or meta-commentary.`;
 
     const userPrompt =
 `## RECENT CHAT HISTORY
 ${formattedChatHistory}
 
-Generate the Atmosphere Summary:`;
+Generate the Skeleton Source:`;
 
     const routerSettings = {
         connectionSource: settings.worldConnectionSource || 'default',
@@ -4884,7 +6065,7 @@ Generate the Atmosphere Summary:`;
         routerSettings.openaiModel = settings.openaiModel;
     }
 
-    const rawOutput = await sendStateRequest(routerSettings, systemPrompt, userPrompt);
+    const rawOutput = chatCommitResult(ownsChat, await sendStateRequest(routerSettings, systemPrompt, userPrompt));
     if (!rawOutput?.trim()) throw new Error('LLM returned an empty response.');
 
     // Clean up surrounding quotes/newlines

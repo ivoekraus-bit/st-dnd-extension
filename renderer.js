@@ -1,14 +1,16 @@
-import { getSettings, getBarBackground, getBarShowAsPercentage } from './state-manager.js';
+import { getSettings, getBarBackground, getBarShowAsPercentage, getBarAnimateChanges } from './state-manager.js';
 import { lookupCustomPortraitSrc } from './portrait-storage.js';
 import { escapeHtml, decodeHtml, highlightParens, highlightNumbers, parseInWorldTime, isRestTimeUnset, formatTimeDiff, isArchivedQuestStatus, questHasEffectiveDeadline, isEmergentQuest } from './memo-processor.js';
 import { BLOCK_ICONS, BLOCK_ORDER, PAGE_SIZE, NO_PAGINATE, renderStartingGearTierOptions } from './constants.js';
 import { isResolvedCombatantStatusLine, parseCombatSideHeader } from './src/state/combat-persistence.js';
+import { buildDisplayGroupRenderPlan } from './src/features/display-groups.js';
 
 // ── Renderer module: pure HTML string producers, localStorage helpers ──
 // No live DOM mutations. All functions return strings or void (localStorage).
 
 const DEFAULT_HP_COLOR = '#00ffaa';
 const DEFAULT_XP_COLOR = 'linear-gradient(90deg, #0088ff, #00d4ff)';
+const BUY_ME_A_COFFEE_ICON = new URL('./src/ui/buy_me_a_coffee-63ed78263f6e.svg', import.meta.url).href;
 
 /** CSS tint for any browser-supported solid color token (named or hexadecimal). */
 function makeColorTintStyle(color, backgroundPct = 12, borderPct = 40) {
@@ -21,6 +23,13 @@ function makeBarrelValueStyle(background) {
         return `background:${background};-webkit-background-clip:text;background-clip:text;color:transparent;`;
     }
     return `color:${background};`;
+}
+
+/** Machine-readable state used to animate a bar across full DOM refreshes. */
+function makeBarAnimationData(barId, current, max, kind = 'linear', animateOverride = null) {
+    if (!barId || !Number.isFinite(current) || !Number.isFinite(max) || max <= 0) return '';
+    const animate = animateOverride === null ? getBarAnimateChanges(barId) : !!animateOverride;
+    return ` data-rt-bar-id="${escapeHtml(barId)}" data-rt-bar-current="${current}" data-rt-bar-max="${max}" data-rt-bar-kind="${kind}" data-rt-bar-animate="${animate}"`;
 }
 
 /**
@@ -115,13 +124,20 @@ export function renderDayNightBadge(str) {
         'ac': 'text'
     };
 
-    export function renderSubFieldByRule(rule, line, barId = null) {
+    export function renderSubFieldByRule(rule, line, barId = null, options = {}) {
         const colonIdx = line.indexOf(':');
         // If there's no colon, the whole line is the value (no label)
         const hasLabel = colonIdx !== -1;
         const labelText = hasLabel ? line.substring(0, colonIdx + 1).trim() : '';
         const value     = hasLabel ? line.substring(colonIdx + 1).trim() : line.trim();
-        const labelStyle = rule.color ? ` style="color:${rule.color}"` : '';
+        // Badge color overrides belong to the badge value itself. Applying the
+        // same color to a preceding label (for example `Status:` in
+        // `Status: ((BADGEPINK)) Respected`) visually merges the label into the
+        // badge styling even though it is not part of the badge.
+        // A BAR color is a fill color, not a text color. Keeping it off the
+        // label means `Hunger: ((BARBLUE)) 75/100` colors only the bar.
+        const colorLabel = rule.color && !['badge', 'badge_colored', 'pills', 'pill_colored', 'hp_bar', 'xp_bar', 'progress'].includes(rule.renderType);
+        const labelStyle = colorLabel ? ` style="color:${rule.color}"` : '';
         const labelHtml  = labelText
             ? `<span class="rt-entity-sub-label"${labelStyle}>${escapeHtmlWithColor(labelText)}</span>`
             : '';
@@ -181,7 +197,7 @@ export function renderDayNightBadge(str) {
 
                         return `<div class="rt-entity-sub-line rt-barrel-row">
                             ${labelHtml}
-                            <div class="rt-barrel-track" aria-label="${escapeHtml(`${labelText || 'Value'} ${displayValue}`)}">
+                            <div class="rt-barrel-track"${makeBarAnimationData(barId, clamped, rangeMax, 'barrel', getBarAnimateChanges(positiveBarId) || getBarAnimateChanges(negativeBarId) || (options.customMarker && !!getSettings().animateAllCustomBarChanges))} aria-label="${escapeHtml(`${labelText || 'Value'} ${displayValue}`)}">
                                 <div class="rt-barrel-color-control rt-barrel-negative-control"${negativeRecolorData}></div>
                                 <div class="rt-barrel-color-control rt-barrel-positive-control"${positiveRecolorData}></div>
                                 <div class="rt-barrel-center-marker"></div>
@@ -209,7 +225,7 @@ export function renderDayNightBadge(str) {
                         : 'linear-gradient(90deg,#e74c3c,#c0392b)';
                     if (barId) barBg = getBarBackground(barId, barBg, pct);
 
-                    const recolorData = barId ? ` data-recolor-id="${escapeHtml(barId)}" data-recolor-current="${escapeHtml(barBg)}" title="Click to recolor"` : '';
+                    const recolorData = barId ? ` data-recolor-id="${escapeHtml(barId)}" data-recolor-current="${escapeHtml(barBg)}" data-recolor-explicit-color="${rule.color ? 'true' : 'false'}" title="Click to recolor"` : '';
 
                     const showAsPct = getBarShowAsPercentage(barId);
                     const dispCur = showAsPct ? Math.round(pct) : cur;
@@ -217,7 +233,7 @@ export function renderDayNightBadge(str) {
 
                     return `<div class="rt-entity-sub-line" style="gap:6px;">
                         ${labelHtml}
-                        <div class="rt-hp-bar-wrap"${recolorData} style="flex:1; position:relative; height:14px; border-radius:4px; overflow:hidden; background:rgba(255,255,255,0.1);">
+                        <div class="rt-hp-bar-wrap"${recolorData}${makeBarAnimationData(barId, cur, max, 'linear', getBarAnimateChanges(barId) || (options.customMarker && !!getSettings().animateAllCustomBarChanges))} style="flex:1; position:relative; height:14px; border-radius:4px; overflow:hidden; background:rgba(255,255,255,0.1);">
                             <div class="rt-hp-bar" style="width:${pct.toFixed(1)}%; height:100%; border-radius:4px; background:${barBg}; transition:width 0.3s;"></div>
                         </div>
                         <span style="font-size:0.82em; opacity:0.85; white-space:nowrap;">${dispCur}/${dispMax}${extra ? ' ' + escapeHtml(extra) : ''}</span>
@@ -288,7 +304,7 @@ export function renderDayNightBadge(str) {
                     const recolorData = barId ? ` data-recolor-id="${escapeHtml(barId)}" data-recolor-current="${escapeHtml(barBg)}" title="Click to recolor"` : '';
 
                     return `<div class="rt-entity-sub-line rt-progress-row">${labelHtml}
-                        <div class="rt-progress-bar-wrap"${recolorData}>
+                        <div class="rt-progress-bar-wrap"${recolorData}${makeBarAnimationData(barId, cur, max)}>
                             <div class="rt-progress-bar" style="width:${pct.toFixed(1)}%;background:${barBg};"></div>
                         </div>
                         <span class="rt-progress-label">${cur}/${max}${extra ? ' ' + escapeHtml(extra) : ''}</span>
@@ -342,7 +358,7 @@ export function renderDayNightBadge(str) {
 
                     return `<div class="rt-entity-sub-line rt-weight-row">${labelHtml}
                         <span class="rt-weight-icon">⚖️</span>
-                        <div class="rt-weight-bar-wrap"${recolorData}>
+                        <div class="rt-weight-bar-wrap"${recolorData}${makeBarAnimationData(barId, cur, max)}>
                             <div class="rt-weight-bar" style="width:${pct.toFixed(1)}%;background:${barBg};"></div>
                         </div>
                         <span class="rt-weight-label">${cur}/${max}${extra ? ' ' + escapeHtml(extra) : ''}</span>
@@ -386,22 +402,30 @@ export function renderDayNightBadge(str) {
                 return `<div class="rt-entity-sub-line">${labelHtml} ${escapeHtmlWithColor(value)}</div>`;
             }
             case 'slots': {
-                const pm = value.match(/(\d+)\s*\/\s*(\d+)/);
+                const pm = value.match(/(\d+(?:\.\d+)?|\.\d+)\s*\/\s*(\d+(?:\.\d+)?|\.\d+)/);
                 if (pm) {
-                    const cur = parseInt(pm[1], 10), max = parseInt(pm[2], 10);
+                    const rawCurrent = Number(pm[1]), rawMax = Number(pm[2]);
+                    const cur = Math.max(0, Math.min(rawCurrent, rawMax));
+                    const max = rawMax;
                     const extra = value.replace(pm[0], '').trim();
                     let barBg = rule.color ? rule.color : '#aaaaaa';
                     if (barId) barBg = getBarBackground(barId, barBg, max > 0 ? (cur/max)*100 : 0);
-                    const recolorData = barId ? ` data-recolor-id="${escapeHtml(barId)}" data-recolor-current="${escapeHtml(barBg)}" title="Click to recolor"` : '';
+                    const recolorData = barId ? ` data-recolor-id="${escapeHtml(barId)}" data-recolor-current="${escapeHtml(barBg)}"` : '';
                     
                     let slotsHtml = '';
-                    for (let i = 0; i < max; i++) {
-                        const isFilled = i < cur;
-                        slotsHtml += `<div class="rt-slot ${isFilled ? 'filled' : 'empty'}" style="${isFilled ? `background:${barBg};` : ''}"></div>`;
+                    for (let i = 0; i < Math.ceil(max); i++) {
+                        const fill = Math.max(0, Math.min(1, cur - i));
+                        const isFilled = fill >= 1;
+                        const isPartial = fill > 0 && fill < 1;
+                        const fillHtml = fill > 0
+                            ? `<span class="rt-slot-fill" style="width:${fill * 100}%;background:${barBg};"></span>`
+                            : '';
+                        slotsHtml += `<div class="rt-slot ${isFilled ? 'filled' : isPartial ? 'partial' : 'empty'}">${fillHtml}</div>`;
                     }
+                    const tooltip = `${labelText || 'Value'} ${pm[1]}/${pm[2]}${extra ? ` ${extra}` : ''}`;
                     
                     return `<div class="rt-entity-sub-line rt-slots-row">${labelHtml}
-                        <div class="rt-slots-container"${recolorData}>${slotsHtml}</div>
+                        <div class="rt-slots-container"${recolorData} title="${escapeHtml(tooltip)}" aria-label="${escapeHtml(tooltip)}">${slotsHtml}</div>
                         <span class="rt-slots-label">${extra ? escapeHtml(extra) : ''}</span>
                     </div>`;
                 }
@@ -469,7 +493,7 @@ export function renderDayNightBadge(str) {
                     if (barId) barBg = getBarBackground(barId, barBg, pct);
                     const recolorData = barId ? ` data-recolor-id="${escapeHtml(barId)}" data-recolor-current="${escapeHtml(barBg)}" title="Click to recolor"` : '';
                     
-                    const chargeHtml = `<div class="rt-battery-wrap ${isLow && cur === 0 ? 'empty-flash' : ''}"${recolorData} style="border-color:${barBg};">
+                    const chargeHtml = `<div class="rt-battery-wrap ${isLow && cur === 0 ? 'empty-flash' : ''}"${recolorData}${makeBarAnimationData(barId, cur, max)} style="border-color:${barBg};">
                         <div class="rt-battery-fill" style="width:${pct}%;background:${barBg};"></div>
                         <div class="rt-battery-nub" style="background:${barBg};"></div>
                     </div>`;
@@ -699,7 +723,8 @@ export function renderDayNightBadge(str) {
             const m = MARKER_TOKEN_RE.exec(remaining);
             if (!m) break;
 
-            const preText = remaining.slice(0, m.index).trim();
+            let preText = remaining.slice(0, m.index).trim();
+            preText = preText.replace(/^[-*+•–—]\s*/, '').trim();
             const markerType = m[1].toUpperCase();
             const colorSuffix = m[2] || null;
             const colorArg1 = m[3] || null;
@@ -798,35 +823,39 @@ export function renderDayNightBadge(str) {
         //   Marker-in-middle: [Epic] Sword - ((GAUGE)) 75/100 → preText="[Epic] Sword -", content="75/100"
         //   Marker-at-end:    [Epic] Sword - Durability 75/100 ((GAUGE)) → preText="[Epic] Sword - Durability 75/100", content=""
         //   With colon:       Durability: ((GAUGE)) 75/100   → preText="Durability:", content="75/100"
+        const cleanPre = (preText || '').replace(/^[-*+•–—]\s*/, '').trim();
         let reconstructedContent;
-        if (!preText) {
+        if (!cleanPre) {
             // ── Marker at start of line — content is everything ──
             reconstructedContent = content.trim();
         } else if (content.trim()) {
             // ── Marker in middle — text on both sides ──
-            if (preText.includes(':')) {
-                // preText already has colon structure (e.g. "Durability: ((GAUGE)) 75/100")
-                reconstructedContent = `${preText} ${content}`.trim();
+            if (cleanPre.includes(':')) {
+                // cleanPre already has colon structure (e.g. "Durability: ((GAUGE)) 75/100")
+                reconstructedContent = `${cleanPre} ${content}`.trim();
+            } else if (content.includes(':')) {
+                // content already has colon structure (e.g. "((BAR)) Health: 50/100")
+                reconstructedContent = `${cleanPre} ${content}`.trim();
             } else {
-                // No colon — synthesize one so preText becomes the label
-                reconstructedContent = `${preText}: ${content}`.trim();
+                // No colon — synthesize one so cleanPre becomes the label
+                reconstructedContent = `${cleanPre}: ${content}`.trim();
             }
         } else {
-            // ── Marker at end of line — content is empty, everything is in preText ──
-            if (preText.includes(':')) {
+            // ── Marker at end of line — content is empty, everything is in cleanPre ──
+            if (cleanPre.includes(':')) {
                 // Already has colon structure (e.g. "Durability: 75/100 ((GAUGE))")
-                reconstructedContent = preText.trim();
+                reconstructedContent = cleanPre.trim();
             } else {
                 // No colon. For progression types, try to split "Label X/Y" into "Label: X/Y"
                 // by finding the X/Y numeric pattern.
                 const PROGRESSION = new Set(['barrel', 'hp_bar', 'xp_bar', 'progress', 'clock', 'stars', 'weight', 'orbs', 'slots', 'phase', 'gauge', 'charge']);
                 const numMatch = PROGRESSION.has(rule.renderType)
-                    ? preText.match(/^(.*?)\s+(\d[\d,]*\s*\/\s*\d[\d,]*.*)$/)
+                    ? cleanPre.match(/^(.*?)\s+(\d[\d,]*\s*\/\s*\d[\d,]*.*)$/)
                     : null;
                 if (numMatch && numMatch[1].trim()) {
                     reconstructedContent = `${numMatch[1].trim()}: ${numMatch[2].trim()}`;
                 } else {
-                    reconstructedContent = preText.trim();
+                    reconstructedContent = cleanPre.trim();
                 }
             }
         }
@@ -842,7 +871,9 @@ export function renderDayNightBadge(str) {
             barId = `${tag}:${entityName}:${labelText}${ctxSuffix}`;
         }
 
-        return renderSubFieldByRule(rule, reconstructedContent, barId);
+        return renderSubFieldByRule(rule, reconstructedContent, barId, {
+            customMarker: rule.renderType === 'hp_bar' || rule.renderType === 'barrel',
+        });
     }
 
 
@@ -871,6 +902,8 @@ export function renderDayNightBadge(str) {
         if (segments.length === 0) return null;
         const usesExplicitColumns = line.includes('||');
         const usesTabStops = segments.some(segment => segment.tabStop !== undefined);
+        const compactPillRow = segments.length > 1 && segments.every(segment =>
+            ['pills', 'pill_colored', 'badge', 'badge_colored'].includes(segment.rule.renderType));
 
         const lineAnchor = (!entityName && lineIdx !== null) ? `L${lineIdx}` : '';
 
@@ -909,7 +942,7 @@ export function renderDayNightBadge(str) {
             return `<div class="${cellClass}"${layoutStyle}>${html}</div>`;
         }).join('');
 
-        return `<div class="rt-multi-marker-row${usesTabStops ? ' rt-multi-marker-row--tab-stops' : usesExplicitColumns ? ' rt-multi-marker-row--columns' : ''}">${childrenHtml}</div>`;
+        return `<div class="rt-multi-marker-row${usesTabStops ? ' rt-multi-marker-row--tab-stops' : usesExplicitColumns ? ' rt-multi-marker-row--columns' : ''}${compactPillRow ? ' rt-multi-marker-row--compact-pills' : ''}">${childrenHtml}</div>`;
     }
 
     export function renderLineInEntityContext(tag, line, entityName, rawLine) {
@@ -947,7 +980,7 @@ export function renderDayNightBadge(str) {
         // Plain kv fallback
         const kv = line.match(/^([^:]+):\s*(.+)$/);
         if (kv) return `<div class="rt-card-kv"><span class="rt-card-key">${escapeHtmlWithColor(kv[1].trim())}:</span><span class="rt-card-val">${escapeHtmlWithColor(kv[2].trim())}</span></div>`;
-        return `<div class="rt-card-item">${escapeHtmlWithColor(line.trim())}</div>`;
+        return `<div class="rt-card-item rt-card-item--plain">${escapeHtmlWithColor(line.trim())}</div>`;
     }
 
     /**
@@ -1202,6 +1235,7 @@ export function renderDayNightBadge(str) {
 
     const COLLAPSE_KEY = 'rpg_tracker_collapsed';
     const DETACHED_KEY = 'rpg_tracker_detached';
+    const PARTY_COMPACT_KEY = 'rpg_tracker_party_compact';
 
 
 
@@ -1228,6 +1262,22 @@ export function renderDayNightBadge(str) {
     }
     export function saveDetached(set) {
         localStorage.setItem(DETACHED_KEY, JSON.stringify([...set]));
+    }
+
+    export function loadPartyCompact() {
+        try { return localStorage.getItem(PARTY_COMPACT_KEY) === 'true'; }
+        catch { return false; }
+    }
+
+    export function savePartyCompact(on) {
+        try { localStorage.setItem(PARTY_COMPACT_KEY, String(!!on)); }
+        catch { /* ignore */ }
+    }
+
+    function renderPartyCompactButton(isOn) {
+        const active = isOn ? ' active' : '';
+        const title = isOn ? 'Show full party details' : 'Compact mode: portrait, name, and HP only';
+        return `<button type="button" class="rt-party-compact-btn${active}" data-tag="PARTY" aria-pressed="${isOn ? 'true' : 'false'}" title="${title}">Compact Mode</button>`;
     }
 
     const ACTIVE_TAB_KEY = 'rpg_tracker_active_tab';
@@ -1452,39 +1502,44 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
                     }
 
                     // 2. Entity anchor: classic "Name: X/Y HP ..." or explicit ((HP)) marker
-                    let hpMatch = line.match(/^(.+?):\s*([+-]?[\d,]+)(?:\/([\d,]+))?\s*HP\s*[:|,]?\s*(.*)$/i);
+                    let hpMatch = line.match(/^(.+?):\s*([+-]?[\d,]+|\?+)(?:\/([\d,]+|\?+))?\s*HP\s*[:|,]?\s*(.*)$/i);
                     const isHpMarker = (markerCode === 'HP' || markerCode === 'HPB' || markerCode === 'HPBAR');
 
                     // If marker is specifically ((HP)), try a more relaxed regex (optional HP suffix)
                     if (!hpMatch && isHpMarker) {
-                        hpMatch = line.match(/^(.+?):\s*([+-]?[\d,]+)(?:\/([\d,]+))?(?:\s*HP)?\s*[:|,]?\s*(.*)$/i);
+                        hpMatch = line.match(/^(.+?):\s*([+-]?[\d,]+|\?+)(?:\/([\d,]+|\?+))?(?:\s*HP)?\s*[:|,]?\s*(.*)$/i);
                     }
 
                     // Inline-marker fallback: line was rewritten to just the value portion
                     // (e.g. "HP: 20/20" or bare "20/20"). Use a flexible regex that makes the
                     // label prefix ("HP:") optional so both forms parse correctly.
                     if (!hpMatch && inlineEntityName) {
-                        hpMatch = line.match(/^(?:(.+?):\s*)?([+-]?\d[\d,]*)(?:\/(\d[\d,]*))?(?:\s*HP)?\s*[:|,]?\s*(.*)$/i);
+                        hpMatch = line.match(/^(?:(.+?):\s*)?([+-]?\d[\d,]*|\?+)(?:\/(\d[\d,]*|\?+))?(?:\s*HP)?\s*[:|,]?\s*(.*)$/i);
                     }
 
                     if (hpMatch) {
                         const [, nameRaw, curRaw, maxRaw, rest] = hpMatch;
                         // inlineEntityName takes priority (set when "Name ((BARGREEN)) x/y" is used)
                         const name = (inlineEntityName || nameRaw || '').trim();
-                        const cur = Number(curRaw.replace(/,/g, ''));
-                        const max = maxRaw ? Number(maxRaw.replace(/,/g, '')) : undefined;
-                        const hasMax = max !== undefined;
-                        const pct = hasMax ? Math.max(0, Math.min(100, (cur / max) * 100)) : 100;
+                        const unknownCurrent = /^\?+$/.test(curRaw);
+                        const unknownMax = maxRaw ? /^\?+$/.test(maxRaw) : false;
+                        const cur = unknownCurrent ? undefined : Number(curRaw.replace(/,/g, ''));
+                        const max = !maxRaw || unknownMax ? undefined : Number(maxRaw.replace(/,/g, ''));
+                        const hasMax = maxRaw !== undefined;
+                        const hasKnownRange = Number.isFinite(cur) && Number.isFinite(max) && max > 0;
+                        const unknownHp = unknownCurrent || unknownMax;
+                        // Unknown HP is a neutral full-width indicator, not an implied empty/dead bar.
+                        const pct = hasKnownRange ? Math.max(0, Math.min(100, (cur / max) * 100)) : 100;
                         // If an inline colored-bar rule was detected (e.g. ((BARGREEN))), use its
                         // color directly — don't override it with the damage-based red/yellow/green.
                         const hpColor = inlineBarRule?.color
                             ? inlineBarRule.color
-                            : (!hasMax ? DEFAULT_HP_COLOR : pct > 60 ? DEFAULT_HP_COLOR : pct > 30 ? '#ffaa00' : '#ff5555');
+                            : (unknownHp ? '#6b7280' : !hasMax ? DEFAULT_HP_COLOR : pct > 60 ? DEFAULT_HP_COLOR : pct > 30 ? '#ffaa00' : '#ff5555');
                         const status = (rest || '').trim().replace(/^\|\s*/, '');
                         
                         const showAsPct = getBarShowAsPercentage(`${tag}:${name}:HP`);
-                        const dispCur = showAsPct ? Math.round(pct) : curRaw;
-                        const dispMax = showAsPct ? 100 : maxRaw;
+                        const dispCur = showAsPct && hasKnownRange ? Math.round(pct) : curRaw;
+                        const dispMax = showAsPct && hasKnownRange ? 100 : maxRaw;
                         const label = hasMax ? `${dispCur}/${dispMax}` : `${curRaw}`;
 
                         currentEntity = name;
@@ -1495,13 +1550,13 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
                         if (inlineEntityName) {
                             results.push(`<div class="rt-entity-row" style="display:block; border-bottom:1px solid rgba(255,255,255,0.06); padding-bottom:6px;">
                                 <div class="rt-entity-name" style="font-size:1.1em; margin-bottom:6px;">${escapeHtmlWithColor(currentEntity)}</div>
-                                <div class="rt-hp-bar-wrap" title="Click to recolor HP" data-recolor-id="${escapeHtml(barId)}" data-recolor-current="${escapeHtml(barBg)}" style="position:relative; height:14px; border-radius:4px; overflow:hidden; background:rgba(255,255,255,0.1); margin-bottom:4px; width:100%;">
+                                <div class="rt-hp-bar-wrap${unknownHp ? ' rt-hp-unknown' : ''}" title="Click to recolor HP" data-recolor-id="${escapeHtml(barId)}" data-recolor-current="${escapeHtml(barBg)}" data-recolor-explicit-color="${inlineBarRule?.color ? 'true' : 'false'}"${hasKnownRange ? makeBarAnimationData(barId, cur, max) : ''} style="position:relative; height:14px; border-radius:4px; overflow:hidden; background:rgba(255,255,255,0.1); margin-bottom:4px; width:100%;">
                                     <div class="rt-hp-bar" style="width:${pct.toFixed(1)}%; height:100%; border-radius:4px; background:${barBg}; transition:width 0.3s;"></div>
                                 </div>
                                 <span class="rt-hp-label" style="display:block; font-size:0.82em; opacity:0.85; text-align:left; line-height:1.2;">${label}</span>
                             </div>`);
                         } else {
-                            results.push(`<div class="rt-entity-row"><div class="rt-entity-name">${escapeHtmlWithColor(currentEntity)}</div><div class="rt-hp-bar-wrap" title="Click to recolor HP" data-recolor-id="${escapeHtml(barId)}" data-recolor-current="${escapeHtml(barBg)}"><div class="rt-hp-bar" style="width:${pct.toFixed(1)}%;background:${barBg};"></div></div><span class="rt-hp-label">${label}</span></div>`);
+                            results.push(`<div class="rt-entity-row"><div class="rt-entity-name">${escapeHtmlWithColor(currentEntity)}</div><div class="rt-hp-bar-wrap${unknownHp ? ' rt-hp-unknown' : ''}" title="Click to recolor HP" data-recolor-id="${escapeHtml(barId)}" data-recolor-current="${escapeHtml(barBg)}" data-recolor-explicit-color="${inlineBarRule?.color ? 'true' : 'false'}"${hasKnownRange ? makeBarAnimationData(barId, cur, max) : ''}><div class="rt-hp-bar" style="width:${pct.toFixed(1)}%;background:${barBg};"></div></div><span class="rt-hp-label">${label}</span></div>`);
                         }
 
                         if (status) {
@@ -1822,6 +1877,7 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
 
                 for (let invIdx = 0; invIdx < lines.length; invIdx++) {
                     const line = lines[invIdx];
+                    const rawLine = rawLines[invIdx];
                     const asMarker = tryRenderMarker(line, tag, '', invIdx);
                     if (asMarker !== null) {
                         flushBullets();
@@ -1835,11 +1891,16 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
                         inventoryResults.push(`<div class="rt-inventory-subheader">${escapeHtml(headerText)}</div>`);
                         continue;
                     }
-                    // Original bullet/comma logic
-                    if (line.trim().match(/^[-*]\s+/)) {
-                        pendingBullets.push(line.trim().replace(/^[-*]\s*/, ''));
+                    // A bullet-delimited line is one complete item. Inspect rawLines here
+                    // because the shared preprocessor intentionally removes bullet markers
+                    // from `lines` before dispatching by block type. Item names may contain
+                    // commas (e.g. "Runekind, Quarterstaff +2") and must stay intact.
+                    const bulletRx = /^\s*[-*+•–—](?:\s+|(?=[A-Za-z]))/;
+                    if (bulletRx.test(rawLine)) {
+                        pendingBullets.push(rawLine.replace(bulletRx, '').trim());
                     } else {
-                        // Split on commas except when they are between digits (thousands separators) or inside parentheses
+                        // Preserve legacy non-bulleted, comma-separated inventory lines.
+                        // Do not split thousands separators or commas inside parentheses.
                         line.split(/(?<!\d),(?![^(]*\))|,(?!\d)(?![^(]*\))/).map(i => i.trim()).filter(Boolean)
                             .forEach(i => pendingBullets.push(i));
                     }
@@ -1921,7 +1982,7 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
         }
     }
 
-    export function renderMemoAsCards(memo, filterTag, sectionPages) {
+    export function renderMemoAsCards(memo, filterTag, sectionPages, uiOptions = {}) {
         if (!memo || !memo.trim()) {
             const obSettings = getSettings();
             const useDdMmYy = !!obSettings.useDdMmYyFormat;
@@ -1929,9 +1990,18 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
             const onboardingGenre = obSettings.onboardingGenre || 'fantasy';
             const onboardingGearTier = obSettings.onboardingGearTier || 'auto';
             const gearTierOptions = renderStartingGearTierOptions(onboardingGearTier);
+            const onboardingLevelIsNone = obSettings.onboardingLevel === 'none';
+            const onboardingLevelNum = onboardingLevelIsNone
+                ? null
+                : (parseInt(String(obSettings.onboardingLevel || 1), 10) || 1);
             const startDateInputVal = obSettings.initialDate && obSettings.initialDate !== 'Day 1' ? obSettings.initialDate : '01/01/2026';
+            const startTimeInputVal = obSettings.initialTime || '08:00 AM';
 
             return `<div class="rt-empty" style="text-align: left; align-items: flex-start; padding: 12px; gap: 10px; overflow-y: auto;">
+                <a class="rt-bmc-btn" href="https://buymeacoffee.com/multihog" target="_blank" rel="noopener noreferrer" title="Buy Me a Coffee">
+                    <img src="${escapeHtml(BUY_ME_A_COFFEE_ICON)}" alt="" width="14" height="20">
+                    <span>Buy Me a Coffee</span>
+                </a>
                 <div style="text-align: center; width: 100%; margin-bottom: 2px; flex-shrink: 0;">
                     <div class="rt-empty-icon rt-onboarding-crest" aria-label="Fencers guarding a shield">
                         <span class="rt-onboarding-crest-fencer" aria-hidden="true">🤺</span>
@@ -1949,7 +2019,7 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
 
                 <div class="rt-quickstart" id="rt-quickstart">
                     <div class="rt-quickstart-title">⚡ Instant Action</div>
-                    <div class="rt-quickstart-sub">Choose a genre, roll names until you find one you like, then begin. The extension uses your Narrator Configuration, rolls the rest of your character, builds a Lorebook Agent Player Card plus a name-only ST persona, and starts the adventure.</div>
+                    <div class="rt-quickstart-sub">Choose a genre, optionally enter a name or Initial Setup, then begin. Leave the name blank to let the AI choose it. The extension uses your Narrator Configuration, starts at Level 1 with 0 XP unless Random Level is on, rolls a class and other unspecified details, and builds a Lorebook Agent Player Card plus a name-only ST persona. Uncheck Send Starter Message if you want to type your own first action instead of letting the AI open the campaign.</div>
                     <div class="rt-quickstart-genres" role="group" aria-label="Quick Start genre">
                         <button type="button" class="rt-quickstart-genre-btn" data-genre="fantasy" aria-pressed="false">⚔️ Fantasy</button>
                         <button type="button" class="rt-quickstart-genre-btn" data-genre="realistic" aria-pressed="false">🏙️ Modern</button>
@@ -1957,11 +2027,43 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
                         <button type="button" class="rt-quickstart-genre-btn" data-genre="horror" aria-pressed="false">👻 Horror</button>
                     </div>
                     <div class="rt-quickstart-name-picker">
-                        <input type="text" class="rt-quickstart-name" id="rt-quickstart-name" placeholder="Roll or enter a name" aria-label="Instant Action character name" autocomplete="off" />
+                        <input type="text" class="rt-quickstart-name" id="rt-quickstart-name" placeholder="Optional — enter, roll, or let AI choose" aria-label="Optional Instant Action character name" autocomplete="off" />
                         <button type="button" class="rt-quickstart-roll-btn" id="rt-quickstart-roll-name" disabled>🎲 Roll Name</button>
                     </div>
+                    <label class="rt-quickstart-instructions-label" for="rt-quickstart-instructions">
+                        <span>Initial Setup (optional)</span>
+                        <small>Guide the character, setting, premise, or tone. Anything left unspecified is still randomized.</small>
+                    </label>
+                    <textarea class="rt-quickstart-instructions" id="rt-quickstart-instructions" rows="2" maxlength="1000" placeholder="e.g. A 28-year-old female ranger with a crossbow, starting in a storm-battered frontier town" aria-label="Optional Instant Action Initial Setup"></textarea>
+                    <div class="rt-quickstart-options">
+                        <div class="rt-quickstart-player-card-length">
+                            <label for="rt-quickstart-persona-words">Player Card length</label>
+                            <select id="rt-quickstart-persona-words" class="text_pole" aria-label="Instant Action Player Card word count">
+                                ${[100, 150, 200, 300, 400, 500, 750, 1000].map(n => {
+                                    const selected = String(obSettings.onboardingPersonaWords || '150') === String(n) ? ' selected' : '';
+                                    return `<option value="${n}"${selected}>${n} words</option>`;
+                                }).join('')}
+                                <option value="other"${obSettings.onboardingPersonaWords === 'other' ? ' selected' : ''}>Custom…</option>
+                            </select>
+                            <input id="rt-quickstart-persona-words-custom" type="number" class="text_pole" value="${escapeHtml(String(obSettings.onboardingPersonaWordsCustom || ''))}" style="display:${obSettings.onboardingPersonaWords === 'other' ? 'block' : 'none'}" placeholder="50–5000" min="50" max="5000" aria-label="Custom Instant Action Player Card word count" />
+                        </div>
+                        <div class="rt-quickstart-flag">
+                            <label for="rt-quickstart-random-level" title="When this is off, Instant Action starts at Level 1 with 0 XP. When it is on, a level from 1–10 is rolled. Initial Setup still wins if it names a level.">
+                                <span>Random Level?</span>
+                                <input type="checkbox" id="rt-quickstart-random-level" ${obSettings.onboardingInstantActionRandomLevel === true ? 'checked' : ''} aria-label="Random Level" />
+                            </label>
+                            <span class="rt-cr-help-icon" title="When this is off, Instant Action starts at Level 1 with 0 XP. When it is on, a level from 1–10 is rolled. Initial Setup still wins if it names a level.">?</span>
+                        </div>
+                        <div class="rt-quickstart-flag">
+                            <label for="rt-quickstart-send-starter" title="If this is checked, the AI automatically starts the campaign as soon as the rolled character is ready.">
+                                <span>Send Starter Message?</span>
+                                <input type="checkbox" id="rt-quickstart-send-starter" ${obSettings.onboardingSendStarterMessage !== false ? 'checked' : ''} aria-label="Send Starter Message" />
+                            </label>
+                            <span class="rt-cr-help-icon" title="If this is checked, the AI automatically starts the campaign as soon as the rolled character is ready.">?</span>
+                        </div>
+                    </div>
                     <button type="button" class="rt-quickstart-begin-btn" id="rt-quickstart-begin" disabled>⚡ Begin Instant Action</button>
-                    <div class="rt-quickstart-status" id="rt-quickstart-status">Select a genre, then roll a name</div>
+                    <div class="rt-quickstart-status" id="rt-quickstart-status">Select a genre to begin</div>
                 </div>
 
                 <div class="rt-onboarding-secondary rt-onboarding-drawer rt-onboarding-other-drawer">
@@ -1975,11 +2077,12 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
                 <div style="display: flex; flex-direction: column; gap: 8px; width: 100%; margin: 4px 0; flex-shrink: 0;">
                     <div class="rt-onboarding-config-row">
                         <div class="rt-onboarding-field">
-                            <span class="rt-onboarding-field-label">Level</span>
+                            <span class="rt-onboarding-field-label">Level <span class="rt-cr-help-icon" title="Pick 'N/A' if your system doesn't use numeric character levels — Custom and Persona generation will not invent a level, XP, or D&D-style level indicator.">?</span></span>
                             <select id="rt-starting-level" class="text_pole" style="width: auto; min-width: 60px; padding: 2px 4px; font-size: 11px; height: 22px; border-radius: 4px; background: var(--black70a);">
+                                <option value="none"${onboardingLevelIsNone ? ' selected' : ''}>N/A — No Levels</option>
                                 ${[...Array(20).keys()].map(i => {
                                     const lvl = i + 1;
-                                    const isSel = lvl === parseInt(obSettings.onboardingLevel || '1') ? 'selected' : '';
+                                    const isSel = !onboardingLevelIsNone && lvl === onboardingLevelNum ? 'selected' : '';
                                     return `<option value="${lvl}" ${isSel}>Level ${lvl}</option>`;
                                 }).join('')}
                             </select>
@@ -2011,9 +2114,15 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
                                     <button type="button" data-value="12" class="${!use24h ? 'active' : ''}">12h</button>
                                     <button type="button" data-value="24" class="${use24h ? 'active' : ''}">24h</button>
                                 </div>
+                                <input type="text" id="rt-onboarding-start-time" class="text_pole" value="${startTimeInputVal}" placeholder="${use24h ? '08:00' : '08:00 AM'}" title="Initial time of day for the very first [TIME] block." style="width: 74px; text-align: center; height: 22px; font-size: 11px; border-radius: 4px; background: var(--black70a);" />
                             </div>
                         </div>
                     </div>
+                    <label style="display:flex; align-items:center; gap:5px; cursor:pointer; font-size:0.85em; margin: 2px 0;">
+                        <input type="checkbox" id="rt-onboarding-combat-guide-cb" ${obSettings.onboardingUseCombatScalingGuide !== false ? 'checked' : ''} />
+                        <span>Use Combat &amp; Skill Scaling Guide</span>
+                        <span class="rt-cr-help-icon" title="When enabled, the AI is guided by a classic d20/BAB-style combat and skill progression reference. Turn this off if you're using your own homebrew system and don't want D&D-flavored scaling language influencing Instant Action, Custom, Persona, or PC Import generation.">?</span>
+                    </label>
                     <textarea id="rt-onboarding-custom-instructions" class="text_pole" placeholder="Custom setting/character instructions (e.g. Victorian London, space marine, gritty realism, cyberpunk decker...)" style="width: 100%; min-height: 40px; max-height: 120px; font-size: 11px; padding: 4px 6px; border-radius: 4px; background: var(--black70a); resize: vertical; margin-top: 2px;">${escapeHtml(obSettings.onboardingCustomInstructions || '')}</textarea>
                     <div class="rt-quickstart-name-picker rt-onboarding-name-picker">
                         <input type="text" class="rt-quickstart-name" id="rt-onboarding-rolled-name" placeholder="Roll or enter a name" aria-label="Other Ways character name" autocomplete="off" />
@@ -2117,7 +2226,7 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
                         </select>
                         <button id="rt-cr-preset-load-btn" style="background:rgba(120,80,220,0.2); border:1px solid rgba(120,80,220,0.5); border-radius:4px; color:inherit; font-size:0.75em; padding:2px 8px; cursor:pointer; white-space:nowrap; flex-shrink:0;">Load</button>
                         <button id="rt-cr-preset-delete-btn" style="background:rgba(220,50,50,0.12); border:1px solid rgba(220,50,50,0.4); border-radius:4px; color:rgba(255,100,100,0.9); font-size:0.75em; padding:2px 8px; cursor:pointer; white-space:nowrap; flex-shrink:0;">Delete</button>
-                        <button id="rt-cr-preset-save-btn" title="Save current fields as a new preset" style="background:none; border:1px solid rgba(120,80,220,0.5); border-radius:4px; color:var(--rt-accent); font-size:0.75em; padding:2px 8px; cursor:pointer; white-space:nowrap; flex-shrink:0;">＋ Save</button>
+                        <button id="rt-cr-preset-save-btn" title="Save current fields as a preset" style="background:none; border:1px solid rgba(120,80,220,0.5); border-radius:4px; color:var(--rt-accent); font-size:0.75em; padding:2px 8px; cursor:pointer; white-space:nowrap; flex-shrink:0;">＋ Save</button>
                     </div>
                     <div class="rt-cr-row">
                         <div class="rt-cr-field">
@@ -2125,29 +2234,29 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
                                 <span>Name</span>
                                 <button id="rt-cr-random-name" class="interactable" style="background:none; border:none; color:var(--rt-accent); cursor:pointer; padding:0; margin:0; font-size:1.1em; line-height:1;" title="Roll a random name">🎲</button>
                             </label>
-                            <input id="rt-cr-name" class="text_pole rt-cr-input" type="text" placeholder="e.g. Lyra Ashford, Kael Vane…" />
+                            <input id="rt-cr-name" class="text_pole rt-cr-input" type="text" />
                         </div>
                         <div class="rt-cr-field">
                             <label class="rt-cr-label">Gender</label>
-                            <input id="rt-cr-gender" class="text_pole rt-cr-input" type="text" placeholder="e.g. Female, Male, Non-binary…" />
+                            <input id="rt-cr-gender" class="text_pole rt-cr-input" type="text" />
                         </div>
                         <div class="rt-cr-field">
                             <label class="rt-cr-label">Age</label>
-                            <input id="rt-cr-age" class="text_pole rt-cr-input" type="text" placeholder="e.g. 21, young adult…" />
+                            <input id="rt-cr-age" class="text_pole rt-cr-input" type="text" />
                         </div>
-                        <div class="rt-cr-field">
-                            <label class="rt-cr-label">Orientation</label>
-                            <input id="rt-cr-orientation" class="text_pole rt-cr-input" type="text" placeholder="e.g. Straight, Bisexual, Gay…" />
+                        <div class="rt-cr-field" style="flex:1.35 1 0%;">
+                            <label class="rt-cr-label" style="display:inline-flex; align-items:center; gap:3px; white-space:nowrap;">Sexual Orientation <span class="rt-cr-help-icon" style="width:14px;height:14px;font-size:0.65em;" title="Needed for the relationship system and CYOA romantic options — without this, NPC affection/romance targeting is guesswork.">?</span></label>
+                            <input id="rt-cr-orientation" class="text_pole rt-cr-input" type="text" />
                         </div>
                     </div>
                     <div class="rt-cr-row">
                         <div class="rt-cr-field">
                             <label class="rt-cr-label">Species</label>
-                            <input id="rt-cr-species" class="text_pole rt-cr-input" type="text" placeholder="e.g. Human, Orc, Goblin…" />
+                            <input id="rt-cr-species" class="text_pole rt-cr-input" type="text" />
                         </div>
                         <div class="rt-cr-field">
                             <label class="rt-cr-label">Ethnicity</label>
-                            <input id="rt-cr-ethnicity" class="text_pole rt-cr-input" type="text" placeholder="e.g. Caucasian, Asian, Hispanic…" />
+                            <input id="rt-cr-ethnicity" class="text_pole rt-cr-input" type="text" />
                         </div>
                     </div>
                     <div class="rt-cr-row">
@@ -2162,23 +2271,33 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
                             </select>
                         </div>
                         <div class="rt-cr-field">
-                            <label class="rt-cr-label">Level</label>
+                            <label class="rt-cr-label">Level <span class="rt-cr-help-icon" title="Pick 'N/A' if your system doesn't use numeric character levels — the AI will not invent a level, XP, or D&D-style level indicator.">?</span></label>
                             <select id="rt-cr-level" class="text_pole rt-cr-input">
-                                ${[...Array(20).keys()].map(i => { const l = i + 1; return `<option value="${l}"${l === parseInt(obSettings.onboardingLevel || '1') ? ' selected' : ''}>Level ${l}</option>`; }).join('')}
+                                <option value="none"${onboardingLevelIsNone ? ' selected' : ''}>N/A — No Levels (Custom System)</option>
+                                ${[...Array(20).keys()].map(i => { const l = i + 1; return `<option value="${l}"${!onboardingLevelIsNone && l === onboardingLevelNum ? ' selected' : ''}>Level ${l}</option>`; }).join('')}
                             </select>
                         </div>
                     </div>
                     <div class="rt-cr-row">
                         <div class="rt-cr-field">
-                            <label class="rt-cr-label">Gear Tier <span class="rt-cr-help-icon" title="How well-equipped the character should be — from mundane starter kit to heroic named gear. Auto scales with level.">?</span></label>
+                            <label class="rt-cr-label">Gear Tier <span class="rt-cr-help-icon" title="How well-equipped the character should be — from mundane starter kit to heroic named gear. Auto scales with level. Pick 'None' to skip all gear guidance.">?</span></label>
                             <select id="rt-cr-gear-tier" class="text_pole rt-cr-input">
                                 ${gearTierOptions}
                             </select>
                         </div>
                     </div>
+                    <div class="rt-cr-row">
+                        <div class="rt-cr-field" style="width:100%;">
+                            <label style="display:flex; align-items:center; gap:5px; cursor:pointer; font-size:0.88em; font-weight:normal;">
+                                <input type="checkbox" id="rt-cr-combat-guide-cb" ${obSettings.onboardingUseCombatScalingGuide !== false ? 'checked' : ''} />
+                                <span>Use Combat &amp; Skill Scaling Guide</span>
+                                <span class="rt-cr-help-icon" title="When enabled, the AI is guided by a classic d20/BAB-style combat and skill progression reference. Turn this off if you're using your own homebrew system and don't want D&D-flavored scaling language influencing the result.">?</span>
+                            </label>
+                        </div>
+                    </div>
                     <div class="rt-cr-row rt-cr-time-row">
                         <div class="rt-cr-field" style="width:100%;">
-                            <label class="rt-cr-label">Time &amp; Date <span class="rt-cr-help-icon" title="Calendar and clock format for [TIME] tracking in generated memos. Day 1 = narrative day count; DD/MM/YYYY = real calendar dates.">?</span></label>
+                            <label class="rt-cr-label">Time &amp; Date <span class="rt-cr-help-icon" title="Calendar and clock format for [TIME] tracking in generated memos. Day 1 = narrative day count; DD/MM/YYYY = real calendar dates. The last field sets the initial time of day for the very first [TIME] block.">?</span></label>
                             <div class="rt-cr-time-controls">
                                 <div class="rt-seg-toggle" id="rt-cr-date-seg" role="group" title="Choose the calendar format used for [TIME] tracking.">
                                     <button type="button" data-value="day" class="${!useDdMmYy ? 'active' : ''}">Day 1</button>
@@ -2189,6 +2308,7 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
                                     <button type="button" data-value="12" class="${!use24h ? 'active' : ''}">12h</button>
                                     <button type="button" data-value="24" class="${use24h ? 'active' : ''}">24h</button>
                                 </div>
+                                <input type="text" id="rt-cr-start-time" class="text_pole rt-cr-input" value="${startTimeInputVal}" placeholder="${use24h ? '08:00' : '08:00 AM'}" title="Initial time of day for the very first [TIME] block." style="width: 84px; text-align: center;" />
                             </div>
                         </div>
                     </div>
@@ -2210,11 +2330,11 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
                     <div class="rt-cr-row">
                         <div class="rt-cr-field">
                             <label class="rt-cr-label">Background <span class="rt-cr-help-icon" title="You don't need to write a full backstory. A brief hint guides the AI (e.g. 'grew up on the streets', 'ex-soldier', 'noble exile'). Leave blank and the AI will invent a fitting background.">?</span></label>
-                            <input id="rt-cr-background" class="text_pole rt-cr-input" type="text" placeholder="e.g. ex-soldier, raised in the slums…" />
+                            <input id="rt-cr-background" class="text_pole rt-cr-input" type="text" />
                         </div>
                         <div class="rt-cr-field">
                             <label class="rt-cr-label">Appearance <span class="rt-cr-help-icon" title="Just a hint is enough (e.g. 'tall, red hair, scar on cheek'). Leave blank and the AI will create a full appearance description.">?</span></label>
-                            <input id="rt-cr-appearance" class="text_pole rt-cr-input" type="text" placeholder="e.g. tall, dark hair, green eyes…" />
+                            <input id="rt-cr-appearance" class="text_pole rt-cr-input" type="text" />
                         </div>
                     </div>
                     <div class="rt-cr-field" style="width:100%;">
@@ -2255,38 +2375,60 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
 
                 <div class="rt-onboarding-divider"><span>How It Works</span></div>
 
-                <div class="rt-onboarding-chat-tip" role="note">
-                    <div class="rt-onboarding-chat-tip-title">Need help? Open <b>CHAT</b> in the State Tracker header</div>
-                    <div class="rt-onboarding-chat-tip-body">Talk to the <b>Adventure Companion</b> for help with Multihog or to discuss your story. Enable Tutorial Mode in CHAT when you want the full framework guide attached to every request. Or head to the Discord, under the Extensions subforum: <a href="https://discord.gg/sillytavern" target="_blank" rel="noopener noreferrer">https://discord.gg/sillytavern</a>. Hell, head there anyway!</div>
+                <div class="rt-onboarding-prompt-backup-note" role="note" style="font-size:12px;line-height:1.4;padding:8px 10px;border-left:3px solid var(--rt-accent);background:rgba(120,80,220,0.1);border-radius:4px;">
+                    <b>NOTE:</b> Multihog D&amp;D Framework auto-applies its own system prompt. If you want to restore your old prompt, go to the extension settings: General &amp; Visuals -> Core -> Restore backup to Main.
+                    <div style="margin-top:8px;">A summarizer is <b>mandatory</b> for this extension to compress the context. I recommend <a href="https://github.com/Lodactio/Extension-Summaryception" target="_blank" rel="noopener noreferrer">Summaryception</a>, which creates a summary and auto-ghosts/hides messages. You only need to have the narrator see the last 10 messages or so verbatim; the rest can be hidden away as memory is handled by Lorebook Agent (part of Multihog) and Summaryception.</div>
                 </div>
 
-                <div style="font-size: 13px; opacity: 0.9; display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; line-height: 1.4;">
+                <div class="rt-onboarding-how-it-works">
                     <div><b style="color: var(--rt-accent);">Auto-Tracking:</b> As you roleplay, the extension intelligently parses assistant responses using natural language. It detects losses of HP, new loot, or combat triggers, running background passes to update the state.</div>
 
                     <div><b style="color: var(--rt-accent);">Prompt Injection:</b> The State Memo and RNG Queue are injected seamlessly into your outgoing prompt. It acts as the "source of truth," assuring the narrator/GM model accurately sees HP, inventory, and mechanical outcomes. Buffs/debuffs tick down automatically based on in-story real-time passed. It JUST WORKS™!</div>
 
                     <div><b style="color: var(--rt-accent);">Lorebook Agent 🤖:</b> Open it from the <b>Lorebook Agent</b> tab at the top of the State Tracker panel and preferably detach it from the State Tracker UI. It autonomously manages your lorebook — creating, updating, activating, deactivating, and deleting entries as your story evolves. Click <b>?</b> inside the agent panel for full documentation.</div>
 
-                    <div><b style="color: var(--rt-accent);">World Progression 🌍:</b> Simulates off-screen world activity by generating reports of background events at regular in-world intervals (such as daily). You can seed the simulation with an optional World Skeleton to introduce undiscovered factions, locations, NPCs, and conflicts outside the narrative. It includes Focus Randomization to keep events varied, and Backlog Consolidation to periodically compress older reports and prevent token bloat. Configure these options inside the World Progression section of the Extension Settings menu (accessible via SillyTavern's Extensions panel).</div>
+                    <div><b style="color: var(--rt-accent);">World Progression 🌍:</b> Simulates location-scale conditions and wider currents at regular in-world intervals. It reads complete location lore dossiers without hidden maps, rotates through the least recently covered places, and writes directional prose for the narrator and later Map Evolution passes. A World Skeleton can seed undiscovered locations and regional context. Backlog Consolidation compresses older reports. Configure these options inside World Progression in Extension Settings.</div>
+
+                    <div><b style="color: var(--rt-accent);">Map Evolution 🗺️:</b> Makes maps/locations dynamic. Dungeons and towns evolve and generate story threads autonomously in the background (or even as you're in the location). Cleared half a dungeon, left, and then came back? The opposition may have gotten reinforcements or set up ambushes. Can be configured to run more or less often in the Persistent Maps section of the settings.</div>
+                </div>
+
+                <div class="rt-onboarding-divider"><span>Need Help</span></div>
+
+                <div class="rt-onboarding-chat-tip" role="note">
+                    <div class="rt-onboarding-chat-tip-title">Need help? Try these:</div>
+                    <ol class="rt-onboarding-help-list">
+                        <li>Watch <a href="https://www.youtube.com/watch?v=82Lt9pRYFS0" target="_blank" rel="noopener noreferrer">this basic video walkthrough</a> to get started.</li>
+                        <li>Talk to the <button type="button" class="rt-onboarding-open-chat" id="rt-onboarding-open-chat">Adventure Companion</button> bot. It has access to a large document regarding the extension when Tutorial Mode is enabled.</li>
+                    </ol>
                 </div>
 
                 <div class="rt-onboarding-divider"><span>Setup Guide</span></div>
 
-                <div style="font-size: 13px; opacity: 0.9; flex-shrink: 0; line-height: 1.4; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 12px;">
-                    <b style="color: var(--rt-accent); font-size: 14px;">Initial Setup:</b><br><br>
-                    1. Set your starting level, genre, and time/date format (Day vs. calendar date, 12h vs. 24h) in the controls above, then use the archetype buttons to roll a new character, or <b>manually describe a character</b> by clicking 💬.<br><br>
-                    2. Create a character card for your "narrator" (e.g. Game Master). <b>Leave the card fields empty</b>, as the framework handles all logic via the system prompt.<br><br>
-                    3. Toggle the options below — the system prompt is <b>applied automatically</b> whenever you change a setting.<br><br>
-                    4. Make sure your Persona in SillyTavern matches the character name in the State Tracker after character creation. You can also describe your character in Persona as normal in SillyTavern.<br><br>
-                    5. In SillyTavern, use the <b>Chat Completion API</b> and enable <b>Enable function calling</b> under <b>AI Response Configuration</b>. Otherwise the <b>RollTheDice</b> tool will not work. Alternatively, choose an RNG mode without tool calls in <b>Narrator Configuration</b> below (e.g. <b>Pre-Seeded Only</b> or <b>No RNG</b>).<br><br>
+                <div class="rt-onboarding-setup-guide">
+                    <b class="rt-onboarding-setup-title">Initial Setup:</b>
+                    <ol class="rt-onboarding-setup-list">
+                        <li><b>API must be Chat Completion</b> — SillyTavern lists the outdated Text Completion option first. If that is selected, this extension will not work. Open the left-side API dropdown and choose Chat Completion.</li>
+                        <li>Ensure <b>Function Calling</b> is enabled in your Chat Completion preset if you want Hybrid RNG tool rolls and the default Persistent Maps opener (<b>CreateAreaMap</b>). You can skip function calling: set the Map Architect opener to <b>Text command</b> under Narrator Configuration (when Persistent Maps is on), and use Pre-Seeded RNG. You <i>can</i> turn Persistent Maps off in Game Systems / Components.</li>
+                        <li>Set up your connections in the extension's connection settings. I recommend a lightweight, relatively fast and cheap model for everything but the main narrator/GM. More on that below.</li>
+                        <li>Create a narrator character card. Leave the card content empty, as the framework handles all logic via the system/Main ST prompt.
+                            <div class="rt-onboarding-gm-create">
+                                <label class="rt-onboarding-gm-label" for="rt-onboarding-gm-name">Narrator card name</label>
+                                <input id="rt-onboarding-gm-name" class="text_pole rt-onboarding-gm-name" type="text" value="Game Master" placeholder="Game Master" maxlength="120" aria-label="Narrator card name">
+                                <button type="button" class="rt-onboarding-open-chat" id="rt-onboarding-create-gm">Create narrator card</button>
+                            </div>
+                            <div class="rt-onboarding-gm-note">Multihog doesn&apos;t use a one-on-one chat format but uses a format written like a book, that seamlessly allows for multiple characters. The messages are attributed to a narrator, not a single character.</div>
+                        </li>
+                        <li>Use one of the character creation options above to roll a new character. You can either use the Character Creator option to clearly specify your character, use Other Ways to Begin for a more rough description, or use Instant Action to get started quicker.</li>
+                    </ol>
                     <div style="margin-top: 8px;">
-                        🪙 <b>Token Optimization:</b> To reduce token costs, especially when in tool use mode, consider using a summarizer such as the <b>Summaryception</b> extension. Summarization combined with <b>Lorebook Agent</b> will guarantee the AI stays on track and keep token costs low.
+                        🪙 <b>Token Optimization:</b> A summarizer that <b>hides verbatim messages</b> is essential — without it, tool-use and long chats will balloon token cost. Use something like <a href="https://github.com/Lodactio/Extension-Summaryception" target="_blank" rel="noopener noreferrer"><b>Summaryception</b></a> that auto-ghosts/hides older messages so the narrator only sees the last ~10 turns verbatim. Combined with <b>Lorebook Agent</b>, memory stays in lore and summaries instead of raw chat, which keeps the AI on track and the cost down.
                     </div>
                     <div style="margin-top: 12px;">
                         🤖 <b>What Model to Use?</b><br><br>
-                        <b>MiMo 2.5 Pro</b> or <b>DeepSeek 4 Pro</b>: both are great bang for the buck with high GM output quality. I use MiMo myself through OpenRouter — DeepSeek 4 Pro is another strong pick in the same tier. Try both and see which voice you prefer.<br><br>
-                        For the State Tracker and Lorebook Agent, I use <b>Gemini 3.1 Flash-Lite</b>. It's very inexpensive and handles the job amazingly well. Gemini 3 Flash or 3.5 Flash are of course even better, but I don't think they're needed. Flash-Lite does the job.<br><br>
-                        If your model thinks too long in combat, enable <b>Combat API Override</b> in State Tracker settings — it auto-switches when the <code>[COMBAT]</code> tag is active in the tracker and switches back when combat ends. <b>Gemini 3.5 Flash</b> is a great choice for this; set thinking to <b>Medium</b> so it still thinks a little.<br><br>
+                        For the narrator, I'd recommend trying at least the following:<br>
+                        <ul style="margin: 4px 0 10px 20px; padding-left: 16px;"><li>MiMo 2.5 Pro</li><li>Deepseek V4 Pro and latest Flash</li><li>GPT-5.6 Luna, for its great cost-efficiency. Seems to be a decent model overall.</li></ul>
+                        <i>For the State Tracker and Lorebook Agent, I've been recommending the Gemini Flash-Lite and Flash models. However, now I'm not sure at all anymore. Deepseek V4 Flash 0731 recently came out and is very promising, and the same goes for GPT-5.6 Luna. These are seriously inexpensive models and seem to be heavy-hitters in terms of performance.</i><br><br>
+                        <i>If your model thinks too long in combat, enable</i> <b>Combat API Override</b> <i>in State Tracker settings — it auto-switches when the</i> <code>[COMBAT]</code> <i>tag is active in the tracker and switches back when combat ends.</i> <b><i>This way you can have a faster model, so combat is faster.</i></b><br><br>
                         These are recommendations, not rules — experiment. Different models shine for different styles of play.
                     </div>
                 </div>
@@ -2366,28 +2508,45 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
                     <div style="display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; padding-left: 5px;">
                         <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
                             <input type="checkbox" id="rt_onboarding_mod_loot" />
-                            <span>🎲 Loot (Roll for Loot Quality)</span>
+                            <span>🎲 Loot Rolls</span>
                         </label>
                         <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
                             <input type="checkbox" id="rt_onboarding_mod_random_events" />
-                            <span>🌍 Random Events (Rolls on time skips and travel)</span>
+                            <span>🌍 Random Event Rolls</span>
                         </label>
                         <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
                             <input type="checkbox" id="rt_onboarding_mod_resting" />
-                            <span>💤 Time-Limited Resting and interruption rolls based on location danger</span>
+                            <span>💤 Resting Restrictions (=&gt;9h between rests)</span>
                         </label>
                         <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
                             <input type="checkbox" id="rt_onboarding_mod_party_bench" />
                             <span>⛺ Benched Party (Tracks temporarily separated companions)</span>
                         </label>
+                        <div>
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;" title="Builds a hidden location map before exploring a dungeon, ruin, town, or city. New maps need CreateAreaMap (function calling) or the text-command opener below.">
+                            <input type="checkbox" id="rt_onboarding_mod_dungeon_reality_and_hidden_mapping" />
+                            <span>🗺️ Persistent Maps</span>
+                        </label>
+                        <div id="rt_onboarding_map_architect_opener_wrap" style="padding-left: 20px; display: none; flex-direction: column; gap: 4px;">
+                            <span style="font-size: 0.75em; opacity: 0.6; text-transform: uppercase; font-weight: bold; margin-top: 2px;">Map Architect opener</span>
+                            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;" title="Default. The narrator calls CreateAreaMap; SillyTavern pauses the turn until the map is ready.">
+                                <input type="radio" name="rt_onboarding_map_architect_opener" value="tool" id="rt_onboarding_map_architect_opener_tool" />
+                                <span>Tool call (CreateAreaMap) — requires function calling</span>
+                            </label>
+                            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;" title="For models or presets without function calling. The narrator emits a [CREATE_AREA_MAP] block and stops; Map Architect runs, then narration continues.">
+                                <input type="radio" name="rt_onboarding_map_architect_opener" value="text" id="rt_onboarding_map_architect_opener_text" />
+                                <span>Text command — no function calling</span>
+                            </label>
+                        </div>
+                        </div>
                         <div style="display:flex;align-items:center;gap:6px;">
                             <input type="checkbox" id="rt_onboarding_mod_cyoa_mode" />
-                            <span>🧭 CYOA Mode (Numbered action choices at end of outputs)</span>
+                            <span>🧭 CYOA Mode (action choices every turn)</span>
                             <button id="rt_onboarding_cyoa_settings_btn" style="background:none;border:1px solid rgba(255,255,255,0.25);border-radius:4px;color:inherit;font-size:0.75em;padding:1px 6px;cursor:pointer;flex-shrink:0;opacity:0.8;" title="CYOA Settings"><i class="fa-solid fa-gear"></i></button>
                         </div>
                         <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
                             <input type="checkbox" id="rt_onboarding_mod_npc_rel_bars" />
-                            <span>💞 Relationship System (tracks each NPC's friendship and affection toward you)</span>
+                            <span>💞 Relationship System (Friendship &amp; Affection)</span>
                         </label>
                     </div>
 
@@ -2396,6 +2555,13 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
                     </button>
                 </div>
                 </div>
+                </div>
+                </div>
+                <div class="rt-onboarding-connection-shortcut" style="width:100%;flex-shrink:0;">
+                    <button type="button" class="menu_button interactable" id="rt-open-character-creation-connection-settings" style="width:100%;">
+                        <i class="fa-solid fa-plug-circle-bolt"></i> Character Creation Connection
+                    </button>
+                    <small>Shared by Character Creator, Instant Action, and Other Ways to Begin. Configure it under <b>Connections &amp; Models</b> in extension settings.</small>
                 </div>
             </div>`;
         }
@@ -2407,18 +2573,34 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
 
         const s = getSettings();
         const order = stripBenchedPartyTag(s.blockOrder || BLOCK_ORDER);
-        const sorted = [
+        let sorted = [
             ...order.filter(k => blocks[k] !== undefined),
             ...stripBenchedPartyTag(Object.keys(blocks).filter(k => !order.includes(k))).sort()
         ];
+        if (s.xpBarAtBottom === true && !filterTag) {
+            sorted = sorted.filter(tag => tag !== 'XP');
+        }
 
         const collapsed = loadCollapsed();
         const detached = loadDetached();
 
-        // If filtering by a single tag (detached window context)
-        const tagsToRender = filterTag ? [filterTag] : sorted;
+        // Detached/single-module contexts deliberately bypass Display Groups.
+        // Display Groups only change the main rendered composition.
+        if (filterTag) {
+            return renderSectionCard(filterTag, blocks, collapsed, detached, sectionPages, filterTag, uiOptions);
+        }
 
-        return tagsToRender.map(tag => renderSectionCard(tag, blocks, collapsed, detached, sectionPages, filterTag)).join('');
+        // A previously detached child keeps its established detached behavior
+        // instead of being silently duplicated inside a new virtual host.
+        const displayGroups = (s.displayGroups || []).map(group => ({
+            ...group,
+            members: (group?.members || []).filter(tag => !detached.has(String(tag).toUpperCase())),
+        }));
+        const renderPlan = buildDisplayGroupRenderPlan(sorted, displayGroups, s.displayGroupsEnabled);
+        return renderPlan.map(entry => entry.kind === 'group'
+            ? renderDisplayGroupCard(entry, blocks, collapsed, detached, sectionPages, s.displayGroupsShowGaps === true)
+            : renderSectionCard(entry.tag, blocks, collapsed, detached, sectionPages, null, uiOptions)
+        ).join('');
     }
 
     /**
@@ -2431,9 +2613,10 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
      * @param {Set<string>} detached
      * @param {object} sectionPages  mutable pagination state, keyed by tag
      * @param {string|null} filterTag  when set, hides the detach button and skips the detached-placeholder check
+     * @param {{fullViewSections?: string[], showCategorySettings?: boolean, bodyOnly?: boolean}} [uiOptions]
      * @returns {string}
      */
-    function renderSectionCard(tag, blocks, collapsed, detached, sectionPages, filterTag) {
+    function renderSectionCard(tag, blocks, collapsed, detached, sectionPages, filterTag, uiOptions = {}) {
         if (tag === 'QUESTS') return ''; // Quest log has dedicated high-fidelity renderer, skip standard card
         const content = blocks[tag];
         if (content === undefined && filterTag) {
@@ -2442,7 +2625,7 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
         if (content === undefined) return '';
 
         // If main panel context, filter out detached windows
-        if (!filterTag && detached.has(tag)) {
+        if (!uiOptions.bodyOnly && !filterTag && detached.has(tag)) {
             return `<div class="rt-detached-placeholder" data-tag="${tag}">
                 <span class="rt-placeholder-icon">⧉</span> ${tag} is detached
                 <button class="rt-reattach-btn-inline" data-tag="${tag}" title="Re-attach">↓</button>
@@ -2453,7 +2636,8 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
         const icon = customField?.icon || BLOCK_ICONS[tag] || '📄';
         const displayName = customField?.label || tag;
         const items = blockToItems(tag, content);
-        const isCollapsed = collapsed.has(tag);
+        const isCollapsed = !uiOptions.bodyOnly && collapsed.has(tag);
+        const isPartyCompact = tag === 'PARTY' && loadPartyCompact();
 
         let totalValueBadge = '';
         if (tag === 'INVENTORY' && items.totalValueGP && getSettings().showTotalInventoryValue !== false) {
@@ -2466,7 +2650,12 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
         }
 
         const renderType = customField?.renderType || tag;
-        const isFullView = getSettings().fullViewSections.includes(tag) || NO_PAGINATE.has(renderType);
+        const fullViewOverride = Array.isArray(uiOptions.fullViewSections)
+            ? new Set(uiOptions.fullViewSections.map(value => String(value).toUpperCase()))
+            : null;
+        const isFullView = (fullViewOverride
+            ? fullViewOverride.has(tag)
+            : getSettings().fullViewSections.includes(tag)) || NO_PAGINATE.has(renderType);
         const localPageSize = getPageSize(tag);
 
         const page = isFullView ? 0 : (sectionPages[tag] ?? 0);
@@ -2492,10 +2681,12 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
         ` : '';
 
         const personaFromCharBtn = tag === 'CHARACTER' ? `
-            <button class="rt-char-to-persona-btn" data-tag="CHARACTER" title="Create Lorebook Agent Player Card from this CHARACTER (uses sheet + last 3 story messages)">
-                👤
+            <button class="rt-char-to-persona-btn" data-tag="CHARACTER" title="Create a Lorebook Agent Player Card from this CHARACTER sheet (uses the sheet plus the last 3 story messages)">
+                Create PC Card
             </button>
         ` : '';
+
+        const partyCompactBtn = tag === 'PARTY' ? renderPartyCompactButton(isPartyCompact) : '';
 
         const fullViewBtn = NO_PAGINATE.has(renderType) ? '' : `
             <button class="rt-fullview-btn${isFullView ? ' active' : ''}" data-tag="${tag}" title="${isFullView ? 'Switch to Paged View' : 'Switch to Full List'}">
@@ -2522,22 +2713,59 @@ function formatValueToCurrency(totalCp, detectedCurrency) {
             benchedPanelHtml = renderBenchedPartyPanel(blocks['BENCHED PARTY'], collapsed.has('BENCHED PARTY'), loadBenchedExpanded());
         }
 
-        return `<div class="rt-section-card${isCollapsed ? ' rt-collapsed' : ''}" data-tag="${tag}">
+        const compactClass = isPartyCompact ? ' rt-party-compact' : '';
+        const bodyHtml = `<div class="${bodyClass}"${catStyleAttr}>${pageItems.join('')}${pagination}${benchedPanelHtml}</div>`;
+        if (uiOptions.bodyOnly) {
+            return `<div class="rt-display-group-member${compactClass}" data-member-tag="${tag}">${bodyHtml}</div>`;
+        }
+
+        return `<div class="rt-section-card${isCollapsed ? ' rt-collapsed' : ''}${compactClass}" data-tag="${tag}">
             <div class="rt-section-header" data-tag="${tag}">
                 <span>${icon} ${displayName}</span>
                 <div class="rt-section-header-right">
                     ${totalValueBadge}
                     ${personaFromCharBtn}
+                    ${partyCompactBtn}
                     ${detachBtn}
                     ${fullViewBtn}
-                    <button class="rt-category-settings-btn" data-tag="${tag}" title="Category Rendering Options">
+                    ${uiOptions.showCategorySettings === false ? '' : `<button class="rt-category-settings-btn" data-tag="${tag}" title="Category Rendering Options">
                         <i class="fa-solid fa-cog"></i>
-                    </button>
+                    </button>`}
                     <span class="rt-item-count">${items.length} ${items.length === 1 ? 'entry' : 'entries'}</span>
                     <span class="rt-collapse-icon">${isCollapsed ? '&#9656;' : '&#9662;'}</span>
                 </div>
             </div>
-            <div class="${bodyClass}"${catStyleAttr}>${pageItems.join('')}${pagination}${benchedPanelHtml}</div>
+            ${bodyHtml}
+        </div>`;
+    }
+
+    /** Render one virtual, display-only host with headerless member bodies. */
+    function renderDisplayGroupCard(entry, blocks, collapsed, detached, sectionPages, showGaps = true) {
+        const { key, group, tags } = entry;
+        const isCollapsed = collapsed.has(key);
+        const memberBodies = tags.map(tag => renderSectionCard(
+            tag,
+            blocks,
+            collapsed,
+            detached,
+            sectionPages,
+            null,
+            { bodyOnly: true, showCategorySettings: false, fullViewSections: tags },
+        )).join('');
+        if (!memberBodies) return '';
+
+        const partyCompactBtn = tags.includes('PARTY') ? renderPartyCompactButton(loadPartyCompact()) : '';
+
+        return `<div class="rt-section-card rt-display-group-card${isCollapsed ? ' rt-collapsed' : ''}" data-tag="${key}" data-display-group-id="${escapeHtml(group.id)}">
+            <div class="rt-section-header" data-tag="${key}">
+                <span>${escapeHtml(group.icon)} ${escapeHtml(group.name)}</span>
+                <div class="rt-section-header-right">
+                    ${partyCompactBtn}
+                    <span class="rt-item-count">${tags.length} ${tags.length === 1 ? 'module' : 'modules'}</span>
+                    <span class="rt-collapse-icon">${isCollapsed ? '&#9656;' : '&#9662;'}</span>
+                </div>
+            </div>
+            <div class="rt-section-body rt-display-group-body${showGaps ? '' : ' rt-display-group-body--seamless'}">${memberBodies}</div>
         </div>`;
     }
 
@@ -2713,10 +2941,13 @@ export function renderTabModeView(memo, sectionPages, questsCtx = null) {
 
     const s = getSettings();
     const order = stripBenchedPartyTag(s.blockOrder || BLOCK_ORDER);
-    const sorted = [
+    let sorted = [
         ...order.filter(k => blocks[k] !== undefined),
         ...stripBenchedPartyTag(Object.keys(blocks).filter(k => !order.includes(k))).sort()
     ];
+    if (s.xpBarAtBottom === true) {
+        sorted = sorted.filter(tag => tag !== 'XP');
+    }
 
     const collapsed = loadCollapsed();
     const detached = loadDetached();
@@ -2734,7 +2965,8 @@ export function renderTabModeView(memo, sectionPages, questsCtx = null) {
         tabTags = tabTags.filter(t => t !== 'QUESTS');
     }
 
-    if (tabTags.length === 0) {
+    const tabPlan = buildDisplayGroupRenderPlan(tabTags, s.displayGroups, s.displayGroupsEnabled);
+    if (tabPlan.length === 0) {
         return `<div class="rt-tabmode-wrap">
             <div class="rt-tabmode-pinned">${pinnedHtml}</div>
             ${vitalsHtml}
@@ -2742,16 +2974,24 @@ export function renderTabModeView(memo, sectionPages, questsCtx = null) {
         </div>`;
     }
 
+    const entryKey = entry => entry.kind === 'group' ? entry.key : entry.tag;
+    const tabKeys = tabPlan.map(entryKey);
     let activeTag = loadActiveTab();
-    if (!tabTags.includes(activeTag)) activeTag = tabTags[0];
+    if (!tabKeys.includes(activeTag)) activeTag = tabKeys[0];
 
-    const tabMeta = (tag) => {
+    const tabMeta = (entry) => {
+        if (entry.kind === 'group') return { icon: entry.group.icon, label: entry.group.name };
+        const tag = entry.tag;
         if (tag === 'QUESTS') return { icon: BLOCK_ICONS.QUESTS || '📋', label: 'Quests' };
         const customField = (s.customFields || []).find(f => f.tag.toUpperCase() === tag);
         return { icon: customField?.icon || BLOCK_ICONS[tag] || '📄', label: customField?.label || tag };
     };
 
-    const tabBadge = (tag) => {
+    const tabBadge = (entry) => {
+        if (entry.kind === 'group') {
+            return `<span class="rt-tab-badge" title="${entry.tags.length} grouped modules">${entry.tags.length}</span>`;
+        }
+        const tag = entry.tag;
         if (tag === 'QUESTS') {
             const count = questsCtx?.quests?.length || 0;
             return count > 0 ? `<span class="rt-tab-badge">${count}</span>` : '';
@@ -2768,26 +3008,45 @@ export function renderTabModeView(memo, sectionPages, questsCtx = null) {
         return badges;
     };
 
-    const tabBtnHtml = (tag) => {
-        const { icon, label } = tabMeta(tag);
-        const isActive = tag === activeTag;
-        return `<button class="rt-tab-btn${isActive ? ' active' : ''}" data-tag="${tag}" title="${escapeHtml(label)}">
-            <span class="rt-tab-icon">${icon}</span>${tabBadge(tag)}
+    const tabBtnHtml = (entry) => {
+        const key = entryKey(entry);
+        const { icon, label } = tabMeta(entry);
+        const isActive = key === activeTag;
+        return `<button class="rt-tab-btn${isActive ? ' active' : ''}" data-tag="${key}" title="${escapeHtml(label)}">
+            <span class="rt-tab-icon">${escapeHtml(icon)}</span>${tabBadge(entry)}
         </button>`;
     };
 
-    const tabStripHtml = `<div class="rt-tab-strip">${tabTags.map(tabBtnHtml).join('')}</div>`;
+    const tabStripHtml = `<div class="rt-tab-strip">${tabPlan.map(tabBtnHtml).join('')}</div>`;
 
-    const contentHtml = activeTag === 'QUESTS'
-        ? renderQuestLog(questsCtx?.quests || [], questsCtx?.currentTime || '', collapsed, detached, 'QUESTS')
-        : renderSectionCard(activeTag, blocks, collapsed, detached, sectionPages, activeTag);
+    const activeEntry = tabPlan.find(entry => entryKey(entry) === activeTag);
+    const contentHtml = activeEntry?.kind === 'group'
+        ? renderDisplayGroupCard(activeEntry, blocks, collapsed, detached, sectionPages, s.displayGroupsShowGaps === true)
+        : activeEntry?.tag === 'QUESTS'
+            ? renderQuestLog(questsCtx?.quests || [], questsCtx?.currentTime || '', collapsed, detached, 'QUESTS')
+            : renderSectionCard(activeEntry?.tag, blocks, collapsed, detached, sectionPages, activeEntry?.tag);
 
-    return `<div class="rt-tabmode-wrap" data-tab-order="${tabTags.join(',')}">
+    return `<div class="rt-tabmode-wrap" data-tab-order="${tabKeys.join(',')}">
         <div class="rt-tabmode-pinned">${pinnedHtml}</div>
         ${vitalsHtml}
         ${tabStripHtml}
         <div class="rt-tabmode-content" data-active-tag="${activeTag}">${contentHtml}</div>
     </div>`;
+}
+
+/**
+ * Render only the memo-backed XP row for the persistent bottom-of-panel bar.
+ * Keeping this sourced from blockToItems means it shares parsing, recoloring,
+ * percentage labels, and animation data attributes with the normal XP module.
+ * @param {string} memo
+ * @returns {string}
+ */
+export function renderBottomXpBar(memo) {
+    if (!memo || !memo.trim()) return '';
+    const blocks = parseMemoBlocks(memo);
+    if (blocks.XP === undefined) return '';
+    const xpRow = blockToItems('XP', blocks.XP).find(item => item.includes('class="rt-xp-row"'));
+    return xpRow ? `<div class="rt-bottom-xp-content">${xpRow}</div>` : '';
 }
 
 // ── Quest Log Renderer ─────────────────────────────────────────────────────

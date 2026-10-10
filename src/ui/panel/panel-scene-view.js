@@ -1,6 +1,19 @@
 import { runtimeState } from '../../app/runtime-state.js';
+import { createChatCommitGuard } from '../../state/pass-affinity.js';
+import { getActiveChatId } from '../../../state-manager.js';
+import { canUseSceneMemo } from '../../state/scene-affinity.js';
+import { isLocationMappingEnabled } from '../../state/section-enabled.js';
+import {
+    bindDungeonMapEmbedEvents,
+    captureDungeonMapViewport,
+    isDungeonMapDetached,
+    reattachDungeonMapPanel,
+    restoreDungeonMapViewport,
+    updateDetachedDungeonMapPanel,
+} from './dungeon-map-panel.js';
+import { createCoalescedRefresh } from './refresh-coalescer.js';
 
-/** Manages the Lorebook Agent Scene View and its Records/Visualization mode UI. */
+/** Manages the Lorebook Agent Scene View and its Records/Visuals/Map UI. */
 export function createSceneViewController({
     agentPanel,
     buildImmersionSceneState,
@@ -12,25 +25,50 @@ export function createSceneViewController({
     runRealtimeSceneArtCheck,
     showLocationImageSettingsMenu,
 }) {
-        const bindImmersionViewEvents = () => {
+        const openMappedLocation = async (path) => {
+            const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+            const item = await loadLocationEntryByPath(path);
+            if (!ownsChat()) return;
+            const opener = globalThis._rpgAgentOpenLocationDetail;
+            if (item && typeof opener === 'function') {
+                await opener(item, path);
+                return;
+            }
+            if (path) {
+                toastr.info(`No location record for "${path}" yet.`, 'Visuals/Map');
+            }
+        };
+
+        const mapHandlers = () => {
+            const ownsView = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+            return {
+                onAreaClick: (path) => { if (ownsView()) return openMappedLocation(path); },
+                onDetach: () => { void runtimeState.refreshImmersionView(); },
+                onReattach: () => { void runtimeState.refreshImmersionView(); },
+            };
+        };
+
+        const bindImmersionViewEvents = (scene) => {
+            const ownsView = createChatCommitGuard(getActiveChatId(), getActiveChatId);
             const root = agentPanel.querySelector('#rt-agent-immersion-view');
             if (!root) return;
 
             const hero = root.querySelector('.rt-immersion-hero-wrap');
             if (hero) {
                 const activateHero = async () => {
+                    if (!ownsView()) return;
                     const path = hero.getAttribute('data-loc-path');
                     const raw = hero.getAttribute('data-loc-raw');
                     if (path) {
                         const item = await loadLocationEntryByPath(path);
-                        const opener = globalThis._rpgAgentOpenLocationDetail;
-                        if (item && typeof opener === 'function') {
-                            await opener(item, path);
-                        } else {
-                            await showLocationImageSettingsMenu(path, () => runtimeState.refreshImmersionView(), item?.content || '');
-                        }
+                        if (!ownsView()) return;
+                        await showLocationImageSettingsMenu(
+                            path,
+                            () => runtimeState.refreshImmersionView(),
+                            item?.content || '',
+                        );
                     } else if (raw) {
-                        toastr.info(`No lore match for "${raw}". Add a Locations entry or check the name.`, 'Scene View');
+                        toastr.info(`No lore match for "${raw}". Add a Locations entry or check the name.`, 'Visuals/Map');
                     }
                 };
                 hero.addEventListener('click', () => { void activateHero(); });
@@ -46,10 +84,12 @@ export function createSceneViewController({
                 tile.addEventListener('click', (e) => {
                     e.stopPropagation();
                     void (async () => {
+                        if (!ownsView()) return;
                         if (tile.getAttribute('data-is-pc') === '1') {
                             let opener = globalThis._rpgAgentOpenPcDetail;
                             if (typeof opener !== 'function' && typeof globalThis._rpgRefreshAgentManifest === 'function') {
                                 await globalThis._rpgRefreshAgentManifest();
+                                if (!ownsView()) return;
                                 opener = globalThis._rpgAgentOpenPcDetail;
                             }
                             if (typeof opener === 'function') {
@@ -60,11 +100,13 @@ export function createSceneViewController({
                         const entryId = tile.getAttribute('data-npc-entry-id');
                         if (!entryId) return;
                         const item = await loadNpcEntryByKey(entryId);
+                        if (!ownsView()) return;
                         let opener = globalThis._rpgAgentOpenNpcDetail;
                         let parseRel = globalThis._rpgAgentParseRelationship;
                         if (typeof opener !== 'function' || typeof parseRel !== 'function') {
                             if (typeof globalThis._rpgRefreshAgentManifest === 'function') {
                                 await globalThis._rpgRefreshAgentManifest();
+                                if (!ownsView()) return;
                             }
                             opener = globalThis._rpgAgentOpenNpcDetail;
                             parseRel = globalThis._rpgAgentParseRelationship;
@@ -75,29 +117,9 @@ export function createSceneViewController({
                     })();
                 });
             });
-        };
 
-        runtimeState.refreshImmersionView = async () => {
-            const s = getSettings();
-            try {
-                const scene = await buildImmersionSceneState(s.currentMemo, s);
-                maybeAutoGenerateImmersionSceneArt(scene, () => { void runtimeState.refreshImmersionView(); });
-
-                if (!s.agentImmersionMode) return;
-                const container = agentPanel.querySelector('#rt-agent-immersion-view');
-                if (!container || agentPanel.style.display === 'none') return;
-                container.innerHTML = renderImmersionViewHtml(scene);
-                bindImmersionViewEvents();
-            } catch (err) {
-                console.error('[RPG Tracker] runtimeState.refreshImmersionView failed:', err);
-                const container = agentPanel.querySelector('#rt-agent-immersion-view');
-                if (container) {
-                    container.innerHTML = '<div style="text-align:center;opacity:0.5;font-size:0.769em;padding:10px;">Failed to load scene view.</div>';
-                }
-            }
+            bindDungeonMapEmbedEvents(root, { scene, ...mapHandlers() });
         };
-        globalThis._rpgRefreshImmersionView = runtimeState.refreshImmersionView;
-        globalThis._rpgCheckRealtimeSceneArt = runRealtimeSceneArtCheck;
 
         const syncAgentImmersionUi = () => {
             const s = getSettings();
@@ -107,34 +129,92 @@ export function createSceneViewController({
             const vizBtn = agentPanel.querySelector('#rt-agent-view-mode-visualization');
             const viewModeSwitch = agentPanel.querySelector('#rt-agent-view-mode-switch');
             const campaignTitle = agentPanel.querySelector('#rt-agent-campaign-header-title');
-            const locationsOn = !!s.locationImages;
-            let immersion = !!s.agentImmersionMode;
+            const visualsAvailable = !!s.locationImages || !!runtimeState.hasActiveDungeonMap;
+            const showImmersion = visualsAvailable && !!s.agentImmersionMode;
 
-            if (!locationsOn) {
-                if (immersion) {
-                    s.agentImmersionMode = false;
-                    immersion = false;
-                }
-                if (viewModeSwitch) viewModeSwitch.style.display = 'none';
-                if (campaignTitle) campaignTitle.style.display = 'block';
-            } else {
-                if (viewModeSwitch) viewModeSwitch.style.display = '';
-                if (campaignTitle) campaignTitle.style.display = 'none';
-            }
-
-            if (immersionEl) immersionEl.style.display = immersion ? 'flex' : 'none';
-            if (manifestEl) manifestEl.style.display = immersion ? 'none' : 'flex';
+            if (viewModeSwitch) viewModeSwitch.style.display = visualsAvailable ? '' : 'none';
+            if (campaignTitle) campaignTitle.style.display = visualsAvailable ? 'none' : 'block';
+            if (immersionEl) immersionEl.style.display = showImmersion ? 'flex' : 'none';
+            if (manifestEl) manifestEl.style.display = showImmersion ? 'none' : 'flex';
             if (recordsBtn) {
-                recordsBtn.classList.toggle('rt-agent-view-mode-btn-active', !immersion);
-                recordsBtn.setAttribute('aria-selected', !immersion ? 'true' : 'false');
+                recordsBtn.classList.toggle('rt-agent-view-mode-btn-active', !showImmersion);
+                recordsBtn.setAttribute('aria-selected', !showImmersion ? 'true' : 'false');
             }
             if (vizBtn) {
-                vizBtn.classList.toggle('rt-agent-view-mode-btn-active', immersion);
-                vizBtn.setAttribute('aria-selected', immersion ? 'true' : 'false');
+                vizBtn.classList.toggle('rt-agent-view-mode-btn-active', showImmersion);
+                vizBtn.setAttribute('aria-selected', showImmersion ? 'true' : 'false');
             }
         };
         globalThis._rpgSyncAgentImmersionUi = syncAgentImmersionUi;
 
+        const performImmersionRefresh = async () => {
+            const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+            const s = getSettings();
+            // Pin before lorebook await — a mid-refresh chat switch must not
+            // render the departing chat's scene or queue Real-Time gen into the
+            // arriving chat (runRealtimeSceneArtCheck has the same guard).
+            //
+            // onChatChanged flips runtimeState.currentChatId and kicks an
+            // "instant" manifest/immersion refresh BEFORE loadChatState replaces
+            // the live memo. Chat-id affinity alone then passes (id is already
+            // the arriving chat) while buildImmersionSceneState still captured
+            // the departing memo — which queued Real-Time location art into the
+            // wrong chat. Abort when the live memo was swapped mid-await; the
+            // post-loadChatState refresh will rebuild from the arriving partition.
+            const passChatId = runtimeState.currentChatId;
+            const memoAtStart = s.currentMemo;
+            if (!canUseSceneMemo(s, passChatId, memoAtStart)) return;
+            try {
+                const scene = await buildImmersionSceneState(memoAtStart, s, { chatId: passChatId });
+                if (!ownsChat()) return;
+                if (!canUseSceneMemo(getSettings(), passChatId, memoAtStart)) return;
+                runtimeState.hasActiveDungeonMap = !!scene.dungeonMap;
+                maybeAutoGenerateImmersionSceneArt(scene, () => { void runtimeState.refreshImmersionView(); }, { chatId: passChatId });
+                syncAgentImmersionUi();
+                if (isDungeonMapDetached()) {
+                    if (scene.dungeonMap) {
+                        updateDetachedDungeonMapPanel(scene, mapHandlers());
+                    } else {
+                        // Turning the component off must close a previously
+                        // detached map window rather than leaving stale UI.
+                        reattachDungeonMapPanel();
+                    }
+                }
+
+                const showImmersion = s.agentImmersionMode && (s.locationImages || runtimeState.hasActiveDungeonMap);
+                if (!showImmersion) return;
+                const container = agentPanel.querySelector('#rt-agent-immersion-view');
+                if (!container || agentPanel.style.display === 'none') return;
+                // Rebuilding the scene also recreates the graph's overflow element.
+                // Retain its pan position across Map Updater and other scene refreshes.
+                const mapViewport = captureDungeonMapViewport(container);
+                container.innerHTML = renderImmersionViewHtml(scene);
+                restoreDungeonMapViewport(container, mapViewport);
+                bindImmersionViewEvents(scene);
+            } catch (err) {
+                if (!ownsChat()) return;
+                if (!canUseSceneMemo(getSettings(), passChatId, memoAtStart)) return;
+                console.error('[RPG Tracker] runtimeState.refreshImmersionView failed:', err);
+                runtimeState.hasActiveDungeonMap = false;
+                syncAgentImmersionUi();
+                const container = agentPanel.querySelector('#rt-agent-immersion-view');
+                if (container) {
+                    container.innerHTML = '<div style="text-align:center;opacity:0.5;font-size:0.769em;padding:10px;">Failed to load scene view.</div>';
+                }
+            }
+        };
+        runtimeState.refreshImmersionView = createCoalescedRefresh(performImmersionRefresh);
+        globalThis._rpgRefreshImmersionView = runtimeState.refreshImmersionView;
+        globalThis._rpgCheckRealtimeSceneArt = runRealtimeSceneArtCheck;
+
+        if (isDungeonMapDetached()) {
+            const enabled = isLocationMappingEnabled(getSettings());
+            if (enabled) {
+                updateDetachedDungeonMapPanel(null, mapHandlers());
+            } else {
+                reattachDungeonMapPanel();
+            }
+        }
 
     return { syncAgentImmersionUi };
 }

@@ -2,6 +2,1429 @@
 
 All notable changes to the **Multihog D&D Framework** will be documented in this file.
 
+## [2026.9.25] - 2026-09-27
+
+### Fixed
+- File-backed memo, map, and Map Evolution history now loads and saves from phones or other browsers connected over plain HTTP on a local network. Chat switching can restore each chat's own history without browser APIs that are reserved for secure contexts.
+
+## [2026.8.97] - 2026-09-25
+
+### Fixed
+- Switching chats cancels departing Real-Time Visualization work without permanently disabling the mode. Explicit user stops and generation failures still disable further attempts until re-enabled.
+- "On Location enter (once per place)" reuses existing location art on revisits instead of behaving like "every location change". The other trigger modes retain their existing behavior.
+- Location-background preference is explicitly treated as global, alongside the other visualization preferences, when cleaning legacy chat snapshots.
+
+## [2026.8.96] - 2026-09-24
+
+### Changed
+- Reduced paired Linear Stone history retention from 50 to 25 snapshots. Existing histories, including those already migrated to the 50-entry limit, are trimmed on load while preserving LIVE and its map.
+
+## [2026.8.95] - 2026-09-24
+
+### Fixed
+- Linear Stone history now retains 50 paired memo/dungeon-map snapshots instead of 1,000 per chat. Existing live, saved-chat, and profile histories are trimmed on settings load; loading older chat/profile snapshots also applies the limit.
+- Retention preserves the current LIVE stone and its map even when LIVE lies outside the newest 50 entries. Chat Link conflict archives also preserve this pair at the limit.
+- Older rollback snapshots beyond retention are removed to reduce settings.json size. Current memos, campaign lorebooks, and current map contents are unchanged; storage remains in the existing format.
+
+## [2026.8.94] - 2026-09-23
+
+### Fixed
+- Scene View and Real-Time location generation resolve the Locations lorebook from the tracked chat when SillyTavern's chat ID is stale. Stale scene requests cannot stamp visit tracking for another chat.
+- Map Evolution reads World Reports from the campaign pinned to its pass, preventing another campaign's reports from driving map changes.
+- Linear Stone swipe synchronization follows the LIVE history index after Chat Link archiving or restoring older stones. Rolling back to a saved base keeps its dungeon-map snapshot paired and preserves unrelated archives; missing base snapshots are left unknown rather than reusing abandoned occupancy.
+- Previous-memo archiving retains the stored LIVE map snapshot after slicing non-zero history indices.
+
+## [2026.8.93] - 2026-09-19
+
+### Fixed
+- Automatic portrait and location generation select lorebooks using the tracked chat when SillyTavern's chat ID is stale. Scene prompts also use the tracked campaign's linked player character, present NPCs, and legacy campaign-prefix override.
+- Dungeon-map snapshots update the actual LIVE history slot, including after Chat Link conflict archiving or restoring an older stone as LIVE, without overwriting another stone's map.
+
+## [2026.8.92] - 2026-09-18
+
+### Fixed
+- Shared chat ownership guards now cover map agents, lorebook writes and recovery, world generation, portrait follow-ups, narrative scheduling, history navigation, and delayed panel actions. Switching away and back also cancels the old operation.
+- `/la save` retains its originating chat through nested lorebook writes and uses a campaign-scoped Chronicle book. Dungeon-map capture and map transactions stop before updating another chat's history or activation.
+- Full Lorebook Agent audits stop between chunks after a switch. Branch Campaign and Chat Link dialogs cannot apply the departing chat's choices to the arriving chat.
+- Cancelled map operations cannot clear a newer run's controller or notifications. Persistent panel controls capture ownership for each action and continue working after a switch; explicitly chat-scoped image uploads can still finish safely.
+- Chat Link conflict archiving keeps memo/map history paired and preserves the LIVE-history pointer. Known legacy object stones, including those already restored as LIVE, are repaired when settings, chats, or profiles load.
+
+### Development
+- Added deferred-I/O regression coverage for chat switches, round trips, cancellation, failed recovery, and successful ordinary writes. Documented the shared async ownership pattern in `docs/chat-ownership.md`.
+
+## [2026.8.91] - 2026-09-16
+
+### Fixed
+- Automatic dungeon-map capture retains chat ownership across lorebook awaits and stops writing `dungeonMapHistory` or Lorebook Agent activation into another chat after a switch. Campaign Locations writes keep the pinned prefix.
+- Chat Link conflict RESTORE/OVERWRITE archives displaced memos as plain Linear Stone strings (paired with dungeon-map history). Object stones no longer poison the memo panel, delta view, or "restore as LIVE".
+
+## [2026.8.90] - 2026-09-15
+
+### Fixed
+- Renaming an inactive chat migrates its data to the renamed file, preserving the open chat's state. The destination uses SillyTavern's filename sanitizer instead of the active chat ID.
+- Renamed chats retain their original lorebook prefix across saves, reloads, and later renames. Manual overrides remain scoped to their chat, and new campaign branches use their cloned lorebooks.
+
+## [2026.8.89] - 2026-09-14
+
+### Fixed
+- Character Creator, Quick Start, PC Import, and onboarding archetype rolls stop after a cancelled/chat-changed State Tracker prompt, so late Player Card, portrait, persona, or starter-message follow-ups cannot land in another chat.
+- Character creation retains the same ownership guard through initial configuration, persona imports/uploads, and Player Card preview approval. Switching away and back also invalidates pending work.
+
+## [2026.8.88] - 2026-09-13
+
+### Fixed
+- Lorebook Agent retains chat ownership across lorebook/LLM awaits and stops committing records, activation, relationships, or watermarks into another chat after a switch (including the post-LLM window where the response is already in hand).
+- Delayed Lorebook Agent auto-cleanup is cancelled on chat switch; history finalization and portrait rename follow-up saves also stop when their originating pass loses ownership.
+
+## [2026.8.87] - 2026-09-13
+
+### Fixed
+- World Progression retains chat ownership across lorebook loads, saves, activation, and LLM awaits, and stops writing reports or advancing timers into another chat after a switch.
+- Chat switches abort in-flight World Progression and Lorebook Agent LLM work before the live projection flips.
+- Adventure Companion aborts in-flight LLM/tool work on chat switch and refuses late actions when the originating chat is no longer active.
+- Cancelled Companion requests retain their abort signal and cannot execute late tools or clear the controls of a newer request.
+- State memo commands stop before changing quests, history, or memo data if the chat or state changes while a map snapshot is captured.
+
+### Added
+- **`/get-state-memo` and `/set-state-memo` slash commands**: Read the full state memo or a single `[BLOCK]` without an LLM pass. `/get-state-memo block=TIME` returns just the content (`Day 2`); `/get-state-memo TIME` (positional) returns the wrapped block (`[TIME]\nDay 2\n[/TIME]`). `/set-state-memo block=TIME Day 2` sets one block's content (merging into existing memo), or `/set-state-memo <full memo>` replaces everything. Block id uses named `block=` argument so quoted content is never misparsed. `/set-state-memo` pushes the same Linear Stone History delta/version entry as a narrative or Direct Prompt update, so `[ LIVE ]` navigation and the delta panel see the change.
+
+## [2026.8.86] - 2026-09-10
+
+### Fixed
+- Narrator-regex relationship updates retain chat ownership across lorebook NPC resolve and stop writing friendship/affection deltas into another chat after a switch.
+- Late regex and agent rollback work stops before starting another rollback or updating the arriving chat's scheduler.
+
+## [2026.8.85] - 2026-09-09
+
+### Fixed
+- Scene View / Real-Time location-art refreshes abort when `onChatChanged` flips the chat id before `loadChatState` replaces the live memo, so a mid-switch immersion build cannot queue the departing chat's location image into the arriving chat.
+- Scene rendering and background updates check the live memo's chat owner, including when both chats have identical memo text.
+
+## [2026.8.84] - 2026-09-08
+
+### Fixed
+- Portrait and location auto-generation checks retain chat ownership across lorebook loads and stop enqueueing after a chat switch.
+- Queued image jobs stop before using another chat's prompt context; late Real-Time failures no longer disable the arriving chat's mode.
+- Chat switches with Chat Link off reset auto-generation entity tracking.
+
+## [2026.8.83] - 2026-09-08
+
+### Fixed
+- Lorebook Agent portrait and location-image drops and library imports retain their original chat while files are read, fetched, and uploaded.
+- Late scene refreshes, NPC activation, fallback portrait generation, and Player Card updates no longer modify another chat after switching.
+
+## [2026.8.82] - 2026-09-01
+
+### Fixed
+- **Map Evolution queue migration**: Upgrading from before 2026.8.80 left `mapEvolutionTickCount` stuck at the unused factory `1` under scope `all`, because the migration ran after `settingsVersion` was already stamped to the factory version. Interval ticks then evolved only one due map (and while the current map was due, only that map). The one-shot now bumps untouched `all`/`1` installs to `2`.
+
+## [2026.8.81] - 2026-08-31
+
+### Changed
+- **Alpha / Beta labels**: Persistent Maps, Display Groups, and the Relationship System no longer show Alpha or Beta badges.
+- **Map Evolution**: Removed the Gemini Flash / “prefer a fast model” recommendation from the Map Evolution connection and settings copy.
+
+## [2026.8.80] - 2026-08-31
+
+### Changed
+- **Map Evolution queue**: Interval ticks no longer evolve every due map in one turn. The due pool is still collected in full, then only N maps run (default 2); the rest stay due for later turns. If the current map is due, it always takes a slot first. 0 still means “all due maps this turn.”
+- **Mapped site General**: CreateAreaMap `brief_description` is now written into the Location CORE (the General field) instead of the private-map boilerplate. An existing lore-authored description is left alone.
+- **PARTY Compact Mode**: The PARTY module header has a Compact Mode toggle. When on, each member shows only portrait, name, and HP (including hiding Cantrips / leveled spell rows).
+
+## [2026.8.79] - 2026-08-30
+
+### Changed
+- **Pacing/Output Length**: Factory default is Normal again. Shorter Outputs length limits were causing dropped level-up sequences and skipped combat turns.
+
+## [2026.8.78] - 2026-08-30
+
+### Changed
+- **Bench ETA RNG**: Pre-return task resolution follows the live RNG mechanic. Hybrid (Pre-Seeded + Tool Calls) uses `RollTheDice` outside combat; the RNG Queue is combat-only in that mode. Pre-Seeded Only still pops a queue d20. The assembled `<bench_ETA_system>` is rewritten to match, including if combat starts on the return turn.
+
+## [2026.8.77] - 2026-08-30
+
+### Changed
+- **Party bench mechanics**: `<leaving_vs_benching>` now spells out temporary vs permanent separation, and says not to redeclare stats on rejoin.
+
+## [2026.8.76] - 2026-08-30
+
+### Changed
+- **Lorebook Agent Combat Profile**: Party members' existing Combat Profiles can now be patched from `[PARTY]` after level-up. LA already allowed Combat Profile updates on automatic passes, but only from `[COMBAT]` — companions never appear there, so PARTY LEVEL SYNC left lorebook stats stale. The `[PARTY]` sheet is now injected as `## PARTY MECHANICAL STATE`; lasting stats (max HP, BAB, AC, saves, HD, class features) sync, while current-HP/status ticks still do not create or rewrite a profile.
+
+## [2026.8.75] - 2026-08-29
+
+### Changed
+- **Role**: Combat initiative now specifies party rolls first, then enemies.
+- **Level-up protocol**: Party level sync is a flat `PARTY LEVEL SYNC` line in the same level-up output (replaces nested `<party_sync>`).
+
+## [2026.8.74] - 2026-08-29
+
+### Changed
+- **Level-up protocol**: Nested `<party_sync>` replaces the old PARTY SYNC line. Companions still grow in lockstep with {{user}}, but as a loose class-logic pass (HP, skills, BAB, attributes, HD) rather than a guaranteed HD each. Markdown emphasis is stripped from the pause card.
+
+## [2026.8.73] - 2026-08-29
+
+### Changed
+- **Instant Action level**: Starts at Level 1 with 0 XP. A **Random Level** toggle (off by default) restores the old 1–10 roll. Initial Setup still overrides when it names a level; N/A — No Levels stays level-free.
+- **Pacing/Output Length**: Factory default is now Shorter Outputs.
+
+## [2026.8.72] - 2026-08-29
+
+### Changed
+- **Random event rolls**: `<random_events>` occurrence threshold is now ≥10 (was ≥14).
+- **Map Evolution cadence**: Other-maps interval default is 8 hours (was 12). Current-map stays 1 hour. Untouched 12h/1h installs migrate; custom cadences are kept.
+
+## [2026.8.71] - 2026-08-29
+
+### Changed
+- **Map Evolution story lookback**: Recent chat is now supplied to every due map (default 20 user turns; `0` skips). The same prompt filters to facts relevant to each site so background maps can reconcile stale occupancy when play says someone left or joined the party elsewhere. Map Updater still runs only on the current map.
+- **Map Evolution REMOVE_ASSET**: Evolution may purge stale ACTIVE records contradicted by recent play when no local thread should survive; traceable departures still prefer `LEFT`.
+
+## [2026.8.70] - 2026-08-29
+
+### Changed
+- **Random event rolls**: `<random_events>` no longer batches RollTheDice calls. Dangerous travel may still produce enemy encounters outside the random-event roll.
+
+## [2026.8.69] - 2026-08-29
+
+### Changed
+- **Map Evolution story lookback**: Recent chat is supplied only for the current map and the site just left. Background maps use the same prompt with an empty `RECENT STORY` block so they do not become player-centric.
+
+## [2026.8.68] - 2026-08-29
+
+### Added
+- **Map Evolution connection**: Map Evolution has its own Connection Settings slot instead of sharing Map Updater. Existing installs copy the Updater connection once.
+- **Map Evolution story lookback**: Configurable Story Lookback (default 10 user turns; 0 skips recent story) for scheduled and manual ticks. Direct Command's lookback now actually reaches the pass.
+
+### Fixed
+- **Map Evolution current site**: Footer matching no longer treats another map's BUILDING whose name contains the current site (for example a trail named toward Coldwater Creek) as the party location.
+
+## [2026.8.67] - 2026-08-28
+
+### Added
+- **Fractional ((SLOTS))**: Slot markers accept decimal values such as `1.5/4` and `.25/1`, drawing a proportional partial pip and showing the exact value on hover.
+
+### Fixed
+- **Slot recolor preview**: Live color dragging now paints `.rt-slot-fill` (including partial pips) instead of the old filled-box background.
+
+## [2026.8.66] - 2026-08-28
+
+### Changed
+- **Frozen 2026.8.60 tree**: Republished the 2026.8.60 codebase under a newer version so SillyTavern's auto-updater installs this freeze over 2026.8.61–2026.8.65.
+
+## [2026.8.60] - 2026-08-27
+
+### Changed
+- **Anti-Museum Tour**: Tightened setup copy — shorter Chat Completion and output-length guidance, softer intro wording, and trimmed context-limit rant while keeping summarizer/cache-hit advice.
+
+## [2026.8.59] - 2026-08-26
+
+### Fixed
+- **Anti-Museum Tour on mobile**: The checklist now fills the screen and scrolls inside the panel instead of sitting offscreen or behind a tiny scrollbar.
+- **Map occupancy icons**: Tapping or clicking a room's asset icons no longer opens that node's lore entry. Icons still show the asset tooltip; the room node itself remains the lore opener.
+
+## [2026.8.58] - 2026-08-26
+
+### Added
+- **Anti-Museum Tour**: First-run SillyTavern API checklist with live status checkmarks for Chat Completion, function calling, unlimited context, and 100k output length. Dismissible anytime; reopen from General & Visuals → Core & Branching → Anti-Museum Tour.
+- **Narrator card creator**: One-click empty narrator card creation with a customizable name (default `Game Master`) from the Anti-Museum Tour, startup Setup Guide, and extension settings.
+
+### Changed
+- **Onboarding setup**: Setup Guide now explains book-style narrator RP (not one-on-one character chat) and adds the named narrator card creator beside the Game Master step.
+
+## [2026.8.57] - 2026-08-26
+
+### Changed
+- **CreateAreaMap site names**: A new dungeon/interior may be named before it appears in the Location footer. The old verbatim-footer-segment gate is gone, so the GM can create the map first, then copy that exact `site` name into the footer after entry. Map activation still requires an exact footer match.
+
+## [2026.8.56] - 2026-08-26
+
+### Changed
+- **XP system**: `<xp_system>` now uses bulleted guidance, clarifies that XP should feel meaningful at the current level, and adds quest payout examples (e.g. major level-6 quest: 5,000–10,000 XP).
+
+## [2026.8.55] - 2026-08-26
+
+### Changed
+- **Narrative Voice (Normal)**: `<narrative>` Voice line now permits expanding {{user}}'s dialogue/actions consistent with their character (replacing the prior paraphrase/light-expansion wording).
+- **Relationship system**: Factory default is now off (`npcRelationshipBars: false`). Existing installs still on the shipped-on default migrate to off and rebuild the NPC module instruction.
+
+## [2026.8.54] - 2026-08-26
+
+### Changed
+- **Map Evolution departures**: Living occupants who leave a site now use `LEFT` (`LEAVING` is accepted and stored as `LEFT`) instead of `FLEEING` or `REMOVE_ASSET`. The record stays so cause, actor, detail, and threads survive; they no longer occupy the room. `FLEEING` is panic still on the map. `REMOVE_ASSET` remains for clutter or identities that should be forgotten. Untouched shipped Evolution/Updater prompts migrate.
+
+## [2026.8.53] - 2026-08-25
+
+### Changed
+- **Removed SillyTavern Discord references**: Onboarding help, README support, and Adventure Companion guidance no longer link to or mention the SillyTavern Discord.
+
+## [2026.8.52] - 2026-08-25
+
+### Fixed
+- **Map containment loops in narrator prose**: Narrator, player, and Map Updater snapshots no longer recurse forever when an asset id collides with its room or containment otherwise loops. Map Details already stopped; the hotter LLM-facing trees now use the same cutoff.
+
+## [2026.8.51] - 2026-08-25
+
+### Fixed
+- **Map Details stack overflow**: Asset inspector nesting no longer recurses forever when containment loops, duplicate/empty ids, or an asset id matching its room.
+
+## [2026.8.50] - 2026-08-25
+
+### Changed
+- **Map Evolution cadence**: Background maps now default to 12 hours. The current map defaults to 1 hour, with optional minutes, and a High Dynamism vs Standard detail preset. Untouched 8h/8h installs migrate; custom cadences are kept.
+
+### Fixed
+- **Map Details hover lag**: Asset hover cards stay on the document body as a popover instead of living inside the modal, so hovering no longer recosts the compact Visuals/Map until reload.
+- **Map Details overlay and tooltip scrollbars**: Restored the inspector backdrop and sized popover tooltips to the card so they no longer cover the menu or show a scrollbar.
+
+## [2026.8.49] - 2026-08-25
+
+### Fixed
+- **Present Now ignores CYOA choices**: Names that appear only inside unused CYOA choice/button blocks no longer count as scene presence.
+
+## [2026.8.48] - 2026-08-25
+
+### Changed
+- **Onboarding summarizer guidance**: The How It Works note now states that a summarizer is mandatory and recommends Summaryception. Token Optimization stresses a summarizer that hides verbatim messages so the narrator only sees recent turns.
+
+## [2026.8.47] - 2026-08-25
+
+### Changed
+- **Direct Visuals/Map image editing**: Clicking the active location artwork now opens its image-generation and management window immediately instead of opening Location details first.
+- **Map Themes shortcut**: General & Visuals → UI Appearance now links directly to the canonical Map Themes drawer under Persistent Maps.
+
+## [2026.8.46] - 2026-08-25
+
+### Added
+- **Optional map background textures**: Map Themes can now place an uploaded image or HTTP(S) image behind every persistent-map graph. A live Canvas-color overlay controls readability, and custom theme presets retain both the texture and overlay strength.
+
+## [2026.8.45] - 2026-08-25
+
+### Fixed
+- **Map asset hover lag**: Removed per-icon CSS drop-shadow compositing and stopped rebuilding the hover card on every child pointer event, so sweeping across node assets stays smooth.
+
+## [2026.8.44] - 2026-08-25
+
+### Changed
+- **Relationship tracking prompt**: Narrator `<relationship_tracking>` now guides emit/withhold from the NPC's injected permanent profile, allows negative points, and notes Affection is not limited to explicitly romantic actions. Scale still follows the chat's configured relationship max.
+
+## [2026.8.43] - 2026-08-25
+
+### Added
+- **Portrait story lookback toggle**: Portraits and Location Images settings can now generate character/NPC portraits from the card alone. Off by default; when enabled, the previous chat lookback (default 5 messages) is included. Location images still always use recent story context.
+
+### Changed
+- **Settings drawer title**: Renamed Portraits to Portraits and Location Images.
+
+### Fixed
+- **Map node asset overflow**: Crowded dungeon-map nodes now show one fewer icon so the +N badge stays inside the border, and hovering +N lists the hidden assets.
+
+## [2026.8.42] - 2026-08-25
+
+### Added
+- **Unified NPC and PC Card settings**: The Campaign Records card-settings popup and settings drawer now expose both NPC and Player Character section editors.
+
+### Fixed
+- **Map Evolution selections survive reloads**: Tick scope, count, randomization, and selected mapped sites are preserved in the active chat partition. Discrete map-selection and per-map interval changes now bypass the normal debounced save so an immediate reload does not discard them.
+
+## [2026.8.41] - 2026-08-24
+
+### Added
+- **Blue & White map theme**: Added the user-designed Blue & White palette as a factory preset.
+- **Independent textbox color**: Map asset textboxes now have their own theme color instead of inheriting the canvas, keeping popup text readable on light canvases.
+
+## [2026.8.40] - 2026-08-24
+
+### Added
+- **Persistent Map themes**: The bottom of Persistent Maps now provides live color controls for the map canvas, areas, routes, and every asset type. Includes Ember, Blueprint, Verdant, and Parchment factory themes plus named user presets that can be saved, loaded, and deleted without changing map JSON.
+
+### Changed
+- **Single master power button**: Removed the Lorebook Agent header ⏻. The main panel ⏻ (and Enable Multihog Framework in settings) now powers the whole extension off — stops State Tracker / CYOA / pacing / Lorebook Agent / map injection, restores the backed-up Main prompt, and aborts in-flight agent runs. The Lorebook Agent settings checkbox remains as a preference used only while the framework is on.
+- **Agent header title**: Renamed to "Lorebook Agent & Maps" (header and attached mode tab).
+- **Portrait and Location Image Styles**: Moved art-style / saved setup picker out of the Portrait Prompt Templates drawer and placed it above the templates, with copy explaining that styles load into the templates below and that edits can be saved as presets.
+- **Connections Apply to All**: Connections & Models now has a footer box to copy one feature's connection setup onto every Multihog agent connection (Combat API Override excluded).
+
+## [2026.8.37] - 2026-08-24
+
+### Fixed
+- **CYOA respects State Tracker power**: Powering off the State Tracker (`settings.enabled`) now stops `<CYOA_mode>` injection and CYOA choice-button binding. Leftover CYOA/pacing tags are stripped from the outgoing prompt copy when powered down (same pattern as Persistent Maps). Narrative pacing tags also follow the master toggle.
+
+## [2026.8.36] - 2026-08-24
+
+### Fixed
+- **Reload-proof Chat Link startup**: persistence now remains closed until both SillyTavern settings and a real chat projection are ready. When `APP_READY` precedes the first `CHAT_CHANGED`, Multihog preserves newer live state before any reset, stamps the owning chat on every projection, and refuses to copy one campaign's live state into another. This closes the late-chat startup ordering that could resurrect an older chat partition after updating another extension or reloading SillyTavern.
+
+## [2026.8.35] - 2026-08-24
+
+### Changed
+- **NPC Species CORE field**: factory Species guidance now includes gender (alongside race/subtype). Untouched factory Species descriptions and matching section presets are refreshed on upgrade; custom Species text is left alone. PC Species already asked for gender.
+
+## [2026.8.34] - 2026-08-24
+
+### Fixed
+- **Instant Action level**: no longer inherits the Other Ways to Begin level dropdown. Each run now rolls a random level from 1–10; Initial Setup still overrides when it names an explicit level. Systems set to N/A — No Levels remain level-free.
+
+## [2026.8.33] - 2026-08-24
+
+### Changed
+- **Two-stage Map Architect**: Initial generation now validates and locks an areas/connections-only topology before a separate asset-only placement request. The topology prompt contains no asset contract, placement cannot rewrite the graph, corrections remain local to the failed stage, and nothing is persisted until the merged map validates. Content guidance now targets materially populated functional spaces without duplicating ordinary connection states as barrier assets.
+- **Cleaner topology/content boundary**: Topology geometry now explicitly excludes furnishing-style room inventories, with contrastive examples for desks, banners, boards, tools, and other independently interactable contents. Content placement treats every single worker or creature as `CREATURE`; `GROUP` with `count: 1` is rejected before persistence.
+
+## [2026.8.32] - 2026-08-24
+
+### Fixed
+- **Map prompt vs. stored gateway description**: `CreateAreaMap` now separates a detailed private `prompt` from `brief_description`. Map Architect retains full design/history/topology guidance, while only the brief description becomes a SUBDUNGEON/SUBINTERIOR gateway detail or new Location CORE. This prevents generation prompts from being copied wholesale into persistent asset JSON and repeated context.
+- **Single Map Architect notification**: Native `CreateAreaMap` calls now use only Map Architect's lifecycle notification instead of also asking SillyTavern to display a duplicate generation toast.
+
+## [2026.8.31] - 2026-08-31
+
+### Added
+- **Portrait Prompt Art-Style Presets**: Portrait Prompt Templates now ship factory art-style presets (Fantasy Default, Anime, Photorealistic, Oil Painting, Comic Book, Watercolor, Dark Fantasy). Click to load a style across NPC/PC, Character/Party/Combat, and Location Scene prompts. User Save Setup library remains available underneath; factory names are reserved. Present-NPC location toggle still swaps only within the active shipped style. Preset list scrolls in its own pane.
+
+## [2026.8.29] - 2026-08-29
+
+### Fixed
+- **Control Room cartridge isolation**: Editing or re-locking an unlocked built-in prompt section now targets only the override active in the current setup, instead of an older inactive override retained in another cartridge/chat's shared snippet library.
+
+### Changed
+- **Narrator `<narrative>`**: Split NPC autonomy rules into clearer bullets; clarify non-omniscience (established narrative + archetype); guide tone/behavior from the injected permanent profile (identity fields above chronicle lines, since `[CORE]` markers are stripped for the GM).
+
+## [2026.8.27] - 2026-08-27
+
+### Added
+- **Tabbed Agent Console**: The Lorebook Agent panel Console drawer now has tabs for State Tracker, Lorebook Agent, Map Updater, Map Evolution, and Map Architect. Each agent keeps its own live terminal feed; Agent Log History remains on the Lorebook Agent tab only.
+- **Terminal/Direct Prompt**: Renamed the Console drawer and moved per-agent direct command fields into each terminal tab (including Map Evolution). Removed the Lorebook Agent footer 💬 prompt toggle.
+
+### Fixed
+- **Map Architect direct child targeting**: Explicit `Create INTERIOR/DUNGEON/SETTLEMENT map for "Site Name"` terminal commands now lock the named site and requested kind instead of reusing the active parent map's identity. This allows a SETTLEMENT to correctly host a new SUBINTERIOR/SUBDUNGEON gateway without attempting to treat the settlement document as its own child peer.
+- **Map Updater direct prompt**: Direct-command ADD_ASSET/SET_ASSET operations now require lasting `detail` descriptions, matching routine occupancy updates instead of creating bare-name assets.
+- **Offsite Map Attachment**: `CreateAreaMap` now accepts `attachTo.site` plus `attachTo.cell`, allowing the GM to attach a DUNGEON or INTERIOR to an exact AREA on any mapped parent without moving the player or first creating a BUILDING.
+- **Three-Level Map Nesting**: SETTLEMENT, DUNGEON, and INTERIOR maps can host DUNGEON/INTERIOR peers up to three mapped documents deep. Parent gateway creation, host stamping, and inactive-parent persistence remain atomic.
+
+### Changed
+- **Soft Map Editor Guidance**: native-tool and text-opener instructions now use a short structural-address contract. The mapped-site index prints exact targetable cell names, and attachment errors return exact alternatives for a one-step retry.
+- **Offsite Knowledge Safety**: explicit structural attachment no longer implies player movement or visitation; the new child entrance begins UNREVEALED, while active-location creation retains its VISITED entrance behavior.
+- **Strict Structural Names**: map sites and areas use identity matching that keeps whole-word extensions distinct, so `Cellar Crypt` and `Cellar Crypt Dungeon` cannot collapse into the same cell while small same-token-count typos remain tolerated.
+- **Recursive Gateway Invariant**: SUBDUNGEON and SUBINTERIOR assets are valid on room-scale parent maps, while Map Updater and Map Evolution are explicitly forbidden from creating, moving, renaming, or removing these runtime-owned gateways.
+
+## [2026.8.24.16] - 2026-08-23
+
+### Changed
+- **Map Updater Direct Prompt**: direct map commands now use a compact dedicated system/request prompt that performs only the explicit instruction. Routine occupancy, time, building-population, and unrelated PARTY-cleanup guidance stays exclusive to normal Map Updater passes.
+
+## [2026.8.24.15] - 2026-08-23
+
+### Fixed
+- **Map Updater site exits**: leaving a mapped site now forces one final targeted occupancy pass so NPCs established as departing with the player can be removed from the old map. Map-to-map transitions clean the departed site before the destination's normal updater cadence.
+- **PARTY members on maps**: an existing CREATURE that joins `[PARTY]` must be removed with `REMOVE_ASSET`; prompt guidance and correction validation enforce that PARTY remains outside durable map occupancy.
+
+## [2026.8.24.14] - 2026-08-23
+
+### Added
+- **Map Details Map Updater direct prompt**: Direct Prompt on the site inspector targets that map even when it is not the active site (`siteRoot` pass + inspector commit path).
+
+### Changed
+- **Map Details direct prompt UI**: labeled Direct Prompt button aligned with Map Entries / Raw JSON; prompt panel opens below that row.
+
+## [2026.8.24.12] - 2026-08-22
+
+### Changed
+- **Adventure Companion welcome**: default CHAT greeting now lists Map Updater among the four relay actions.
+
+## [2026.8.24.11] - 2026-08-22
+
+### Added
+- **Adventure Companion → Map Updater**: fourth action relays direct map occupancy instructions (same as Lorebook Agent / State Tracker). Persona, tools, fallback tags, and tutorial docs updated.
+
+## [2026.8.24.10] - 2026-08-22
+
+### Changed
+- **Visuals/Map toolbar**: removed redundant Map Updater button; run Map Updater from the header play menu (or 💬 direct prompt on the site map).
+
+## [2026.8.24.9] - 2026-08-22
+
+### Changed
+- **Map Updater REMOVE_ASSET**: `REMOVE_ASSET` now deletes the asset record (and contained children) from the map. Prompt adds `REMOVE_ASSET` alongside existing `DESTROYED`/`DEAD` guidance — kills still default to remains in-room; purge only when nothing lasting stays or correcting a mistake.
+
+## [2026.8.24.8] - 2026-08-22
+
+### Fixed
+- **Visuals/Map Map Updater direct prompt**: compact single-row layout; 💬 toggle now hides/shows the panel (`display:flex` no longer overrides `hidden`).
+
+## [2026.8.24.7] - 2026-08-22
+
+### Added
+- **Visuals/Map Map Updater direct prompt**: run Map Updater from the site-map toolbar with optional one-pass instructions and lookback (`Ctx`).
+
+## [2026.8.24.6] - 2026-08-22
+
+### Changed
+- **Map Architect familiar sites**: when player-facing story establishes thorough familiarity (home, daily workplace, recurring base), initial maps mark every area `VISITED` and ordinary assets `KNOWN`; hidden surprises stay `UNREVEALED`.
+
+## [2026.8.24.5] - 2026-08-22
+
+### Changed
+- **Map Updater BUILDING population**: skip ambient set dressing (tipped chairs, dusty booths, ordinary furniture); add only map-worthy CREATURE/GROUP/LOOT/HAZARD/TRAP/ALARM/BARRIER/interactive OBJECT contents via `ADD_ASSET`, never `SET_ASSET` on invented ids.
+
+## [2026.8.24.4] - 2026-08-22
+
+### Changed
+- **Pre-narration BUILDING population**: an explicit player action targeting a pending BUILDING now runs its hidden population pass during `MESSAGE_SENT`, before SillyTavern assembles the narrator prompt. Perception, entry, and danger checks therefore adjudicate pre-existing map reality instead of creating contents afterward.
+- **Intent safety**: pre-narration contents begin `UNREVEALED`, cannot write chronicles or assume entry/roll success, and clear the shared population gate atomically. Footer-based first entry remains a retry fallback.
+
+## [2026.8.24.3] - 2026-08-22
+
+### Changed
+- **Map Updater footer name drift**: short leaves like `General Store` still count as entry of the matching longer BUILDING (e.g. `Bullion General Store`); clear `notEntered` and populate normally.
+
+## [2026.8.24.2] - 2026-08-22
+
+### Changed
+- **Map Updater BUILDING population**: clarified narrative-driven interior contents (creative, setting-fit, not excessive), rumor/known seeding, and child-map wording.
+- **First-entry lookback**: FIRST-ENTRY BUILDING POPULATION passes now include at least the last 10 user turns of RECENT STORY (or more when the since-last-run window is wider).
+
+## [2026.8.24.1] - 2026-08-22
+
+### Changed
+- **Map Updater streetscape observation**: clearly identified existing UNREVEALED/SUSPECTED BUILDING/OBJECT landmarks become `KNOWN` from outside observation without clearing `notEntered`.
+
+## [2026.8.24] - 2026-08-22
+
+### Changed
+- **Status footer**: drop duplicated hosted-child breadcrumb guidance (owned by `<dungeon_reality_and_hidden_mapping>`); ban positional phrasing for unmapped BUILDINGs (`Main Street` or `Main Street, General Store` only when inside).
+
+## [2026.8.23.5] - 2026-08-22
+
+### Changed
+- **Status footer location rules**: clarified settlement / hosted-map tier guidance and forbade positional BUILDING phrasing (use the district alone, or `District, Building` only when actually inside).
+
+## [2026.8.23.4] - 2026-08-22
+
+### Fixed
+- **Map Updater exterior-relative footers**: phrases like `behind the general store`, `outside the inn`, or `near the chapel` stay on the district and no longer force a new `BUILDING` asset or first-entry population pass. Existing landmarks such as `Hollow Creek General Store` remain the match when the party actually enters (`inside` / named interior).
+
+## [2026.8.23.3] - 2026-08-22
+
+### Changed
+- **CYOA roll guidance**: choices need not always include a roll, though any choice *can*; high-stakes / problem-solving should use rolls more, downtime less.
+- **Display Groups**: `PARTY` is now an eligible module for display-only grouping (`COMBAT`, `BENCHED PARTY`, and `QUESTS` remain excluded).
+
+## [2026.8.23.2] - 2026-08-23
+
+### Fixed
+- **Asset-area knowledge consistency**: any `KNOWN` or `SUSPECTED` asset now automatically raises its effective containing area from `UNREVEALED` to `DISCOVERED`, including assets inside BUILDING or carried-inventory containers. Architect creation, Updater transactions, saved-map normalization, and presentation share the same invariant.
+
+## [2026.8.23.1] - 2026-08-23
+
+### Fixed
+- **Map Architect knowledge isolation**: premise and reference facts now define private site reality without making unseen districts, inhabitants, threats, or landmarks `DISCOVERED`, `SUSPECTED`, or `KNOWN`. Only explicit player-facing story context can raise initial knowledge above the entrance defaults.
+
+## [2026.8.23] - 2026-08-23
+
+### Changed
+- **Narrator mapping policy**: refreshed the canonical hidden-mapping module for one-map-at-a-time creation, unmapped transition space, standalone-child exit absorption, BUILDING promotion, and lazy BUILDING population. Shipped and embedded prompt copies now stay synchronized with the root source text.
+
+### Fixed
+- **Settlement absorption breadcrumbs**: absorbing an existing DUNGEON/INTERIOR now reparents its root and every descendant Location beneath the settlement district while stamping the canonical hosted site and exit context in the same atomic save.
+- **Chat rename recovery**: exact rename-reset markers now replace transient destination shells, including browser-local Companion and memo-recovery shells, without overwriting data that existed before the rename.
+
+## [2026.8.22.2] - 2026-08-22
+
+### Fixed
+- **Hosted map placement**: promoting a settlement asset now stores or reuses its map at `Settlement :: District :: Asset` instead of creating an unrelated top-level Location. Full-path activation keeps identically named buildings in different settlements distinct.
+- **Mapped-area footers**: narrator guidance now requires the exact current room/area after a hosted peer breadcrumb, including four-tier paths such as `Ashford, North Residential Streets, Residential House, Kitchen Passage`; active map canon flags an incomplete site-only footer for correction.
+
+## [2026.8.22.1] - 2026-08-22
+
+### Changed
+- **Persistent Maps**: added room-scale `INTERIOR` maps, settlement `BUILDING` / `SUBDUNGEON` / `SUBINTERIOR` assets, creation-time peer absorption, and atomic nested-site promotion with host/exit context. Existing `OBJECT` buildings and peaceful `DUNGEON` maps remain compatible.
+- **Map Architect**: settlement generation may now sparingly seed narratively justified `SUBDUNGEON` / `SUBINTERIOR` sites for future mapping, while ordinary structures continue to use `BUILDING`.
+
+## [2026.8.22] - 2026-08-21
+
+### Changed
+- **Persistent Maps**: refreshed the GM mapping contract for settlement-first building classification, first-footer naming, and shared entrances/exits.
+- **Map Evolution**: the default interval is now 8 in-world hours for both current and other mapped sites.
+
+## [2026.8.21] - 2026-08-21
+
+### Fixed
+- **State Tracker profile routing**: completion presets no longer override an OpenRouter connection profile's provider, quantization, fallback, or middle-out routing settings.
+
+## [2026.8.20] - 2026-08-21
+
+### Fixed
+- **Player Card approval responsiveness**: adding a generated Player Card no longer waits for a potentially long Campaign Records refresh before confirming the action.
+
+## [2026.8.19] - 2026-08-21
+
+### Fixed
+- **Visuals/Map viewport retention**: Map Updater refreshes now preserve the map's horizontal and vertical pan position instead of resetting it to the left edge. The detached map window retains its viewport too.
+
+## [2026.8.14] - 2026-08-20
+
+### Added
+- **Time-based map mechanics**: Map Architect, Map Updater, and Map Evolution can now attach absolute in-world timestamps to time-limited assets and resolve their state when those boundaries are reached.
+- **Stock module previews**: stock modules now have the same live rendering preview window as custom modules, including preview-box resizing.
+- **Game System Wizard prompt selection**: choose which module prompts to inject as rendering templates.
+- **Maps Guide**: added a Maps Guide to the Lorebook Agent Locations header.
+
+### Changed
+- **Routine map/manifest performance**: routine map and manifest work no longer downloads the entire SillyTavern settings file.
+
+### Fixed
+- **Settings and extension-data rollback**: fixed a critical bug where both SillyTavern settings and extension data could sometimes be rolled back.
+
+## [8.36.0] - 2026-08-20
+
+### Added
+- **Game System Wizard module formatting examples**: optional checkbox to inject selected existing tracker/GM **prompt instructions** as formatting examples (not live memo values). Per-module picker on the initial and review screens; choices persist.
+
+### Changed
+- **Game System Wizard context**: module prompts are no longer sent on every call by default — opt in via the new control.
+
+## [8.35.0] - 2026-08-19
+
+### Added
+- **Editable map inspector Raw JSON**: with **Reveal All** on, the Visuals/Map and lorebook MAP inspector Raw JSON tab is a native textarea with **Save JSON**. Validates site lock, normalizes the document, and persists directly to the Location root's private `[MAP]`.
+
+### Changed
+- **Map Architect scope tightened**: removed NONE from new map creation handshakes and dropped the standalone-building / peaceful-home mapping exception. DUNGEON is high-risk interiors only; threat choices are LOW through DEADLY. Restored full fantasy syntax examples in the Map Architect system prompt.
+
+## [8.30.3] - 2026-08-19
+
+### Changed
+- **Lorebook Agent context ownership**: Agent and Basic prompts now treat keyword / NEWLY ACTIVATED hits as provisional. Narrative relevance is paramount; lazy-pruning to the cap without activating missing higher-priority archive entries is an explicit failure. The live budget banner repeats that on every pass, and overflow text requires swap-in-the-same-commit, not trim-only. Reset stored Lorebook Agent prompts to pick up the wording.
+
+### Fixed
+- **Basic Mode deactivate-only commits**: `[[DEACTIVATE: …]]` tags are no longer discarded when they are the only actions in a pass.
+
+## [8.30.2] - 2026-08-19
+
+### Changed
+- **Relationship update default**: new installs and unset configs now default to **State Tracker Tags** instead of Narrator Regex. Existing explicit `regex` choices are preserved.
+
+## [8.30.1] - 2026-08-19
+
+### Changed
+- **Combat prompt layout**: moved `<ruleset_note>` to the bottom of `<combat>` instead of the top.
+- **Combat flow**: NPC simulation line now explicitly says never {{user}}'s actions. Reset a stored narrator Combat section to pick up the wording.
+
+## [8.30.0] - 2026-08-19
+
+### Added
+- **Threat NONE**: Persistent Maps now distinguish genuinely safe sites from LOW-threat sites. NONE forbids invented active danger and rejects active trap, hazard, or alarm assets during validation; LOW now means light but real danger. Auto inference, tool/text schemas, map-creation forms, narrator context, and documentation all support the new value. Existing LOW maps remain valid.
+- **Opt-in standalone building maps**: an exact named house, shop, inn, headquarters, or recurring player home/base can be deliberately mapped at room scale with the existing DUNGEON enum. Ordinary entry, ownership, lodging, and incidental settlement interiors still do not trigger maps, preventing automatic building-map proliferation.
+
+### Changed
+- **Genre-neutral Map Architect examples**: full fantasy maps were replaced with independent cross-genre schema snippets, including socially complex nonhuman characters, so examples no longer anchor map size, topology, theme, or creature morality.
+- **Restricted route guidance**: medium and large dungeons normally include a meaningful non-OPEN route, with an isolated reciprocal LOCKED example and guidance for keys, controls, clues, bypasses, and organic seals.
+
+### Fixed
+- **Missing reciprocal routes**: valid one-way omissions are mirrored automatically before strict validation, preserving the original state and detail while leaving conflicting or ambiguous topology for correction.
+
+## [8.28.0] - 2026-08-19
+
+### Added
+- **Mapped-site index for the narrator**: every Persistent Maps turn injects a compact `[MAPPED_SITES]` list of existing maps (name + kind). It does not depend on the live Location footer or lore keys, so approaching or re-entering Thornbrook (or any already-mapped site) no longer looks unmapped. `DUNGEON_REALITY` is still attached only while the footer matches. Reset a stored narrator Persistent Maps section to pick up the skip rule.
+
+## [8.27.0] - 2026-08-19
+
+### Changed
+- **Map Architect moderate threat wording**: MODERATE sites now use stronger occupancy and hazard guidance. Untouched saved defaults are migrated automatically; customized prompts are preserved.
+
+## [8.25.0] - 2026-08-19
+
+### Added
+- **Lorebook Agent map delete**: the cyan MAP chip on a mapped Location root now has an **X** that strips only `[MAP]` (CORE and the lore entry stay). Evolution trajectory for that site is cleared.
+- **On-demand map from a location root**: unmapped Location roots show a muted **+ MAP**. **Auto** spends one Map Architect turn to fill entrance, kind, scale, threat, and premise from the location lore plus recent story, then generates the private `[MAP]`. **Manual** is the same fields in a small form. A sticky **Generating a location map** toast stays up until success or failure. No narrator turn, no CYOA, no chat injection. The live location footer is not required for this explicit request.
+- **Add mapped location**: the Locations header has **Add mapped location** when Persistent Maps is on. **Auto** takes a name, an optional brief, and story lookback (0 = no chat) and fills the rest. **Manual** is name plus map fields; extra keywords are optional. The location name is always added as a keyword. Existing roots still use **+ MAP**.
+
+### Changed
+- **Map Architect reciprocal routes**: the prompt now says to write each connection detail once and copy that exact string onto the reverse (no eastward/westward rewrite). Architect also copies the first-seen detail onto matching reverses before validation, so this mismatch no longer burns a correction pass. Reset a stored Map Architect prompt to pick up the wording.
+
+## [8.10.1] - 2026-08-18
+
+### Changed
+- **Map scale**: the GM opener now treats SETTLEMENT maps as the city/town as a whole (district-scale). Alleys, houses, shops, rooftops, and streets are not mapped sites. Wilderness, roads, countryside, and other places between maps are not mapped. A building gets a DUNGEON map only when that building itself is a high-risk dungeon, ruin, lair, or trapped complex. The occupancy-lag caution is gone from the narrator Persistent Maps section (Map Updater runs every turn). Reset a stored narrator Persistent Maps section and Map Architect prompt to pick up the wording.
+
+## [8.10.0] - 2026-08-18
+
+### Added
+- **Map node occupancy icons**: Visuals/Map room nodes show characteristic kind art under the label for known (and suspected) assets — creature, pack, trap, hazard, alarm, barrier, effect, loot, object (`src/ui/SVG`). Live traps render as `TRAP_ARMED`; a neutralized mechanism renders as `TRAP_DEACTIVATED`. Reveal All still shows unrevealed occupancy as faded icons.
+
+### Changed
+- **Visuals/Map orange/black**: room nodes, connectors, and the Visuals/Map tab use the same `#ffaa00` highlight as character-sheet numbers, on near-black fills. The current room is an orange stroke with orange type; the active Visuals/Map toggle is an orange chip with black type. Occupancy art uses a warm amber/gold/bronze set so kinds still read apart without neon fills.
+- **Asset state `DEACTIVATED`**: canonical "switched off" state for traps, alarms, and similar mechanisms. `DISARMED`, `INACTIVE`, and `PACIFIED` are accepted aliases and stored as `DEACTIVATED`. Map Evolution cannot reverse it, same as the old `DISARMED` lock. Reset stored Map Architect / Map Evolution prompts to pick up the new wording.
+
+## [8.1.3] - 2026-08-18
+
+### Fixed
+- **Main prompt backup**: the original Quick Prompt Main is now snapshotted from Prompt Manager (not only an empty/unhydrated textarea) *before* the framework overwrites it, then mirrored to a browser-local backup that cannot be cancelled by a settings.json save or wiped by turning the tracker/extension off. Disable (⏻) restores that copy even when Quick Prompts is closed, and a later re-enable will not replace a real user backup with the D&D narrator prompt or an empty string.
+
+## [8.1.2] - 2026-08-18
+
+### Changed
+- **Map Evolution GM briefing**: material commits are no longer capped at two or three. Settings → Persistent Maps → Map Evolution has a **GM material-commit ceiling** (default 2000 tokens, ~8000 characters) for how much Map Evolution memory — recent material commits for the current site — is transferred to the narrator. Newest complete commits fill that budget; the latest commit is never sliced. Commit summaries no longer repeat the site name — they are only shown inside that site.
+
+## [8.1.1] - 2026-08-17
+
+### Fixed
+- **Lorebook Agent hex/font colors**: Full Audit no longer strips `<font color=#RRGGBB>` tags down to plain text. Chat cleaning keeps those tags, re-recorded `[CORE]` blocks restore color-bearing fields, and Direct Prompt JSON with `color="#hex"` is repaired so the commit is not dropped. NPC Full Cards render the font tags as color.
+
+## [8.1.0] - 2026-08-17
+
+### Added
+- **Map Evolution LOD timers**: a **Current map** interval beside the existing other-maps interval, plus optional per-map hours on the mapped-site list. Blank inherits; `0` skips automatic ticks for that site. Evolution's prompt and operations are unchanged — presence only chooses the clock. The site list splits **Run now** (checkbox) from **Per-map interval** (optional override); inherit is labeled, not pre-filled as `12`.
+
+## [8.0.10] - 2026-08-17
+
+### Added
+- **Site threat** (`LOW`, `MODERATE`, `HIGH`, `DEADLY`) on `CreateAreaMap` and `[CREATE_AREA_MAP]`: occupancy and trap density for Map Architect. Independent of scale (size) and never matched to party level. Dungeons default HIGH; settlements default MODERATE. Existing maps without a threat field keep working.
+
+### Changed
+- **Map Architect opener** also appears under Narrator Configuration → Components (and onboarding) when Persistent Maps is enabled, in addition to Settings → Persistent Maps → Map Architect.
+- **Text-command opener + CYOA**: the narrator is told not to append CYOA choices on the `[CREATE_AREA_MAP]` command turn; choices resume after the map exists.
+- **Text-command opener parsing**: `name` / `footer_root` aliases and prose scales such as "Small-to-medium" are accepted, and a `[CREATE_AREA_MAP]` fence runs Map Architect whenever Persistent Maps is on.
+
+### Fixed
+- **Persistent Maps multilingual identity**: `site` must be a verbatim Location footer segment (not a translated/retitled English name). Map Architect is told to write human-readable labels in the campaign language. A new map whose root cannot match the live footer is rejected instead of creating an orphan Location entry.
+- **Text-command opener handshake**: `[CREATE_AREA_MAP]` is scanned before State Tracker gates, including regenerate/swipe turns, with `MESSAGE_RECEIVED` and chat-load catch-up so SillyTavern cannot eat the fence before Map Architect runs.
+- **Continue-after-map ramble**: leftover assistant reasoning is cleared, the continue stub is a short in-world line instead of an empty/ZWSP resume, and the private continue brief is not a second full map dump.
+
+## [8.0.3] - 2026-08-17
+
+### Added
+- **Persistent Maps text-command opener**: Settings → Persistent Maps → Map Architect can use **Text command** instead of `CreateAreaMap` when function calling is unavailable. The narrator emits `[CREATE_AREA_MAP]...[/CREATE_AREA_MAP]` and stops; Map Architect runs, the fence is stripped, and narration continues from the entrance. The tool-call opener remains the default.
+
+## [8.0.2] - 2026-08-17
+
+### Changed
+- **Context Debugger** is a wand-menu item (**Multihog Context Debugger**), not a tracker-header button. It logs the last 10 Tracker, Map Architect, and Map Evolution request/response pairs so streamed replies can be inspected without relying on the SillyTavern server console. Prompt and reply blocks start collapsed; expand one, or use the header expand/collapse-all controls. The overlay window is the only scroller.
+
+### Fixed
+- **Context Debugger window scroll**: the card list now scrolls inside the overlay. Inner prompt boxes no longer have their own scrollbars, so the mouse wheel is not trapped.
+
+## [8.0.1] - 2026-08-17
+
+### Fixed
+- **Long Map Architect / Map Evolution / State Tracker jobs**: those requests now stream so OpenRouter, nano-gpt, and similar gateways cannot idle-cut the HTTP wait at ~60s and then drop a reply the model already finished. There is no Multihog generation timeout setting.
+
+## [8.0.0] - 2026-08-17
+
+### Added
+- **NPC/PC Library**: bookmark campaign NPCs and Player Cards into a global library that is not tied to a chat. Cards are role-agnostic: a saved PC can later be an NPC, and vice versa. Packages are `.mnpc.json` files with an optional embedded portrait; the library stores portraits as files, not in settings.json.
+- **NPC/PC Manager**: labeled control on the NPCs header in Campaign Records (Library, From Card, Freeform, Archetype). The CHARACTER header control is labeled **Create PC Card**.
+- **Library actions**: Full Card, Fit into Story, **Add as is**, **Play as PC** (installs the Player Card and asks the State Tracker to swap `[CHARACTER]`), **Add to Party** (`(Name joins the party.)` Direct Prompt), export, and delete.
+- **Library Full Card**: same CORE layout as the campaign card, with a Library badge and keywords. **Edit Text** saves back to the library. Click the portrait to replace, generate, crop, or clear it (library storage only). No relationship bars or AI edit.
+
+### Changed
+- Library cards store CORE identity, keywords, and portrait only — not campaign relationship numbers, chronicle, or dynamic lore. Existing library entries are cleaned the next time the Library tab opens.
+- Library rows: a square portrait matching the action-stack height, appearance plus personality blurb, and a gold scrollbar matching the Full Card button.
+
+## [7.99.3] - 2026-08-17
+
+### Changed
+- **Visuals/Map details control**: the ALPHA note next to Site map is replaced with a labeled **Map Details** button that opens the site inspector.
+
+### Added
+- **Testing Ground undo/redo**: after Evolve this map now or Simulate ticks, Undo last pass restores the map, `[TIME]`, Last Evolved clocks, and Evolution memory to immediately before that run. Redo last pass restores that snapshot and runs the same pass again.
+
+## [7.99.2] - 2026-08-17
+
+### Changed
+- **Map Evolution thread closures**: return to baseline (customary patrol, settled vigil, going home to forage after a disturbance) is `resolved`, not a new OPEN thread. Omitted `thread_status` still defaults to open, so the prompt now requires setting resolved/transformed explicitly. Custom stored Evolution prompts lag until reset; the per-request causal-thread contract is live immediately.
+
+## [7.99.1] - 2026-08-17
+
+### Changed
+- **Map Evolution social life**: co-located groups are not assumed to be enemies. Hostile dungeon occupants may hang around, talk, or cooperate. Occupants may pursue ongoing *projects* that fit their archetype (a bone-ward, a warren shoring, a harvest). In-place `SET_ASSET` detail is real activity. Custom stored Evolution prompts lag until reset or the prompt-defaults dialog; the per-request time-scale contract and Living Occupants snapshot are live immediately.
+
+## [7.99.0] - 2026-08-17
+
+### Changed
+- **Onboarding help**: Need Help is its own section with a numbered list — embedded getting-started video, clickable Adventure Companion (opens CHAT), and SillyTavern Discord. How It Works now covers Auto-Tracking through Map Evolution without mixing in help copy.
+- **Onboarding Setup Guide**: Initial Setup now starts with Function Calling (Persistent Maps + Hybrid RNG), then connections, empty narrator card, and character creation.
+
+## [7.98.2] - 2026-08-16
+
+### Changed
+- **Map Evolution occupancy tempo**: independent occupants may all act, but they do not have to. Staying put is valid when that makes sense. A lone patrol commute as the entire tick is still discouraged. Custom stored Evolution prompts lag until reset or the prompt-defaults dialog; the per-request time-scale contract is live immediately.
+
+## [7.98.1] - 2026-08-16
+
+### Fixed
+- **Map Evolution History scrolling**: the site inspector popup now allows vertical scrolling, so the History list is no longer clipped by SillyTavern's `overflow: hidden` dialog body.
+- **GM Evolution commits are no longer mid-cut at 600 characters**: material-commit summaries keep every operation in the tick. The narrator briefing prefers fewer complete commits over three truncated ones.
+
+## [7.98.0] - 2026-08-16
+
+### Added
+- **Map causality**: every material map operation now requires a concise in-world `cause`. Transitioning an asset into `DEAD` or `DESTROYED` also requires `actor` (`party`, an existing asset id, or a short off-map name). The extension stamps `changed_at` from `[TIME]`. Occupancy `detail` stays the current fact; cause/actor/since are why, who, and when.
+- **Causal thread ledger**: attributed map writes become per-site open/resolved/transformed threads (`mapEvolutionThreadsBySite`). Map Evolution receives **OPEN CAUSAL THREADS** so third-party kills, party kills, and occupations can continue as plot rather than disappearing into occupancy notes.
+- **GM site-activity briefing**: while inside a mapped site, DUNGEON_REALITY includes a compact Recent site activity block (open causal threads, recent complete material Evolution commits, current DIGEST rows) so occupancy makes sense without dumping the Evolution ledger. Per-asset Cause / Actor / Since remain the latest coupling for that entity.
+- **Evolution history compression**: after each Map Evolution pass, closed-thread history is measured (~4 characters per token). If it meets the **user-settable token threshold** (default **10,000**), a second API call compresses resolved/transformed events and prior digests into compact summaries. **Currently open threads stay verbatim.** Settings → Persistent Maps → Map Evolution: enable, threshold, and compression prompt.
+- **Asset `count`**: optional living-member integer (1–99) on map assets. Packs, patrols, garrisons, and swarms are one `GROUP` with `count`; named individuals stay `CREATURE`. `SET_ASSET` can reduce or restock count. `0` is invalid — use `DEAD`/`DESTROYED`.
+- **Map Evolution Testing Ground**: a sandbox (`map-evolution-debug.js`) for balancing without playing. Advance or set in-world time, spawn or kill entities with cause/actor, evolve one map, or simulate up to 20 ticks. Entry points: Settings → Persistent Maps → Map Evolution, the Lorebook Agent Map Evolution drawer, and the map inspector. Includes asset arcs, a memory inspector, Clear evolution history, and a scrolling threads/assets history.
+- **Remembered Reveal All**: the map inspector's Reveal All toggle persists per chat, fully reveals Visuals/Map (not only the inspector lists), and the inspector shows the site graph below Map Entries / Raw JSON.
+
+### Changed
+- Map Updater and Map Evolution prompts require cause (and actor on deaths) and prefer one pack asset over many identical singleton creatures. Custom stored copies lag until reset or the prompt-defaults dialog.
+- **Map Evolution tempo**: hours elapsed with several living groups should emit several operations in one transaction, not one patrol commute. Co-located competing groups are told to interact. The Evolution snapshot now lists **LIVING OCCUPANTS** (with `same-room=` crowding).
+- Evolution now receives the full stored thread ledger (cap raised to 400 events) so the token threshold is the limiter, not a 16-entry prompt slice.
+
+### Fixed
+- **Map Evolution History**: the site inspector now reloads occupancy and the Evolution backlog after Testing Ground closes. Sandbox spawn/kill writes are recorded in that backlog, so History matches the map changes made in Testing Ground.
+- **Testing Ground history list**: attributed events are no longer capped at the last 8 in the UI. The threads/assets columns grow with the stored history and the popup scrolls, instead of clipping older ticks in a short pane.
+
+## [7.95.4] - 2026-08-16
+
+### Fixed
+- **New NPC cards missing from the prompt until Activate / Refresh Manifest**: Add NPC now records the book on `campaignBooks`, writes ST's world-info cache, and persists settings so the next generate can inject the card. Agent-owned lore injects even when Native Keyword Activation is on (or the user message has no extractable text), instead of listing the NPC only in `[NPC_RELATIONS]`. The keyword scanner unions the ownership list with the in-memory registry so a newly created NPCs book is not skipped. A full manifest refresh copies disk-fresh entries back into ST's cache.
+- **Present Now empties on user turns**: the Visualization Present Now list scans only the latest narrator/assistant message. Player inputs are skipped so a turn that does not name NPCs no longer clears the tiles between replies.
+
+## [7.95.3] - 2026-08-16
+
+### Changed
+- **Tutorial video**: startup page and README now point to the current getting-started video.
+
+## [7.95.2] - 2026-08-16
+
+### Added
+- **Buy Me a Coffee**: donation button on the startup page (top right).
+
+## [7.95.1] - 2026-08-16
+
+### Fixed
+- **Map Updater party filter**: occupancy now receives a names-only `[PARTY]` roster and is told not to `ADD_ASSET` those people. Matching adds are rejected on correction.
+
+## [7.95.0] - 2026-08-15
+
+### Added
+- **Lorebook Agent Map Evolution drawer**: ON/OFF, last/next evolution, interval, maps-per-tick scope, Evolve Now, and Reset Timeline sit above World Progression and stay synced with Settings.
+- **World Progression locations-per-report**: the agent drawer can set how many location dossiers each report covers.
+- **Persistent Maps + World Progression**: Map Evolution is the compatibility layer. Reports stay location-scale prose; maps realize them lazily. The older “do not use both” warning is retired.
+
+### Changed
+- **Map Evolution defaults**: interval is 12 in-world hours; automatic scope is every due mapped site. Map Architect, Map Updater, and Map Evolution output budgets default to 25000 tokens.
+- **Map inspector Run Now**: the site-scoped Map Evolution button sits beside Evolution History as a horizontal control.
+- **CYOA Mode**: shipped choices must not invent map obstacles (locked doors, traps, barricades) that are not already on an attached site map.
+- **Location-centric World Progression**: WP rotates complete readable location dossiers and Wider Currents, strips `[MAP]`, and treats named entities as constraints rather than simulation subjects.
+- **Lazy report realization**: World Reports no longer fan out into an immediate all-map Evolution pass.
+- **Macro-only World Skeleton**: skeleton generation creates locations, factions, and conflicts only. Legacy skeleton NPC entries remain on disk but are ignored.
+- **Per-location Evolution backlog** and **unified map inspector** as previously described in the 7.86 line.
+
+### Fixed
+- **Upgrade migrations**: Keyword Overflow 0→6, Max Active Keys 8→12, and Map Architect token flooring are one-time flags that are *not* seeded in defaults, so existing 7.82 chats actually receive them. After that pass, 0 / 8 / a lower token budget remain valid explicit choices.
+- **World Progression map isolation**: hidden `[MAP]` JSON cannot enter the WP prompt.
+- **Map Evolution time scale**: each site request uses that map's own Last Evolved clock and accumulated backlog.
+
+## [7.86.2] - 2026-08-15
+
+### Fixed
+- **Keyword Overflow / Max Active Keys upgrade**: the one-time 0→6 and 8→12 raises now actually run for existing chats. The previous flags were seeded `true` from defaults, so saved 0/8 never changed. After this pass, setting 0 or 8 again is kept.
+
+## [7.86.1] - 2026-08-15
+
+### Changed
+- **Persistent Maps (Alpha)**: the Components toggle is renamed from Location Mapping (Alpha). The internal `<dungeon_reality_and_hidden_mapping>` tag is unchanged.
+- **Keyword Overflow Cap**: default is now 6 (was 0 / no cap). Existing chats still at 0 are raised once; you can set 0 again afterward for no cap.
+- **Max Active Keys**: default is now 12 (was 8). Existing chats still at 8 are raised once; you can set 8 again afterward.
+
+## [7.86.0] - 2026-08-15
+
+### Changed
+- **Map Evolution Run now**: the checklist and **Evolve checked maps now** live in their own always-visible section. Interval **Selected maps** still uses those checks for automatic ticks, but you no longer have to pick that option to run evolution manually.
+- **Map Evolution MOVE_ASSET schema**: the shipped prompt now shows `to`/`from` (never `location`) and a move example. Correction retries also repeat that field reminder. Reset the Evolution prompt in settings if you still have an older copy.
+- **Map Evolution schedule**: Last Evolved / Next Scheduled, Override, and Reset Timeline match World Progression. Next is the soonest per-site interval due; Override stamps every mapped site so the next tick fires at the chosen in-world time.
+
+## [7.85.0] - 2026-08-15
+
+### Changed
+- **Persistent Maps settings**: the left-rail section is renamed from Map Architect. Map Architect lookback, tokens, and prompt live in their own nested drawer beside Map Updater and Map Evolution.
+- **Map Architect max tokens**: saved values below 25000 are raised once to match Map Updater / Map Evolution. After that one-time floor, you can lower the budget again.
+- **Separate map connections**: Map Architect keeps its own connection for the foundation pass. Map Updater and Map Evolution share a second connection so occupancy and off-screen change can use a cheaper model. Existing chats copy the current Architect connection onto that new slot once, then the two can diverge.
+- **Map Evolution stance**: off-screen map change is primary. World Progression is optional macro flavor, not a permission gate. Dungeons may restock from rival adventurers, scavengers, or anyone the site could attract — not only the original faction. Settlements may evolve as ordinary civic occupancy or unrest; neither is preferred. Changes must still make logical and narrative sense for the site.
+
+## [7.84.0] - 2026-08-15
+
+### Added
+- **Map Evolution on demand and tick scope**: the play-menu Map Evolution item opens a map picker (All / None / Current) and evolves the chosen sites immediately. Interval ticks can stay on the current map, take **N** due maps (0 = all due), evolve **every** due map, or use a **selected** checklist. Randomize is on by default; turn it off to prefer the oldest-due maps. World Progression grounding is unchanged and still follows report mentions, not the tick count.
+
+## [7.83.0] - 2026-08-14
+
+### Added
+- **Map Evolution**: a dedicated off-screen map pass (own `.js`, own prompt, own in-world interval) that is never mixed into Map Updater occupancy. After World Progression, it grounds named report outcomes onto matching maps **one site at a time**. Interval restlessness can move/restock entities outside the player bubble; play-established deaths stay dead. Settings live under Map Architect → Map Evolution; the Lorebook Agent play menu has a third item.
+
+### Changed
+- **Map Updater / Map Evolution max tokens**: default is now 25000 (same as Map Architect). The old 2500 budget was too small for a JSON map pass and killed the output stream. Saved 2500 values are upgraded automatically; the settings cap is 32000.
+
+## [7.82.0] - 2026-08-14
+
+### Added
+- **Adventure Companion site map**: CHAT options and the Adventure Companion settings drawer can inject the currently active player-facing site map (same knowledge fog as Visuals/Map with Reveal all off) so the Companion can discuss exploration. Visited rooms include known contents; discovered names are outside-only; unrevealed rooms, traps, and occupants stay hidden. Injected lore also strips private `[MAP]` JSON.
+
+## [7.80.0] - 2026-08-14
+
+Public release of Location Mapping: dedicated Map Updater, settlement maps, ARCHIVE INDEX existence checks, and a Components kill switch that actually stops architect/updater API calls. See 7.50.14–7.50.30 for the stepwise notes.
+
+## [7.50.30] - 2026-08-14
+
+### Changed
+- **Location Mapping (Alpha)**: the Components toggle is renamed from Dungeon Reality Mapping. It covers dungeons, ruins, towns, and cities. The internal `<dungeon_reality_and_hidden_mapping>` tag is unchanged.
+
+### Fixed
+- **Location Mapping disable**: turning the Components checkbox off now actually stops the stack — CreateAreaMap unregisters, in-flight Map Updater requests abort, and occupancy API calls are not sent. Unlocking the sysprompt section no longer greys out this kill switch.
+
+## [7.50.29] - 2026-08-14
+
+### Fixed
+- **Map Architect "Use Current Settings"**: profile requests with an empty completion-preset override no longer send a bare Custom OpenAI payload (HTTP 404). The live SillyTavern completion preset is used when the connection profile has none, and the live endpoint URL is filled in as a fallback.
+
+## [7.50.28] - 2026-08-14
+
+### Changed
+- **Lorebook Agent existence checks**: ARCHIVE INDEX is treated as the complete catalog (now includes Book::UID). The agent is told not to `grep_lore` / `inspect_book` to verify whether a name exists; absence means record it. Concatenated name-dump greps are rejected with that hint.
+
+## [7.50.27] - 2026-08-14
+
+### Fixed
+- **Site map current-area highlight**: a footer interior that is an occupying asset (chapel, inn) or a breadcrumb tail above a matching district now highlights the host district. The graph no longer falls back to the entrance when the leaf is not itself an area.
+
+## [7.50.26] - 2026-08-14
+
+### Changed
+- **Map Architect prompt examples**: the shipped architect prompt now includes truncated valid DUNGEON and SETTLEMENT JSON (reciprocal routes, LOCKED passages, INITIAL_MAP assets, chapel as a district OBJECT not an area). Reset the Map Architect prompt in settings if you still have an older copy.
+
+## [7.50.25] - 2026-08-14
+
+### Changed
+- **Map Updater prompt examples**: the shipped occupancy prompt now includes compact valid JSON for noop, ADD_ASSET (chapel + occupant), and SET_ASSET, plus a note not to use `{type, asset:{...}}`. Reset the Map Updater prompt in settings if you still have an older copy.
+
+## [7.50.24] - 2026-08-14
+
+### Fixed
+- **Wrapped ADD_ASSET operations**: Map Updater accepts `{type:"ADD_ASSET", asset:{...}}` and flattens it to `{op, name, kind, ...}` instead of burning correction retries on `type` vs `op` and a nested `asset` object.
+
+## [7.50.23] - 2026-08-14
+
+### Fixed
+- **Chronicle `area` alias**: Map Updater chronicles that send `area` instead of `area_id` are accepted instead of forcing a correction retry.
+
+## [7.50.22] - 2026-08-14
+
+### Fixed
+- **Manual Map Updater lookback**: Play-button Map Updater runs now use the Lorebook Agent lookback (last N user turns) instead of the since-last-run watermark. After an auto-run on the same turn, a manual pass no longer sends empty RECENT STORY. A settlement footer interior that is not yet an OBJECT asset is called out so the model cannot noop it away.
+
+## [7.50.21] - 2026-08-14
+
+### Changed
+- **Map Architect max output tokens** now default to **25000** (UI still clamps 1000–32000). Existing saved values are kept; only new installs and reset-to-default pick up 25000, so long maps are not truncated after the generation cost is already paid.
+
+### Fixed
+- **Map Updater Stop + Lorebook Terminal**: occupancy updates now share the Lorebook Agent terminal and Stop button. Stop appears only after an active map is confirmed (auto-ticks outside a mapped site no longer flash it). Cancel aborts the in-flight request. Occupancy finishes still refresh Campaign Records but do not trigger NPC portrait auto-generation.
+
+## [7.50.20] - 2026-08-14
+
+### Changed
+- **Run Research Now** on the Lorebook Agent header expands into a choice: **Lorebook Agent** (NPC/location/relationship records) or **Map Updater** (dungeon and town occupancy). Map Updater can be run by hand even when its auto cadence is off.
+
+## [7.50.19] - 2026-08-14
+
+### Changed
+- **Map Updater is separate from Lorebook Agent**: Dungeon and settlement occupancy updates no longer ride on the Lorebook Agent pass. A dedicated Map Updater (Map Architect connection, compact JSON, default every turn) maintains `[MAP]`. Lorebook Agent keeps NPC/location/relationship records on its own cadence and no longer receives `inspect_map`, `commit.map`, or `[MAP_COMMIT]`. The agent panel has **Map every:** next to **Run every:**.
+
+## [7.50.18] - 2026-08-14
+
+### Fixed
+- **Map commit bounce on omitted evidence**: ADD_ASSET without `evidence` no longer rejects the whole Lorebook Agent commit. Missing evidence defaults to CONFIRMED. `kind: NPC` (and PERSON/CHARACTER) is stored as CREATURE, so a chapel+priest settlement commit can land instead of retrying until the model hangs.
+
+## [7.50.17] - 2026-08-14
+
+### Changed
+- **Settlement interiors in the footer**: When the party enters a chapel, inn, shop, or similar invented interior, the GM Location footer must append that building (city, district, interior) instead of stopping at the district.
+- **Lorebook Agent settlement interiors**: On SETTLEMENT maps, an interior the party actually enters is recorded as a KNOWN OBJECT asset in that district. The agent uses the latest narration, not only the status footer, so a missing third footer segment no longer skips the chapel.
+
+## [7.50.16] - 2026-08-14
+
+### Fixed
+- **Map Architect on Connection Profiles**: CreateAreaMap no longer sends a provider-level JSON schema through Connection Profile / Ollama / OpenAI-compatible connections. Those schemas 404 on many chat-completion backends. Main API already skipped them; the architect still parses and validates the raw JSON itself.
+
+## [7.50.15] - 2026-08-14
+
+### Changed
+- **Dungeon map GM leeway**: Room-scale dungeon maps are preferred canon, not a hard ban. The narrator may add a room or incidental feature if play naturally requires it, so long as it does not contradict established map facts.
+
+## [7.50.14] - 2026-08-14
+
+### Changed
+- **CreateAreaMap**: The Map Architect tool is now `CreateAreaMap` (was `CreateDungeonMap`). It accepts `kind: DUNGEON` for room-scale interiors or `kind: SETTLEMENT` for district-scale towns and cities. Settlement maps stay macroscopic; the GM may invent granular interiors that do not contradict those districts.
+
+## [7.50.13] - 2026-08-14
+
+### Changed
+- **Map Architect hubs**: The architect prompt now says occasional hub/nexus layouts are welcome — one area may have many routes instead of forcing a linear chain.
+
+## [7.50.12] - 2026-08-14
+
+### Changed
+- **Map Architect density**: The architect prompt no longer says to skip incidental objects. It now tells the model to populate furnishings, clutter, tools, loot, and hazards on the initial map instead of leaving it sparse for later invention.
+
+## [7.50.11] - 2026-08-14
+
+### Changed
+- **Dungeon map lag note**: The narrator now treats established story events as overriding a lagging map (a killed enemy stays dead even if still listed ACTIVE), instead of treating the latest DUNGEON_REALITY occupancy as catch-up truth.
+
+## [7.50.10] - 2026-08-14
+
+### Changed
+- **Map Architect settings tab**: Map Architect now has its own left-rail settings section, directly below Lorebook Agent, matching World Progression and Adventure Companion.
+
+## [7.50.9] - 2026-08-14
+
+### Added
+- **Settings search**: The floating settings window has a keyword search that filters nested drawers across tabs.
+
+### Changed
+- **Dungeon map lag note**: The narrator `<dungeon_reality_and_hidden_mapping>` prompt now says the attached map may lag a few turns behind play due to update frequency.
+
+## [7.50.8] - 2026-08-14
+
+### Fixed
+- **Tracker snapshot map rollback**: The State Tracker `[ LIVE ]` arrows now roll dungeon-map occupancy back with the memo. Each tracker snapshot stores the current `[MAP]`; viewing or restoring a previous stone writes that occupancy back, and returning to LIVE restores the map that was live when you started browsing.
+
+## [7.50.7] - 2026-08-14
+
+### Changed
+- **Dungeon map combat granularity**: Lorebook Agent map commits now treat `[MAP]` as lasting occupancy, not the current combat beat. Transient targeting, poses, HP, and conditions such as frightened stay in the combat tracker.
+
+## [7.50.6] - 2026-08-14
+
+### Fixed
+- **Branch Campaign keeps relationship stats**: Friendship/affection values and their change logs are now saved with the chat, copied onto the branch, and remapped to the cloned lorebook names. A branch no longer resets every NPC to 0.
+
+## [7.50.5] - 2026-08-14
+
+### Changed
+- **Companion documentation**: Tutorial Mode's framework doc now covers Dungeon Reality Mapping — Map Architect, `[MAP]` storage, Visuals/Map vs the GM MAP badge, knowledge fog, and function-calling requirements.
+
+### Fixed
+- **Visuals/Map on first boot**: The Campaign Records / Visuals/Map switch is probed as soon as the panel is built, so a mapped site can show the tab without turning on location images or Real-Time Visualization.
+
+## [7.50.1] - 2026-08-14
+
+### Changed
+- **Draggable site graph**: Dragging the Visuals/Map graph pans the view instead of selecting text. Revealed rooms still open on click.
+- **Site details from Visuals/Map**: The list button next to the graph opens the readable map (rooms, geometry, routes, and assets). Unrevealed rooms and assets stay hidden unless **Reveal all** is turned on. The Lorebook MAP badge remains the full GM inspector, including Raw JSON.
+
+## [7.50.0] - 2026-08-14
+
+Dungeon Reality Mapping is **alpha**. The mapped-site loop works in play, but expect sharp edges and keep backups of important chats.
+
+### Added
+- **Dedicated Map Architect**: The narrator can call a one-shot private agent with its own prompt, connection profile, model, preset, lookback, and output budget to create dangerous-site maps.
+- **Initial-map validation and correction**: New maps are checked for valid JSON, exact site/entrance identity, scale, stable IDs, asset references, reciprocal passage details, and a fully connected physical graph. Invalid output receives up to two correction passes and is never partially saved.
+- **Visuals/Map site graph**: While inside a mapped dungeon, Visuals/Map shows a knowledge-filtered node graph (visited rooms named, discovered rooms dim, unrevealed neighbors as unlabeled stubs). It can be popped out into its own window. The Lorebook MAP badge remains the private GM inspector.
+
+### Changed
+- **Lightweight narrator contract**: The full map-authoring specification is no longer carried in every GM prompt. A short `CreateDungeonMap` contract replaces it, while the dedicated agent stores validated JSON directly in the root Location entry and returns compact prose to the narrator.
+- **Visuals/Map rename**: The Lorebook Agent **Visualization Mode** tab is now **Visuals/Map**. Real-Time Visualization Mode (scene-art generation) keeps its settings name. The Campaign Records / Visuals/Map switch appears when location images are on or the party is inside a mapped site.
+
+### Fixed
+- **Site map connectors**: Connection lines now stop at each room’s border instead of running through node labels.
+- **Mapped-site activation**: The site map follows whole location segments, so a nested dungeon such as `Whispering Woods, Forgotten Tomb` stays active, while a nearby place that only mentions the site (`Forest Near the Hall of the Ember-Ancestors`) does not.
+- **Map Architect progress feedback**: A persistent toast now indicates when a location map is being generated, then reports completion or failure when the tool call ends.
+- **Reliable Map Architect tool calls**: Main API map creation now reads the untouched provider response, bypassing both unsupported provider-level JSON schemas (`Bad Request`) and SillyTavern dialogue cleanup (`No message generated`). Connection Profile, Ollama, and direct OpenAI-compatible modes retain structured-output support.
+- **No immediate retry loops**: Architect transport, configuration, validation, and persistence failures are now real tool errors. The narrator remains outside the site and must not retry the tool during the same turn.
+
+## [7.25.1] - 2026-08-13
+
+### Fixed
+- **Safe campaign cloning**: Clone Stack and Branch Campaign now abort before writing when a destination lorebook already exists, preventing whole-book overwrite and cleanup of pre-existing books.
+- **Chat-scoped Lorebook Agent history**: Undo and redo now operate only on the active chat, preserve other chats' history, reject mismatched redo snapshots, and follow safe chat renames.
+
+## [7.25.0] - 2026-08-13
+
+### Changed
+- **Optional Instant Action starter message**: A **Send Starter Message?** checkbox sits below Player Card length. It is on by default so Instant Action still opens the campaign automatically; uncheck it if you want to type your own first action.
+
+### Fixed
+- **Instant Action honors Initial Setup level and class**: A requested level such as "A level 7 ranger" now overrides the Other Ways level dropdown. The prompt no longer forces `STARTING LEVEL: 6` as mandatory when Initial Setup asked for a different level, and the random archetype is treated as a fallback when a class is specified.
+
+## [7.20.1] - 2026-08-12
+
+### Changed
+- **Optional Instant Action names**: A rolled or typed name is no longer required. Leave the name blank and the AI chooses one; the roll button remains available as an option.
+- **Instant Action Player Card length**: Quick Start now offers preset and custom word counts from 50–5000 words.
+
+### Fixed
+- **Initial Setup reaches the Player Card**: Character details, setting, premise, and tone are now passed to Player Card/persona generation as well as the state memo creator and opening narrator message.
+
+## [7.20.0] - 2026-08-11
+
+### Changed
+- **Initial Setup label**: Instant Action guidance is labeled `Initial Setup:` in the character-generation prompt and opening adventure message.
+
+## [7.10.6] - 2026-08-11
+
+### Added
+- **Instant Action instructions**: Quick Start now has an optional guidance box for character details, setting, premise, or tone. Specified details override rolled defaults, and the same guidance is included with the opening `Begin the adventure` message so the narrator starts in the requested scenario.
+
+## [7.10.5] - 2026-08-11
+
+### Fixed
+- **First-pass Lorebook Agent undo**: The initial generated campaign can now be undone to a true empty baseline, with complete metadata restoration and lossless redo state.
+- **Rollback display consistency**: Undo, redo, and manual refresh now read authoritative lorebook data from disk instead of reviving deleted entries from historical logs or SillyTavern's stale cache.
+
+## [7.10.4] - 2026-08-11
+
+### Changed
+- **Removed Barnaby few-shot**: The Lorebook Agent Basic Mode no longer injects the hardcoded `{{example}}` / Barnaby sample NPC that was overriding word-target instructions.
+- **Editable runtime prompt fragments**: Combat Profile guidance, auto/manual pass restrictions, existing-NPC chronicle nudge, and relationship-section wording are now editable templates (Lorebook Agent → System Prompt → Runtime Prompt Fragments) instead of hardcoded router strings.
+- **NPC word targets are overall totals**: Major/Minor NPC targets now mean "exactly N words across the whole [CORE] block" (matching PC framing), not per-section minimums. Existing installs are rescaled by section count (defaults 225 / 135).
+
+## [7.1.52] - 2026-08-09
+
+### Changed
+- **Worn Equipment**: Renamed the Lorebook Agent CORE field from Equipment to Worn Equipment (and clarified prompts) so LA treats it as visibly worn/carried gear — not coins, loot piles, or inventory lists. Legacy `Equipment:` headers in existing entries still patch in place.
+
+## [7.1.51] - 2026-08-09
+
+### Fixed
+- **CHAT-BOUND Game Systems on new chat**: Unseen chats with Chat Link + Lock Control Room no longer keep previous-chat CHAT-BOUND activations enabled. Catalog items deactivate for the new chat; GLOBAL enablement and inherited Narrator Configuration stay intact.
+
+## [7.1.50] - 2026-08-09
+
+### Added
+- **Dungeon Reality Mapping (Experimental)**: New native `<dungeon_reality_and_hidden_mapping>` sysprompt section (below `<constraints>`) that builds a full hidden location map before high-risk exploration and resolves traps, stealth, and enemies against it. Toggleable under Components; on by default.
+- **XP rule**: Do not award XP as a consequence of a failed check.
+
+### Changed
+- **Settings overlay appearance**: Defaults to Light on first boot.
+
+## [7.1.35] - 2026-08-08
+
+### Added
+- **Settings overlay**: Extensions drawer keeps a light Multihog stub with **Open Settings**; full settings open in a floating external window with a left tab rail (General, Connections, Game Systems, State Tracker, Lorebook Agent, World Progression, Adventure Companion). Not a fullscreen takeover — centered/draggable panel with mobile safe-area sizing.
+- **Settings window Dark / Light lock**: Appearance toggle at the top of General forces readable locked chrome so ST/tracker themes cannot wash out the settings menu. Defaults to Dark.
+- **State Tracker settings shortcut**: Wrench button in the tracker header (left of CHAT) opens the settings overlay.
+- **Critical settings WAL**: Browser-local backup for Display Groups and prompt-defaults acknowledgement so cancelled settings saves during reload are less likely to resurrect deleted groups or the upgrade dialog.
+
+### Fixed
+- **Prompt defaults fingerprint**: Shipped-default fingerprint no longer reads live user settings (e.g. relationship max / CORE sections) via module getters, which could false-trigger Prompt Defaults Updated.
+- **Settings overlay mobile layout**: Panel no longer spawns clipped above the viewport or collapses to a header-only strip.
+- **Settings overlay readability**: Strengthened muted/inline-opacity description text in locked Dark/Light chrome.
+- **Settings overlay background**: Removed probe for missing `assets/settings-bg.png` (kept SVG gradient only).
+
+## [7.1.2] - 2026-08-08
+
+### Changed
+- **World Skeleton prompt**: Adds a procedural NPC naming rule with culture-matched construction and randomized first/last-name root macros so new skeleton NPCs avoid high-frequency placeholder names.
+
+## [7.1.0] - 2026-08-08
+
+### Added
+- **Branch Campaign**: One-button pipeline under General & Visuals → Core & Branching that creates a SillyTavern transcript branch, deep-copies all Multihog per-chat data (memo, quests, portraits maps, setup, companion, etc.), clones the lorebook stack under the new chat’s sanitized prefix, then opens the branch — leaving the original chat intact.
+- **Chat rename migration**: Listens for SillyTavern `CHAT_RENAMED` and moves Multihog `chatStates` (plus companion / memo-recovery maps) to the new chat file name so renaming a chat no longer looks like an empty campaign.
+
+### Changed
+- **Clone Stack**: Uses the shared lorebook clone helper; tip points users at Branch Campaign for the full automated branch.
+
+## [7.0.14] - 2026-08-08
+
+### Added
+- **Lorebook Agent System Prompt Editor**: Exposed the stored Basic Mode prompt template and the Agent Mode base/shared-context templates in settings, with mode-aware reset controls. Dynamic request context and tool schemas remain generated at runtime.
+
+### Changed
+- **Game System Wizard UI Live Preview**: Added a read-only live rendering of the matching tracker sample block, including progress bars, custom markers, badges, and preview pagination controls. Edit the source block above it to update both the preview and saved template.
+
+### Fixed
+- **Lorebook Agent Prompt Updates**: Routed all four Lorebook templates through the normal prompt-fingerprint/update dialog, preserving custom prompts and cartridge backups until the user explicitly applies the update.
+- **Lorebook Agent Prompt Runtime**: Dynamic module, relationship, campaign, activation-limit, and combat guidance now expands per request without rewriting stored templates or crossing Basic/Agent editor fields.
+- **Lorebook Agent Prompt Whitespace**: Removed empty spacer lines from shipped templates and dynamic insertions.
+- **Game System Wizard Preview**: Preview extraction now matches exactly what saving retains instead of rendering unrelated fallback blocks.
+
+## [7.0.13] - 2026-08-08
+
+### Fixed
+- **Custom Module Editor**: Save/Delete after alt-tab (or any `saveSettings` → catalog sync) no longer targets an orphaned field object. Renaming a module ID could previously remove the live entry entirely; edits could silently fail to persist.
+
+## [7.0.12] - 2026-08-08
+
+### Changed
+- **CYOA prompt**: clarify resource eligibility as >0 (not depleted) in TRACKER STATE 0 (Current).
+
+## [7.0.11] - 2026-08-08
+
+### Changed
+- **CYOA prompt**: choices that spend a resource are only eligible when that resource is >0 in TRACKER STATE 0 (Current).
+
+## [7.0.10] - 2026-08-08
+
+### Changed
+- **Quests sysprompt**: objectives must be multiple, obtainable, clear immediate goals whose completion can be determined — not long-term vague goals.
+
+## [7.0.3] - 2026-08-08
+
+### Changed
+- **RNG explanation**: rewritten RollTheDice vs RNG Queue flow (pros/cons), plus how CYOA/combat close queue foresight — in the Narrator Configuration help popup and `docs/multihogDnDdoc.md`.
+
+## [7.0.2] - 2026-08-08
+
+### Changed
+- **XP system**: `<xp_system>` now awards for real consequences (info/threat/option/obstacle/quest), scales to stakes, defaults to award when in doubt, and ties skill-check XP to DC / combat XP to challenge.
+
+## [7.0.1] - 2026-08-08
+
+### Changed
+- **State memo inject**: every-turn TRACKER STATE 0 injection now uses a short `<state_memo>` preamble (resource availability / spend guidance) plus `## TRACKER STATE 0 (Current)`, instead of `### STATE MEMO (DO NOT REPEAT)`. Main system prompt `<state_memo>` wording is unchanged.
+
+## [7.0.0] - 2026-08-08
+
+### Changed
+- **CYOA injection**: `<CYOA_mode>` is no longer written into Quick Prompt Main. When CYOA is enabled, the built CYOA block is injected every turn into the user-message core (with active narrative pacing tags), immediately above the RNG queue. Prior CYOA/pacing copies are stripped from older user turns first.
+- **Narrative pacing tags**: mode instructions are nested as `<high_agency_mode_on>`, `<output_length>`, and `<slice_of_life_mode_on>` inside `<narrative>`, and the active tags are re-injected every turn with CYOA.
+- **CYOA prompt**: removed the generic “USER-DEFINED: Use the exact complete choice text…” type line.
+- **Prompt Defaults Updated**: fingerprint now includes runtime narrative pacing variants, the live CYOA builder block, and the context-inject contract so interceptor/builder changes surface in the upgrade dialog.
+
+## [6.9.41] - 2026-08-07
+
+### Fixed
+- **Lookback Update**: explicit Last N messages (panel / `/statetracker lookback=N`) no longer ignored when “Since last user message” is enabled — that mode still applies to regular auto/manual updates only.
+
+## [6.9.40] - 2026-08-07
+
+### Fixed
+- **Visualization Mode location resolve**: footer location text using em/en dashes (e.g. `Elderbough — Orra Venn's Workshop`) now tokenizes like `::` / commas, so hierarchical lore paths match instead of showing a duplicated unresolved label.
+
+## [6.9.35] - 2026-08-07
+
+### Changed
+- **Quests sysprompt**: clearer accept/complete/fail markers, broader objectives, and difficulty/emergent-quest guidance.
+- **Prompt order**: `<quests>` now sits above `<homebrew_and_custom_classes>`; Control Room order migrates for setups still on the old stock relative order (settings 5.5.16).
+
+## [6.9.34] - 2026-08-07
+
+### Fixed
+- **Location Scene Prompt**: Portrait Prompt Library save/load now includes the Location Scene Prompt (and the present-NPC toggle). Previously only NPC/PC and Character/Party/Combat prompts were persisted, so loading a saved setup left Location Scene unchanged/stale.
+- **Location Scene Prompt reset**: enabling Real-Time Visualization or toggling "Include Present NPCs" no longer force-overwrites a custom Location Scene Prompt — factory swap only happens when the current text is still a shipped default.
+
+## [6.9.33] - 2026-08-07
+
+### Changed
+- **CYOA prompt**: nudge line now reads "Not every looking around needs to be an investigation check, but investigating something specific should be."
+
+## [6.9.32] - 2026-08-07
+
+### Changed
+- **CHARACTER module toggle**: `[CHARACTER]` can now be turned off in Modules & Order like other stock modules (UI checkbox, State Tracker schema injection, and character-creation active blocks all respect `modules.character`). Default remains on.
+
+## [6.9.31] - 2026-08-07
+
+### Changed
+- **CYOA prompt**: restored to the pre-discipline wording (removed the "DC only on concrete targets / vague scans = NORMAL" rule — it made the model too conservative and encouraged silent rolls without committing DCs in choice text). Matches the v6.9.22 CYOA/sysprompt text.
+- **CYOA prompt**: added one soft nudge line — "Not every looking around needs to be an investigation check, but investigating something specific should be."
+
+## [6.9.29] - 2026-08-07
+
+### Changed
+- **Unified RollTheDice**: the d20 tool can also handle percentage odds via `formula: "1d100"` + `compare: "lte"` (auto-inferred for pure d100 formulas). Global **d100 Mode** and `RollTheDiceD100` remain for percentage-based rulesets.
+
+### Removed
+- Upstream existence-check / risk-scale prompt machinery and the per-turn `EXISTENCE ROLLS (d100)` queue pool (too much prompt weight for the ROI).
+
+## [6.9.28] - 2026-08-06
+
+### Added
+- **Species / Body / Equipment CORE split**: Lorebook Agent NPC/PC Core Sections replace the old combined `Appearance/Species` with Species (static), Body (lasting physical look), and Equipment (worn/carried gear). LA can sync PC Body/Equipment; automatic cadence passes may only touch Combat Profile via CORE tools (other identity fields require Direct Prompt). One-shot per-chat `[CHARACTER]` seed grounds first-pass Equipment. Prompt-defaults upgrade UI can reset NPC/PC Core Sections. Card-list synopsis + docs/tests included.
+
+## [6.9.27] - 2026-08-06
+
+### Added
+- **Existence checks**: d20 RNG queues now include a short `EXISTENCE ROLLS (d100):` pool (3 values) for upstream "is there something at all?" rolls (traps/hazards, hostile presence, notable finds) before any detection/skill DC. New `<existence_checks>` sysprompt section with category-specific follow-ups (traps held until triggered; missed loot gone forever; enemies contextual, not auto-stealth). CYOA examples gain pure-percentage chance brackets plus a dungeoneering Example 3.
+
+### Changed
+- Removed stale embedded `<RNG_constraints>` text that banned queue use for traps/exploration (contradicted Pre-Seeded / existence-check design).
+
+## [6.9.26] - 2026-08-06
+
+### Changed
+- **Tutorial docs**: First-Time Setup now recommends wiring Connections & Models to suitable components, and drops the redundant "Enable the framework" subsection.
+
+## [6.9.25] - 2026-08-06
+
+### Added
+- **Full Review Mode**: optional State Tracker operating mode (checkbox under Enable State Tracker) that wholesale-replaces the Core Prompt and User Prompt Suffix with a built-in "dump every module with real content" prompt. Recommended for weaker/local models that struggle with delta-only tracking. Custom Core Prompt / suffix are preserved and restored when the toggle is off. Documented in the Adventure Companion tutorial docs as the go-to fix when running Gemma / Mistral Small / Qwen / Llama / Phi as the tracker.
+
+### Fixed
+- **Empty `[TAG]…[/TAG]` pairs polluting the memo**: `mergeMemo` now treats hollow empty blocks (e.g. `[PARTY]\n[/PARTY]`) as removals instead of writing them into the persisted memo — a common Full Review failure mode on weak models. The Full Review prompt also no longer forbids omitting inapplicable modules.
+
+## [6.9.24] - 2026-08-05
+
+### Fixed
+- **"No message generated" / walled Direct Prompt & Character Creator requests**: the default (generateRaw) connection path now disables SillyTavern's `trimNames` cleanup. Previously, if a raw completion happened to start with `"{{user}}:"` or `"{{char}}:"` (very plausible for a full character sheet whose first line is the generated name — especially once Character Creator's "Create SillyTavern Persona" option sets `{{user}}` to that exact name), ST's core `cleanUpMessage` silently deleted the **entire response**, surfacing as an opaque "No message generated" error and blocking character creation / state updates.
+
+## [6.9.23] - 2026-08-05
+
+### Added
+- **Sexual Orientation in Character Creator**: restored next to Age, with a help tip explaining it is needed for the relationship system and CYOA romantic options. Draft/prompt plumbing included.
+
+## [6.9.22] - 2026-08-05
+
+### Fixed
+- **Combat Profile dumps whole [COMBAT] block**: Lorebook Agent guidance now requires one combatant's own stat block only — never the `COMBAT ROUND` header, side headers, or sibling combatants — with examples matching the real per-entity format.
+
+### Changed
+- **Level-up skill points**: `<level_up_protocol>` now includes `+[2+INT mod, min 1] Skill Pts → +1 each to that many Key Skills (cap: skill bonus ≤ level+3)`.
+
+## [6.9.21] - 2026-08-05
+
+### Added
+- **Pin Lorebook Agent entries**: thumbtack pin on tree entries / NPC cards (and green Active Lore Keys pills) permanently activates an entry. Pins are exempt from budget counting, agent deactivation, and keyword auto-expire — handled in JS only, so the agent prompt is unchanged.
+- **Modular Repertoire book-name labels**: stock modules now show the real lorebook category (e.g. `Locations (LOC)`) instead of only the prompt tag; custom tags show a live `→ ..._Bookname` preview matching the router's naming rule.
+
+### Changed
+- **`[CORE]` markers stripped for the GM/narrator**: lore injected into the narrator prompt no longer includes `[CORE]`/`[/CORE]` bookkeeping tags (a blank line keeps the permanent-vs-chronicle break). Stored lorebook content and the Lorebook Agent's own context still keep the tags.
+
+### Fixed
+- **Full NPC Cards broken**: restored the `renderRelTierDetailed` dependency wiring so opening a Full NPC Card no longer throws `ReferenceError`.
+
+## [6.9.20] - 2026-08-05
+
+### Fixed
+- **{{user}} still literal in Lorebook Agent tree view**: the default expanded entry view (Permanent description + campaign history lines) used a separate rendering path that the 6.9.16 fix missed — it now also resolves `{{user}}`/`{{char}}` macros for display.
+
+## [6.9.16] - 2026-08-05
+
+### Fixed
+- **{{user}} not substituted in read-only views**: the State Tracker sidebar (Character/Party cards, quest log) and the Lorebook Agent panel (NPC/Location summaries and campaign history) now resolve `{{user}}`/`{{char}}` macros for display. Stored memo/lorebook content and edit textareas still keep the raw macro, so renaming a persona doesn't desync history.
+- **Redundant class/profession in Lorebook Agent entries**: the Lorebook Agent is now explicitly instructed to write the bare `{{user}}` macro in chronicle/history lines, never followed by a class, profession, title, or parenthetical.
+
+## [6.9.15] - 2026-08-05
+
+### Added
+- **Initial campaign time**: Character Creator and Other Ways to Begin now let you set the starting time of day for the first `[TIME]` block (alongside Day 1/DD/MM/YYYY and 12h/24h), with the value persisted per chat and reformatted when the clock toggle changes.
+
+## [6.9.10] - 2026-08-05
+
+### Fixed
+- **Character creation formatting**: always inject the live `[CHARACTER]` module schema into the system prompt so creation never free-forms fields when modules are off.
+- **Abilities preference leak**: omit the Creator "Abilities" preference line (and hide the UI field) unless the `[ABILITIES]` module is enabled.
+- **CHARACTER module toggle**: treat `[CHARACTER]` as mandatory in the Modules list so its schema cannot be silently disabled.
+
+## [6.85.0] - 2026-08-03
+
+### Added
+- **Display Groups (BETA)**: globally bundle related tracker modules under a shared display-only header, with Stack and Tab Mode support, a dedicated manager, and safe opt-out behavior.
+
+### Changed
+- **State Tracker settings layout**: reorganized Advanced Options, module import/export controls, Display Groups, and custom bar animation settings into clearer drawers and controls.
+- **Rendering polish**: centered selected drawer labels, compacted separately colored pill spacing, isolated marker colors from their preceding labels, and aligned custom key/value rows.
+
+## [6.8.0] - 2026-08-03
+
+### Added
+- **Game System Wizard UI Live Preview**: generated tracker sample blocks now render through the real tracker renderer while editing, with working pagination and Full List controls for long blocks.
+- **Shared Character Creation connection**: Character Creator, Instant Action, and Other Ways to Begin now use one configurable connection setting.
+
+### Changed
+- **Wizard preview controls**: persistent Category Rendering Options are hidden from the temporary preview; pagination and full-list mode remain available locally without changing tracker settings.
+
+## [6.7.5] - 2026-08-03
+
+### Changed
+- **CYOA prompt context**: retains the four newest `<choices>` blocks (T-1 through T-4), stripping only T-5 and older blocks while preserving all historical choices in the visible chat.
+
+## [6.7.0] - 2026-08-02
+
+### Added
+- **World Skeleton lorebook sources**: World Skeleton generation can now use selected existing lorebooks as established source material, with per-chat selection and a strict mode that only creates explicitly mentioned entities.
+
+### Changed
+- **Skeleton Source**: replaced the narrow Atmosphere Summary concept with a freeform source field; Auto-Generate remains conservative and produces only a generalized backdrop without named story entities.
+- **Character Creator presets**: duplicate names now prompt before overwriting, and confirmed overwrites replace the existing preset instead of creating duplicates.
+- **World Progression onboarding**: clarified that an immediate Skeleton-only report can provide useful starting context for a new campaign.
+
+## [6.6.40] - 2026-08-02
+
+### Changed
+- **Quest XP scaling**: XP rewards now account for both quest complexity and the task's difficulty for the player character.
+
+## [6.6.35] - 2026-08-02
+
+### Changed
+- **Character Creator fields**: removed example placeholders and the Orientation field, including its draft and prompt plumbing.
+
+## [6.6.30] - 2026-08-01
+
+### Changed
+- **COMBAT ability examples**: elite enemy abilities now include concrete triggers, effects, save DCs, damage, and `2/2` encounter-use counters; the general format now instructs the model to define these properties.
+
+## [6.6.25] - 2026-08-01
+
+### Changed
+- **Narrator Configuration inheritance**: new chats now carry over the configuration from the previously active chat instead of resetting it to factory defaults, while retaining independent per-chat state.
+- **High-Agency Mode explanation**: clarified that this mode omits the instruction to lightly expand on the user's actions.
+
+## [6.6.20] - 2026-08-01
+
+### Changed
+- **NPC stat scaling prompt**: removed the instruction to always leave a fighting chance, allowing narrative realism to determine outcomes without guaranteed safety margins.
+
+## [6.6.15] - 2026-08-01
+
+### Added
+- **Prompt restoration guidance**: onboarding now explains that Multihog auto-applies its system prompt and points to the backup restore control for recovering the previous Main prompt.
+
+## [6.6.10] - 2026-08-01
+
+### Changed
+- **Tentative model guidance**: onboarding, Lorebook Agent help, README, documentation, and Adventure Companion now present Gemini Flash-Lite/Flash, Deepseek V4 Flash 0731, and GPT-5.6 Luna as inexpensive, promising options without a firm recommendation.
+- **Combat API Override guidance**: explains that the feature lets users switch to a faster model while combat is active, without prescribing a specific model.
+
+## [6.6.8] - 2026-08-01
+
+### Fixed
+- **Inventory item names**: bullet-delimited items containing commas (such as `Runekind, Quarterstaff +2`) now render as one item instead of being split across multiple rows. Legacy comma-separated inventory lines remain supported.
+
+## [6.6.5] - 2026-08-01
+
+### Changed
+- **CYOA prompt context**: keeps the two newest completed choice blocks (T-1 and T-2) as fresh examples for the AI, while stripping T-3 and older blocks only from the outgoing prompt. All historical choice buttons remain visible and usable in chat.
+- **Model guidance**: Gemini 3.5 Flash-Lite is again the suggested default for the State Tracker and Lorebook Agent; Deepseek V4 Flash 0731 and GPT-5.6 Luna are presented as alternatives with their respective tradeoffs. Combat API Override now points to faster models such as Gemini 3.5 Flash or Deepseek Flash.
+- **Out-of-range attacks**: the narrator now reports the failed range attempt and asks for another action instead of automatically moving the player closer.
+
+### Tests
+- Added regression coverage to keep the standard, legacy, and embedded prompt copies synchronized for the out-of-range attack rule.
+
+## [6.6.0] - 2026-08-01
+
+### Changed
+- **State Tracker resource accounting**: the Core Prompt now requires implicit spell-slot and resource changes to be tracked when the narrative clearly spends or grants them.
+- **Compact Core Prompt**: removed redundant blank spacer lines without changing prompt structure or instructions.
+- **Model recommendation**: GPT-5.6 Luna is now the primary State Tracker, Lorebook Agent, and Combat API Override recommendation; obsolete Gemini and thinking-level recommendations were removed.
+
+### Fixed
+- **CYOA mechanics wrapping**: long bracketed mechanics now wrap within choice buttons instead of overflowing the viewport.
+
+## [6.5.90] - 2026-08-01
+
+### Changed
+- **COMBAT example clarity**: the elite combatant example now gives Brutal Strike a concrete melee-hit trigger, Fortitude save DC, knockdown effect, and per-combat usage limit.
+
+## [6.5.85] - 2026-08-01
+
+### Changed
+- **Prompt accounting guidance**: PARTY and COMBAT prompts now explicitly require accurate spell-slot and ability-use tracking.
+- **Authoritative state memo**: clarified that TRACKER STATE 0 is read-only, already accounts for prior events, and must not be reconstructed from earlier narration.
+- **RNG queue prompt**: standardized the compact RNG_QUEUE v7.0 block and removed the stray blank line under its tags.
+
+## [6.5.75] - 2026-07-31
+
+### Added
+- **Universal custom-bar trickle animations**: opted-in `((BAR))` and `((BARREL))` changes now transfer progressively, with timing scaled to the percentage of the bar changed. Equivalent proportional changes take the same amount of time regardless of the bar's numeric scale.
+- **Enabled by default**: universal custom-bar animations are now on by default, while remaining user-toggleable.
+
 ## [6.5.35] - 2026-07-30
 
 ### Fixed
@@ -526,7 +1949,7 @@ All notable changes to the **Multihog D&D Framework** will be documented in this
 
 ### Changed
 - **APR threshold**: Second attack at BAB +8 (−5), was +10.
-- **Model guidance**: Onboarding + README note Combat API Override for slow-thinking GM models (Gemini 3.5 Flash, Medium thinking).
+- **Model guidance**: Onboarding + README note Combat API Override for slow-thinking GM models (GPT-5.6 Luna).
 
 ## [5.7.93] - 2026-07-18
 
@@ -1201,7 +2624,7 @@ Release tag for portrait file-storage work (5.1.6–5.1.8).
 - **Time/date UI sync**: All time and date controls (onboarding, Modules & Order pills, Extension Settings) funnel through shared setters so they never show contradictory state.
 - **TIME module prompt editor**: Edit/Reset now picks the correct stock prompt variant (`time`, `time_24h`, `time_ddmmyy`, `time_ddmmyy_24h`) based on both clock and calendar toggles.
 - **Status footer placement**: `<end_of_output_footer>` moved immediately after `</combat>` in both sysprompt files for higher prompt attention.
-- **Onboarding copy**: Updated How It Works, Initial Setup (time/date step), and simplified model recommendations (MiMo 2.5 Pro GM, Gemini 3.1 Flash-Lite for tracker/agent).
+- **Onboarding copy**: Updated How It Works, Initial Setup (time/date step), and simplified model recommendations (MiMo 2.5 Pro GM, GPT-5.6 Luna for tracker/agent).
 - **Lorebook Agent docs**: Removed obsolete Max Tokens control reference; Campaign Records now explains native Lorebook book creation instead of a separate Campaign Prefix control entry.
 
 ## [4.3.5] - 2026-07-05
@@ -2094,7 +3517,7 @@ A comprehensive upgrade to the external LLM pipeline and settings organization, 
 ## [1.7.1] - 2026-05-04
 
 ### Fixed
-- **Silent Model/Preset Switching**: Fixed a major regression where background RPG tracker passes would ignore the selected Connection Profile and Generation Settings Preset. The system now correctly routes requests through specific models (like Gemini 3 Flash) with custom sampler overrides (like disabling reasoning) silently and reliably.
+- **Silent Model/Preset Switching**: Fixed a major regression where background RPG tracker passes would ignore the selected Connection Profile and Generation Settings Preset. The system now correctly routes requests through specific models (like GPT-5.6 Luna) with custom sampler overrides (like disabling reasoning) silently and reliably.
 
 ## [1.7.0] - 2026-05-04
 
@@ -2351,3 +3774,8 @@ Significant upgrades to editing custom fields. The formatting is now clear, and 
 - **HUD Controls**: Added "SYSPROMPT" and "RNG" toggle buttons directly to the tracker panel.
 - **Optimized Layout**: Reordered sections to prioritize Character and Combat status over meta-stats like XP and Time.
 - **Factory Reset**: Added a "Factory Reset" button to the settings panel for easy recovery of default prompts.
+# 2026.8.22.3
+
+- Added map-free BUILDING containers with deterministic first-entry population through the normal Map Updater pass, explicit rumor-seeded SUSPECTED contents, and atomic off-screen Evolution population.
+- Asset placement now supports the closed containment pairs BUILDING → occupants/objects/loot/hazards/traps and CREATURE/GROUP → carried objects/loot, including effective-area movement, filtering, inspection, and presentation.
+- Untouched Map Architect, Map Updater, and Map Evolution prompts migrate to the new container policy while customized prompts remain unchanged.

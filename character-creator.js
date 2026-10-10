@@ -1,4 +1,4 @@
-import { getSettings, saveChatState, DEFAULT_PC_SECTIONS } from './state-manager.js';
+import { getSettings, saveChatState, DEFAULT_PC_SECTIONS, getActiveChatId } from './state-manager.js';
 import { sendStateRequest } from './llm-client.js';
 import { buildOnboardingXpHint, buildOnboardingTimeHint, buildStartingGearHint, buildOnboardingActiveBlocks, buildCombatAndSkillScalingHint } from './constants.js';
 import { escapeHtml } from './memo-processor.js';
@@ -10,6 +10,26 @@ import {
     resolveActivatedPersonaDescription,
 } from './src/state/player-identity.js';
 import { CHARACTER_CREATOR_NAME_ADDITIONS } from './src/state/character-names.js';
+import { buildInstantActionPromptSection, extractInstantActionLevel, normalizeInstantActionInstructions } from './src/state/instant-action-instructions.js';
+import { findCharacterCreatorPresetByName, upsertCharacterCreatorPreset } from './src/features/character-creator/presets.js';
+import { getCharacterCreationConnectionSettings } from './character-creation-connection.js';
+import { createChatCommitGuard } from './src/state/pass-affinity.js';
+
+/**
+ * sendDirectPrompt already refuses memo commits after a chat switch, but callers
+ * must not treat a failed/cancelled result as success — the live projection is
+ * then the arriving chat, so memo/portrait/Player Card follow-ups would corrupt it.
+ * @param {any} result
+ * @param {string} [label]
+ */
+function assertDirectPromptOwned(result, label = 'Character generation') {
+    if (result?.success) return result;
+    const status = result?.status;
+    if (status === 'cancelled' || status === 'chat_changed') {
+        throw new Error(`${label} stopped because the active chat changed or the request was cancelled.`);
+    }
+    throw new Error(result?.message || `${label} failed — State Model returned no character sheet. Check your API connection.`);
+}
 
 const _CR_CLASS_LISTS = {
     fantasy: [
@@ -81,9 +101,10 @@ export function getArchetypesForGenre(genre) {
  * @param {string} [opts.orientationVal]
  * @param {string} [opts.speciesVal]
  * @param {string} [opts.ethnicityVal]
- * @param {string} opts.genre
- * @param {number} opts.level
+ * @param {string} [opts.genre] Empty string means "no genre — AI decides"; omit entirely to fall back to saved settings.
+ * @param {number|null} opts.level Pass null for "no numeric levels" (custom system).
  * @param {string} opts.gearTier
+ * @param {boolean} [opts.useCombatScalingGuide] Defaults to the saved setting; set false to omit the d20/BAB-style combat & skill scaling guide.
  * @param {string} opts.classRaw
  * @param {string} [opts.classOtherVal]
  * @param {string} [opts.traitsVal]
@@ -91,6 +112,7 @@ export function getArchetypesForGenre(genre) {
  * @param {string} [opts.backgroundVal]
  * @param {string} [opts.appearanceVal]
  * @param {string} [opts.additionalVal]
+ * @param {string} [opts.instantActionInstructions] One-time Quick Start guidance; specified details override rolled defaults.
  * @returns {{ prompt: string, extraHints: string, cardSnippet: string }}
  */
 export function buildCharacterGenerationPrompt(opts) {
@@ -101,9 +123,15 @@ export function buildCharacterGenerationPrompt(opts) {
     const orientationVal = (opts.orientationVal || '').trim();
     const speciesVal = (opts.speciesVal || '').trim();
     const ethnicityVal = (opts.ethnicityVal || '').trim();
-    const genre = opts.genre || s.onboardingGenre || 'fantasy';
-    const level = opts.level || 1;
+    // An explicit empty string means "None — AI decides" was chosen deliberately;
+    // only fall back to the saved/default genre when the caller didn't pass one at all.
+    const genre = opts.genre !== undefined ? opts.genre : (s.onboardingGenre || 'fantasy');
+    // opts.level === null means "no numeric levels" (custom system) was chosen.
+    // Instant Action Initial Setup can still override that below if it names a level.
     const gearTier = opts.gearTier || s.onboardingGearTier || 'auto';
+    const useCombatScalingGuide = opts.useCombatScalingGuide !== undefined
+        ? !!opts.useCombatScalingGuide
+        : (s.onboardingUseCombatScalingGuide !== false);
     const classRaw = opts.classRaw || '__story__';
     const classOtherVal = (opts.classOtherVal || '').trim();
     const traitsVal = (opts.traitsVal || '').trim();
@@ -111,6 +139,13 @@ export function buildCharacterGenerationPrompt(opts) {
     const backgroundVal = (opts.backgroundVal || '').trim();
     const appearanceVal = (opts.appearanceVal || '').trim();
     const additionalVal = (opts.additionalVal || '').trim();
+    const instantActionInstructions = normalizeInstantActionInstructions(opts.instantActionInstructions);
+    const instantActionPromptSection = buildInstantActionPromptSection(instantActionInstructions);
+    const extractedLevel = extractInstantActionLevel(instantActionInstructions);
+    // An explicit Initial Setup level wins over the onboarding dropdown, including "no levels".
+    const noLevel = extractedLevel === null && opts.level === null;
+    const level = noLevel ? null : (extractedLevel ?? (opts.level || 1));
+    const instantActionLevelFallback = !!instantActionInstructions && extractedLevel === null && !noLevel;
 
     const isStoryFitting = classRaw === '__story__';
     const isOther = classRaw === '__other__';
@@ -125,7 +160,9 @@ export function buildCharacterGenerationPrompt(opts) {
     } else if (isOther && classOtherVal) {
         classLine = `Class: ${classOtherVal}`;
     } else if (!isOther && !isStoryFitting && classRaw) {
-        classLine = `Class: ${classRaw}`;
+        classLine = instantActionInstructions
+            ? `Class: ${classRaw} (fallback — if the Initial Setup specifies or clearly implies a different class, follow the Initial Setup instead)`
+            : `Class: ${classRaw}`;
     } else {
         classLine = `Class: (invent a class fitting the setting and era — do NOT use fantasy D&D class names in non-fantasy contexts)`;
     }
@@ -136,7 +173,7 @@ export function buildCharacterGenerationPrompt(opts) {
                      (nameVal ? `Name: ${nameVal}\n` : '') +
                      (genderVal ? `Gender: ${genderVal}\n` : '') +
                      (ageVal ? `Age: ${ageVal}\n` : '') +
-                     (orientationVal ? `Orientation: ${orientationVal}\n` : '') +
+                     (orientationVal ? `Sexual Orientation: ${orientationVal}\n` : '') +
                      (speciesVal ? `Species: ${speciesVal}\n` : '') +
                      (ethnicityVal ? `Ethnicity: ${ethnicityVal}\n` : '') +
                      (traitsVal ? `Traits: ${traitsVal}\n` : '') +
@@ -155,20 +192,28 @@ export function buildCharacterGenerationPrompt(opts) {
     const hasTime = !!mods['time'];
     const hasInventory = !!mods['inventory'];
     const hasSpells = !!mods['spells'];
+    const hasAbilities = !!mods['abilities'];
 
-    const levelPrefix = hasXp
-        ? `STARTING LEVEL: ${level} (mandatory — the character MUST be exactly Level ${level}).`
-        : `STARTING LEVEL: ${level} (mandatory — the character MUST be exactly Level ${level}; scale/adjust HP, stats, saves, capabilities, and gear (everything a character of that level might have) to Level ${level} accordingly, but do NOT output an [XP] block as it is disabled).`;
+    const levelPrefix = noLevel
+        ? `LEVEL SYSTEM: This character creation system does not use numeric character levels. Do NOT invent, assign, or output a level number, an [XP] block, or any D&D-style level indicator — balance the character using the setting's own internal logic instead.`
+        : instantActionLevelFallback
+            ? (hasXp
+                ? `STARTING LEVEL: ${level} (fallback — If the Initial Setup specifies or clearly implies a different level, follow the Initial Setup instead. The character MUST be exactly that level.)`
+                : `STARTING LEVEL: ${level} (fallback — If the Initial Setup specifies or clearly implies a different level, follow the Initial Setup instead; scale/adjust HP, stats, saves, capabilities, and gear to that level, but do NOT output an [XP] block as it is disabled).`)
+            : hasXp
+                ? `STARTING LEVEL: ${level} (mandatory — the character MUST be exactly Level ${level}).`
+                : `STARTING LEVEL: ${level} (mandatory — the character MUST be exactly Level ${level}; scale/adjust HP, stats, saves, capabilities, and gear (everything a character of that level might have) to Level ${level} accordingly, but do NOT output an [XP] block as it is disabled).`;
 
-    const xpHint = hasXp ? buildOnboardingXpHint(level) : '';
-    const TIME_FORMAT_HINT = hasTime ? buildOnboardingTimeHint(startDateVal) : '';
-    const magicGearHint = buildStartingGearHint(level, genre, hasInventory, gearTier);
+    const xpHint = (hasXp && !noLevel)
+        ? buildOnboardingXpHint(level, { allowInitialSetupOverride: instantActionLevelFallback })
+        : '';
+    const TIME_FORMAT_HINT = hasTime ? buildOnboardingTimeHint(startDateVal, s.initialTime || '08:00 AM') : '';
+    const magicGearHint = buildStartingGearHint(noLevel ? 1 : level, genre, hasInventory, gearTier);
 
     const activeBlocks = buildOnboardingActiveBlocks(s);
     const closingTagExamples = activeBlocks.map(b => `[/${b}]`).join(', ');
-    const CHARACTER_FORMAT_HINT = `\n\nCRITICAL TAG WRAPPING RULE: Every block you output MUST be enclosed in matching opening and closing tags (${closingTagExamples}).\nCRITICAL PARTY RULE: Do NOT output a [PARTY] block under any circumstances unless explicitly instructed.\nCRITICAL QUESTS RULE: Do NOT add quests or output a [QUESTS] block under any circumstances unless explicitly instructed.`;
-
     const blockListStr = activeBlocks.join(', ');
+    const CHARACTER_FORMAT_HINT = `\n\nCRITICAL TAG WRAPPING RULE: Every block you output MUST be enclosed in matching opening and closing tags (${closingTagExamples}).\nCRITICAL PARTY RULE: Do NOT output a [PARTY] block under any circumstances unless explicitly instructed.\nCRITICAL QUESTS RULE: Do NOT add quests or output a [QUESTS] block under any circumstances unless explicitly instructed.\nCRITICAL FORMAT RULE: Follow the exact field format, structure, and terminology defined in the module instructions provided in this system prompt for each block you output (${blockListStr}) — do not invent, omit, rename, or substitute fields, and do not fall back to a generic D&D template if the defined format differs from one. If a module (e.g. [ABILITIES], [INVENTORY], [SPELLS]) has no instructions in this system prompt, it is disabled — do NOT output that block or its concept (e.g. an "Abilities" list) anywhere in the response.`;
     const spellsClause = hasSpells ? " Only include [SPELLS] if the class genuinely uses magic." : '';
 
     const SETTING_HINTS = {
@@ -178,25 +223,24 @@ export function buildCharacterGenerationPrompt(opts) {
         fantasy: '',
     };
     const settingHint = SETTING_HINTS[genre] || '';
-    const combatSkillHint = buildCombatAndSkillScalingHint();
+    const combatSkillHint = useCombatScalingGuide ? buildCombatAndSkillScalingHint() : '';
     const f = (val, fallback) => val || fallback;
 
     const prompt = `${levelPrefix}
 
-Design a complete player character that fits naturally into the current scenario, card, and recent chat history. Be authentic to the setting, era, and tone.
+Design a complete player character that fits naturally into the current scenario, card, and recent chat history. Be authentic to the setting, era, and tone.${instantActionPromptSection}
 
 --- PLAYER PREFERENCES ---
 Name:         ${f(nameVal, '(invent a creative, setting-appropriate name — NEVER use "User", "Unknown", or any placeholder)')}
 Gender:       ${f(genderVal, '(your choice)')}
 Age:          ${f(ageVal, '(your choice)')}
-Orientation:  ${f(orientationVal, '(your choice)')}
+Sexual Orientation: ${f(orientationVal, '(your choice)')}
 Species:      ${f(speciesVal, '(your choice)')}
 Ethnicity:    ${f(ethnicityVal, '(your choice)')}
 ${classLine}
 Traits:       ${f(traitsVal, '(invent 2–3 distinctive traits)')}
-Level:        ${level}
-Abilities:    ${f(abilitiesVal, '(generate fitting, creative abilities)')}
-Background:   ${f(backgroundVal, '(invent a brief origin)')}
+Level:        ${noLevel ? 'N/A — this system has no numeric levels' : (instantActionLevelFallback ? `${level} (fallback — if the Initial Setup specifies a different level, follow the Initial Setup instead)` : level)}
+${hasAbilities ? `Abilities:    ${f(abilitiesVal, '(generate fitting, creative abilities)')}\n` : ''}Background:   ${f(backgroundVal, '(invent a brief origin)')}
 Appearance:   ${f(appearanceVal, '(invent a memorable appearance)')}
 ${additionalVal ? `Additional:   ${additionalVal}` : ''}
 ${cardSnippet ? `\n--- CHARACTER CARD CONTEXT ---${cardSnippet}` : ''}
@@ -208,9 +252,15 @@ ${nameVal ? `• Use the provided name "${nameVal}" exactly; do not alter or rep
 • Output every currently active state-memo field (enabled stock modules and custom fields): ${blockListStr}.${spellsClause}
 • Do NOT output a [PARTY] block under any circumstances unless explicitly instructed.
 • Do NOT add quests or output a [QUESTS] block under any circumstances unless explicitly instructed.
-• ${isOther || isStoryFitting ? 'Invent the most fitting class for the setting and context.' : `Use the chosen class "${classRaw}" exactly as given — do not rename or substitute it.`}
+• ${instantActionInstructions
+    ? `Treat the randomly chosen class "${classRaw}" as a fallback. If the Initial Setup specifies or clearly implies a different class, profession, or archetype, follow the Initial Setup instead.`
+    : (isOther || isStoryFitting ? 'Invent the most fitting class for the setting and context.' : `Use the chosen class "${classRaw}" exactly as given — do not rename or substitute it.`)}
 • If the setting is non-fantasy and no class was specified, create a class that feels natural to the world — not a fantasy D&D class name.
-• All stats, gear, and saves${hasXp ? ', and XP' : ''} must be consistent with Level ${level}.${magicGearHint}
+${noLevel
+    ? `• There is no numeric level for this character. All stats, gear, and saves must be internally consistent and appropriately balanced for the setting.${magicGearHint}`
+    : instantActionLevelFallback
+        ? `• Treat Level ${level} as a fallback. If the Initial Setup specifies or clearly implies a different level, follow the Initial Setup instead. All stats, gear, and saves${hasXp ? ', and XP' : ''} must be consistent with the chosen level.${magicGearHint}`
+        : `• All stats, gear, and saves${hasXp ? ', and XP' : ''} must be consistent with Level ${level}.${magicGearHint}`}
 ${combatSkillHint}
 ${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${settingHint}`;
 
@@ -219,27 +269,40 @@ ${CHARACTER_FORMAT_HINT}${xpHint}${TIME_FORMAT_HINT}${settingHint}`;
 
 /**
  * Generate a character sheet for Quick Start (no persona overlay).
- * @param {{ genre: string, className: string, level?: number, gearTier?: string, nameVal?: string }} opts
+ * @param {{ genre: string, className: string, level?: number|null, gearTier?: string, nameVal?: string, instantActionInstructions?: string }} opts
  * @returns {Promise<{ charName: string }>}
  */
 export async function generateQuickStartCharacter(opts) {
     const s = getSettings();
     const genre = opts.genre || s.onboardingGenre || 'fantasy';
-    const level = opts.level ?? (parseInt(String(s.onboardingLevel || 1), 10) || 1);
+    const level = opts.level !== undefined
+        ? opts.level
+        : (s.onboardingLevel === 'none' ? null : (parseInt(String(s.onboardingLevel || 1), 10) || 1));
     const gearTier = opts.gearTier || s.onboardingGearTier || 'auto';
     const className = opts.className;
     if (!className) throw new Error('Quick Start requires a class archetype.');
 
     const memoBefore = s.currentMemo || '';
+    const passChatId = opts.chatId ?? getActiveChatId();
+    const ownsChat = opts.canCommit || createChatCommitGuard(passChatId, getActiveChatId);
+    if (!ownsChat()) throw new Error('Character generation stopped because the active chat changed.');
     const { prompt } = buildCharacterGenerationPrompt({
         nameVal: opts.nameVal,
         genre,
         level,
         gearTier,
         classRaw: className,
+        instantActionInstructions: opts.instantActionInstructions,
     });
 
-    await sendDirectPrompt(prompt, { systemPromptMode: 'modules_only' });
+    const result = await sendDirectPrompt(prompt, {
+        systemPromptMode: 'modules_only',
+        connectionSettings: getCharacterCreationConnectionSettings(s),
+    });
+    assertDirectPromptOwned(result);
+    if (!ownsChat()) {
+        throw new Error('Character generation stopped because the active chat changed or the request was cancelled.');
+    }
 
     const s2 = getSettings();
     const memoAfter = s2.currentMemo || '';
@@ -248,7 +311,7 @@ export async function generateQuickStartCharacter(opts) {
     }
 
     const extractedName = extractCharNameFromMemo(memoAfter);
-    return { charName: extractedName || 'My Character' };
+    return { charName: extractedName || 'My Character', passChatId };
 }
 
 /**
@@ -256,27 +319,36 @@ export async function generateQuickStartCharacter(opts) {
  * @param {string} name
  * @param {string} bio
  * @param {number} [wordCount]
+ * @param {{ chatId?: string|null, canCommit?: () => boolean }} [opts]
  * @returns {Promise<boolean>} true if written
  */
-export async function addPlayerCardToLorebookAgent(name, bio, wordCount = 150) {
+export async function addPlayerCardToLorebookAgent(name, bio, wordCount = 150, opts = {}) {
     const safeName = String(name || '').replace(/['"\\]/g, '').trim() || 'My Character';
     const finalBio = String(bio || '').trim();
     if (!finalBio) return false;
 
+    const passChatId = opts.chatId ?? getActiveChatId();
+    const ownsChat = opts.canCommit || createChatCommitGuard(passChatId, getActiveChatId);
+    if (!ownsChat()) return false;
     const s = getSettings();
     if (!s.chatStates) s.chatStates = {};
-    const currentChatId = SillyTavern.getContext().chatId;
-    if (!currentChatId) return false;
 
-    if (!s.chatStates[currentChatId]) s.chatStates[currentChatId] = {};
-    s.chatStates[currentChatId].playerCharacter = {
+    if (!s.chatStates[passChatId]) s.chatStates[passChatId] = {};
+    s.chatStates[passChatId].playerCharacter = {
         name: safeName,
         bio: finalBio,
         wordCount: wordCount || 100,
         timestamp: Date.now(),
     };
-    saveChatState(currentChatId);
-    await refreshAgentManifestNow();
+    saveChatState(passChatId);
+    // The card is ready as soon as it is stored above. Campaign Records can be
+    // rebuilding a large lorebook or Scene View, so never make the approval UI
+    // wait for that unrelated work to finish.
+    if (ownsChat()) {
+        void refreshAgentManifestNow().catch(error => {
+            console.warn('[RPG Tracker] Could not refresh Campaign Records after adding Player Card:', error);
+        });
+    }
     return true;
 }
 
@@ -295,6 +367,7 @@ export function collectCharacterCreatorDraft(panel) {
         genre: /** @type {HTMLSelectElement} */ (panel.querySelector('#rt-cr-genre'))?.value ?? '',
         level: /** @type {HTMLSelectElement} */ (panel.querySelector('#rt-cr-level'))?.value ?? '1',
         gearTier: /** @type {HTMLSelectElement} */ (panel.querySelector('#rt-cr-gear-tier'))?.value ?? 'auto',
+        combatScalingGuide: !!/** @type {HTMLInputElement} */ (panel.querySelector('#rt-cr-combat-guide-cb'))?.checked,
         class: classSelect?.value ?? '__story__',
         classOther: /** @type {HTMLInputElement} */ (panel.querySelector('#rt-cr-class-other'))?.value ?? '',
         traits: /** @type {HTMLTextAreaElement} */ (panel.querySelector('#rt-cr-traits'))?.value ?? '',
@@ -326,6 +399,8 @@ export function applyCharacterCreatorDraft(panel, draft, populateClasses) {
     setVal('#rt-cr-genre', draft.genre ?? '');
     setVal('#rt-cr-level', String(draft.level ?? 1));
     setVal('#rt-cr-gear-tier', draft.gearTier ?? 'auto');
+    const combatGuideCb = /** @type {HTMLInputElement|null} */ (panel.querySelector('#rt-cr-combat-guide-cb'));
+    if (combatGuideCb) combatGuideCb.checked = draft.combatScalingGuide !== false;
     populateClasses(draft.genre ?? '');
     const classSelect = /** @type {HTMLSelectElement|null} */ (panel.querySelector('#rt-cr-class'));
     const classOther = /** @type {HTMLInputElement|null} */ (panel.querySelector('#rt-cr-class-other'));
@@ -380,8 +455,10 @@ export function resetCharacterCreatorFields(panel, populateClasses) {
     setVal('#rt-cr-species', '');
     setVal('#rt-cr-ethnicity', '');
     setVal('#rt-cr-genre', '');
-    setVal('#rt-cr-level', String(s.onboardingLevel || 1));
+    setVal('#rt-cr-level', s.onboardingLevel === 'none' ? 'none' : String(s.onboardingLevel || 1));
     setVal('#rt-cr-gear-tier', s.onboardingGearTier || 'auto');
+    const combatGuideCbReset = /** @type {HTMLInputElement|null} */ (panel.querySelector('#rt-cr-combat-guide-cb'));
+    if (combatGuideCbReset) combatGuideCbReset.checked = s.onboardingUseCombatScalingGuide !== false;
     populateClasses('');
     const classSelect = /** @type {HTMLSelectElement|null} */ (panel.querySelector('#rt-cr-class'));
     if (classSelect) classSelect.value = '__story__';
@@ -472,9 +549,11 @@ export function showCharacterRollPanel(el) {
     } else {
         // Default genre to '' (None — AI decides); do NOT carry over onboardingGenre here
         if (genreSelect) genreSelect.value = '';
-        if (levelSelect) levelSelect.value = String(s.onboardingLevel || 1);
+        if (levelSelect) levelSelect.value = s.onboardingLevel === 'none' ? 'none' : String(s.onboardingLevel || 1);
         const gearTierSelect = /** @type {HTMLSelectElement|null} */ (panel.querySelector('#rt-cr-gear-tier'));
         if (gearTierSelect) gearTierSelect.value = s.onboardingGearTier || 'auto';
+        const combatGuideCbInit = /** @type {HTMLInputElement|null} */ (panel.querySelector('#rt-cr-combat-guide-cb'));
+        if (combatGuideCbInit) combatGuideCbInit.checked = s.onboardingUseCombatScalingGuide !== false;
     }
 
     const nameInput = /** @type {HTMLInputElement|null} */ (panel.querySelector('#rt-cr-name'));
@@ -615,19 +694,38 @@ export function showCharacterRollPanel(el) {
                 presetName = prompt('Name this preset:');
             }
             if (!presetName || !presetName.trim()) return;
+            const trimmedName = presetName.trim();
             const draft = collectCharacterCreatorDraft(panel);
             const st = getSettings();
             if (!st.characterCreatorPresets) st.characterCreatorPresets = [];
-            const newId = Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
-            st.characterCreatorPresets.push({
-                id: newId,
-                name: presetName.trim(),
-                data: draft,
-            });
+            const existingPreset = findCharacterCreatorPresetByName(st.characterCreatorPresets, trimmedName);
+            if (existingPreset) {
+                let overwrite = false;
+                if (Popup?.show?.confirm) {
+                    overwrite = !!(await Popup.show.confirm(
+                        'Overwrite Character Creator Preset?',
+                        `A preset named "<b>${escapeHtml(trimmedName)}</b>" already exists. Replace it with the current fields?`,
+                        { okButton: 'Overwrite', cancelButton: 'Cancel' },
+                    ));
+                } else {
+                    overwrite = confirm(`A preset named "${trimmedName}" already exists. Overwrite it?`);
+                }
+                if (!overwrite) return;
+            }
+            const result = upsertCharacterCreatorPreset(
+                st.characterCreatorPresets,
+                trimmedName,
+                draft,
+                () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+            );
+            st.characterCreatorPresets = result.presets;
             saveSettings();
             renderPresetPills();
-            if (presetSelect) presetSelect.value = newId;
-            toastr['success'](`Preset "${presetName.trim()}" saved!`, 'Character Creator');
+            if (presetSelect) presetSelect.value = result.preset.id;
+            toastr['success'](
+                `Preset "${trimmedName}" ${result.overwritten ? 'overwritten' : 'saved'}!`,
+                'Character Creator',
+            );
         });
     }
 }
@@ -637,20 +735,27 @@ async function handleCharRollGenerate(el, panel) {
     saveCharacterCreatorDraft(panel);
 
     const s = getSettings();
-    const gearTierEl = /** @type {HTMLSelectElement|null} */ (panel.querySelector('#rt-cr-gear-tier'));
-    if (gearTierEl) {
-        s.onboardingGearTier = gearTierEl.value || 'auto';
-        saveSettings();
-    }
     const nameVal        = /** @type {HTMLInputElement}   */ (panel.querySelector('#rt-cr-name'))?.value.trim()        || '';
     const genderVal      = /** @type {HTMLInputElement}   */ (panel.querySelector('#rt-cr-gender'))?.value.trim()      || '';
     const ageVal         = /** @type {HTMLInputElement}   */ (panel.querySelector('#rt-cr-age'))?.value.trim()         || '';
     const orientationVal = /** @type {HTMLInputElement}   */ (panel.querySelector('#rt-cr-orientation'))?.value.trim() || '';
     const speciesVal     = /** @type {HTMLInputElement}   */ (panel.querySelector('#rt-cr-species'))?.value.trim()     || '';
     const ethnicityVal   = /** @type {HTMLInputElement}   */ (panel.querySelector('#rt-cr-ethnicity'))?.value.trim()   || '';
-    const genre          = /** @type {HTMLSelectElement}  */ (panel.querySelector('#rt-cr-genre'))?.value              || s.onboardingGenre || 'fantasy';
-    const level          = parseInt(/** @type {HTMLSelectElement} */ (panel.querySelector('#rt-cr-level'))?.value      || String(s.onboardingLevel || 1), 10) || 1;
-    const gearTier       = /** @type {HTMLSelectElement} */ (panel.querySelector('#rt-cr-gear-tier'))?.value || s.onboardingGearTier || 'auto';
+    const genreEl        = /** @type {HTMLSelectElement|null} */ (panel.querySelector('#rt-cr-genre'));
+    // An empty string is a deliberate "None — AI decides" choice, not a missing value —
+    // only fall back to the saved genre when the select itself couldn't be found.
+    const genre          = genreEl ? genreEl.value : (s.onboardingGenre || 'fantasy');
+    const levelRawVal    = /** @type {HTMLSelectElement|null} */ (panel.querySelector('#rt-cr-level'))?.value
+        ?? (s.onboardingLevel === 'none' ? 'none' : String(s.onboardingLevel || 1));
+    const level          = levelRawVal === 'none' ? null : (parseInt(levelRawVal, 10) || 1);
+    const gearTierEl     = /** @type {HTMLSelectElement|null} */ (panel.querySelector('#rt-cr-gear-tier'));
+    const gearTier       = gearTierEl?.value || s.onboardingGearTier || 'auto';
+    const combatGuideCb  = /** @type {HTMLInputElement|null} */ (panel.querySelector('#rt-cr-combat-guide-cb'));
+    const useCombatScalingGuide = combatGuideCb ? !!combatGuideCb.checked : (s.onboardingUseCombatScalingGuide !== false);
+    s.onboardingLevel = levelRawVal === 'none' ? 'none' : level;
+    s.onboardingGearTier = gearTier;
+    if (combatGuideCb) s.onboardingUseCombatScalingGuide = useCombatScalingGuide;
+    saveSettings();
     const classSelect    = /** @type {HTMLSelectElement|null} */ (panel.querySelector('#rt-cr-class'));
     const classRaw       = classSelect?.value || '__story__';
     const classOtherVal  = /** @type {HTMLInputElement} */ (panel.querySelector('#rt-cr-class-other'))?.value.trim()   || '';
@@ -672,6 +777,7 @@ async function handleCharRollGenerate(el, panel) {
         nameVal, genderVal, ageVal, orientationVal, speciesVal, ethnicityVal,
         genre, level, gearTier, classRaw, classOtherVal,
         traitsVal, abilitiesVal, backgroundVal, appearanceVal, additionalVal,
+        useCombatScalingGuide,
     });
 
     const onboardingEl = resolveOnboardingEl(el) || el;
@@ -681,20 +787,33 @@ async function handleCharRollGenerate(el, panel) {
     if (genBtn) { genBtn.disabled = true; genBtn.textContent = '🎲 Generating...'; }
 
     try {
-        await sendDirectPrompt(prompt, { systemPromptMode: 'modules_only' });
+        const passChatId = getActiveChatId();
+        const ownsChat = createChatCommitGuard(passChatId, getActiveChatId);
+        const result = await sendDirectPrompt(prompt, {
+            systemPromptMode: 'modules_only',
+            connectionSettings: getCharacterCreationConnectionSettings(s),
+        });
+        assertDirectPromptOwned(result);
+        if (!ownsChat()) return;
 
         if (wantPlayerCard || wantStPersona) {
             const s2 = getSettings();
             const extractedName = extractCharNameFromMemo(s2.currentMemo);
             const charName = extractedName || nameVal || 'My Character';
             if (wantStPersona) {
-                await activateSillyTavernPersona(charName);
+                if (!ownsChat()) return;
+                await activateSillyTavernPersona(charName, { chatId: passChatId, canCommit: ownsChat });
             }
             if (!wantPlayerCard) return;
+            if (!ownsChat()) return;
             const finalExtraHints = extraHints + (cardSnippet ? `\n\n--- CHARACTER CARD CONTEXT ---${cardSnippet}` : '');
             const bio = await generatePersonaBio(charName, wordCount, finalExtraHints);
-            if (bio) showPersonaConfirmOverlay(bio, charName, wordCount, extraHints);
+            if (!ownsChat()) return;
+            if (bio) showPersonaConfirmOverlay(bio, charName, wordCount, extraHints, { chatId: passChatId, canCommit: ownsChat });
         }
+    } catch (error) {
+        console.error('[Character Creator]', error);
+        toastr['error'](error?.message || String(error), 'Character Creator', { timeOut: 8000 });
     } finally {
         const resetEl = resolveOnboardingEl(el) || el;
         const resetPanel = resetEl.querySelector('#rt-char-roll-panel') || panel;
@@ -730,8 +849,9 @@ Rules:
 - Total word count across all sections: approximately ${wordCount} words.
 - Write in third person (he/she/they).
 - Keep the prose grounded and natural. Avoid purple prose, excessive em-dashes, or clichés (e.g. "deliberate step", "breath hitched").
-- Do not include a preamble, title, or closing statement. Output ONLY the six sections.
+- Do not include a preamble, title, or closing statement. Output ONLY the ${coreSections.length} sections listed above.
 - CRITICAL: You MUST faithfully and explicitly incorporate ALL provided traits, background hints, species, gender, and appearance hints from the character card and the PLAYER PREFERENCES. Do not ignore user-provided details.
+- CRITICAL: Do NOT describe worn clothing, armor, or gear in the Body section — that belongs exclusively in the Equipment section (if present).
 - CRITICAL: Never output template macro strings such as {{char}}, {{user}}, or any other {{...}} placeholders. Always replace them with the actual character's name or a fitting proper name.
 - Use recent story messages only for voice, relationships, and ongoing situation — do not invent stats that contradict the character card.`;
 
@@ -758,7 +878,7 @@ Rules:
 
     const userPrompt = `CHARACTER CARD:\n${cleanMemo}\n\n${chatLog}\n\nWrite the persona description for ${charName || 'this character'}.\nIMPORTANT REMINDER: The total word count across all sections MUST be approximately ${wordCount} words!`;
     try {
-        const result = await sendStateRequest(s, systemPrompt, userPrompt);
+        const result = await sendStateRequest(getCharacterCreationConnectionSettings(s), systemPrompt, userPrompt);
         return (result || '').trim() || null;
     } catch (e) {
         toastr['warning']('Player Card generation failed.', 'Character Creator');
@@ -766,9 +886,16 @@ Rules:
     }
 }
 
-async function uploadDefaultPersonaAvatar(url, avatarId, refreshAvatars) {
+function assertPersonaChatOwned(canCommit) {
+    if (!canCommit()) throw new Error('Persona setup stopped because the active chat changed.');
+}
+
+async function uploadDefaultPersonaAvatar(url, avatarId, refreshAvatars, canCommit) {
+    assertPersonaChatOwned(canCommit);
     const fetchResult = await fetch(url);
+    assertPersonaChatOwned(canCommit);
     const blob = await fetchResult.blob();
+    assertPersonaChatOwned(canCommit);
     const file = new File([blob], 'avatar.png', { type: 'image/png' });
     const formData = new FormData();
     formData.append('avatar', file);
@@ -780,14 +907,18 @@ async function uploadDefaultPersonaAvatar(url, avatarId, refreshAvatars) {
         cache: 'no-cache',
         body: formData,
     });
+    assertPersonaChatOwned(canCommit);
     if (!response.ok) {
         throw new Error(`Failed to upload persona avatar: ${response.statusText}`);
     }
     const data = await response.json();
+    assertPersonaChatOwned(canCommit);
     await refreshAvatars(true, data?.path || avatarId);
 }
 
 async function injectAsSillyTavernPersona(name, options = {}) {
+    const canCommit = options.canCommit;
+    assertPersonaChatOwned(canCommit);
     const [
         { initPersona, setUserAvatar, getUserAvatars, setPersonaDescription, user_avatar, persona_description_positions },
         { findPersona },
@@ -799,6 +930,7 @@ async function injectAsSillyTavernPersona(name, options = {}) {
         import('../../../power-user.js'),
         import('../../../../script.js'),
     ]);
+    assertPersonaChatOwned(canCommit);
 
     const identity = buildNameOnlyPersonaIdentity(name);
     const trimmedName = identity.name;
@@ -836,13 +968,18 @@ async function injectAsSillyTavernPersona(name, options = {}) {
     } else {
         avatarId = `${Date.now()}-${trimmedName.replace(/[^a-zA-Z0-9]/g, '')}.png`;
         await initPersona(avatarId, trimmedName, identity.description, '');
-        await uploadDefaultPersonaAvatar(default_user_avatar, avatarId, getUserAvatars);
+        assertPersonaChatOwned(canCommit);
+        await uploadDefaultPersonaAvatar(default_user_avatar, avatarId, getUserAvatars, canCommit);
     }
 
+    assertPersonaChatOwned(canCommit);
     await setUserAvatar(avatarId);
+    assertPersonaChatOwned(canCommit);
     setPersonaDescription();
     await saveSettings();
+    assertPersonaChatOwned(canCommit);
     await getUserAvatars(true, avatarId);
+    assertPersonaChatOwned(canCommit);
     return avatarId;
 }
 
@@ -852,12 +989,16 @@ async function injectAsSillyTavernPersona(name, options = {}) {
  * the sole rich biography. Persona-derived onboarding may preserve the existing
  * source description.
  * @param {string} name
- * @param {{ preserveExistingDescription?: boolean }} [options]
+ * @param {{ preserveExistingDescription?: boolean, chatId?: string|null, canCommit?: () => boolean }} [options]
  * @returns {Promise<string>} avatarId
  */
 export async function activateSillyTavernPersona(name, options = {}) {
+    const chatId = options.chatId ?? getActiveChatId();
+    const canCommit = options.canCommit || createChatCommitGuard(chatId, getActiveChatId);
+    assertPersonaChatOwned(canCommit);
     const identity = buildNameOnlyPersonaIdentity(name);
-    const avatarId = await injectAsSillyTavernPersona(identity.name, options);
+    const avatarId = await injectAsSillyTavernPersona(identity.name, { ...options, chatId, canCommit });
+    assertPersonaChatOwned(canCommit);
 
     try {
         const ctx = SillyTavern.getContext();
@@ -870,6 +1011,9 @@ export async function activateSillyTavernPersona(name, options = {}) {
 }
 
 export function showPersonaConfirmOverlay(bioText, charName, wordCount, extraHints = '', opts = {}) {
+    const passChatId = opts.chatId ?? getActiveChatId();
+    const ownsChat = opts.canCommit || createChatCommitGuard(passChatId, getActiveChatId);
+    if (!ownsChat()) return;
     const existing = document.getElementById('rt-persona-confirm-overlay');
     if (existing) existing.remove();
 
@@ -916,9 +1060,14 @@ export function showPersonaConfirmOverlay(bioText, charName, wordCount, extraHin
 
      // ── Add as Player into Lorebook Agent ────────────────────────────────────
      overlay.querySelector('#rt-pco-add-pc').addEventListener('click', async () => {
+         if (!ownsChat()) {
+             toastr['warning']('This Player Card belongs to a previous chat session. Generate it again in the intended chat.', 'Character Creator');
+             overlay.remove();
+             return;
+         }
          const finalBio = /** @type {HTMLTextAreaElement} */ (overlay.querySelector('#rt-pco-bio')).value.trim();
          const safeName = charName.replace(/['"\\]/g, '').trim() || 'My Character';
-         const ok = await addPlayerCardToLorebookAgent(safeName, finalBio, wordCount || 100);
+         const ok = await addPlayerCardToLorebookAgent(safeName, finalBio, wordCount || 100, { chatId: passChatId, canCommit: ownsChat });
          if (ok) {
              toastr['success'](`"${safeName}" added as Player in Lorebook Agent.`, 'Character Creator');
          } else {
@@ -929,10 +1078,12 @@ export function showPersonaConfirmOverlay(bioText, charName, wordCount, extraHin
  
      // ── Regenerate button ────────────────────────────────────────────────────
      overlay.querySelector('#rt-pco-regen').addEventListener('click', async () => {
+         if (!ownsChat()) { overlay.remove(); return; }
          const regenBtn = /** @type {HTMLButtonElement} */ (overlay.querySelector('#rt-pco-regen'));
          regenBtn.disabled = true;
          regenBtn.textContent = '⏳ Regenerating...';
          const newBio = await generatePersonaBio(charName, wordCount, extraHints, opts);
+         if (!ownsChat()) { overlay.remove(); return; }
          if (newBio) {
              /** @type {HTMLTextAreaElement} */ (overlay.querySelector('#rt-pco-bio')).value = newBio;
          } else {
@@ -1167,7 +1318,10 @@ async function importPcFromCard(charCard, mode, el) {
     s.onboardingGearTier = gearTier;
     const importGenre = s.onboardingGenre || 'fantasy';
     const importHasInventory = !!s.modules?.inventory;
-    const gearHint = buildStartingGearHint(s.onboardingLevel || 1, importGenre, importHasInventory, gearTier);
+    const importLevelForGear = s.onboardingLevel === 'none'
+        ? 1
+        : (parseInt(String(s.onboardingLevel || 1), 10) || 1);
+    const gearHint = buildStartingGearHint(importLevelForGear, importGenre, importHasInventory, gearTier);
 
     // --- Step 1: State Memo ---
     const memoPromptMinimal = `You are a state tracker assistant. Translate this character card into state tracker format for the player character.
@@ -1201,57 +1355,79 @@ ${worldCtx}`;
     toastr['info'](`Importing "${name}" as PC… generating state memo.`, 'PC Import');
     el.querySelectorAll('.rt-random-char-btn').forEach(b => { /** @type {HTMLButtonElement} */ (b).disabled = true; });
 
-    await sendDirectPrompt(memoPrompt, { systemPromptMode: 'modules_only' });
+    const passChatId = getActiveChatId();
+    const ownsChat = createChatCommitGuard(passChatId, getActiveChatId);
+    let importSucceeded = false;
+    try {
+        const result = await sendDirectPrompt(memoPrompt, {
+            systemPromptMode: 'modules_only',
+            connectionSettings: getCharacterCreationConnectionSettings(s),
+        });
+        assertDirectPromptOwned(result, 'PC Import');
+        if (!ownsChat()) {
+            throw new Error('PC Import stopped because the active chat changed or the request was cancelled.');
+        }
+        importSucceeded = true;
 
-    // Sync the card's avatar as the PC portrait globally so both the State Tracker
-    // and Campaign Records immediately reflect the newly imported character's image.
-    if (charCard.avatar && charCard.avatar !== 'none') {
-        if (!s.customPortraits) s.customPortraits = {};
-        const avatarUrl = `/characters/${encodeURIComponent(charCard.avatar)}`;
-        const safeName = name.replace(/['"\\]/g, '').trim() || 'My Character';
-        s.customPortraits['CHARACTER'] = avatarUrl;
-        s.customPortraits['PC'] = avatarUrl;
-        s.customPortraits[safeName] = avatarUrl;
-        
-        // Also map the AI-generated clean name (if any) from the new state memo,
-        // so the State Tracker can match the portrait even if the AI changed the name.
-        const extractedName = extractCharNameFromMemo(s.currentMemo);
-        if (extractedName && extractedName !== safeName) {
-            s.customPortraits[extractedName] = avatarUrl;
+        // Sync the card's avatar as the PC portrait globally so both the State Tracker
+        // and Campaign Records immediately reflect the newly imported character's image.
+        if (charCard.avatar && charCard.avatar !== 'none'
+            && ownsChat()) {
+            if (!s.customPortraits) s.customPortraits = {};
+            const avatarUrl = `/characters/${encodeURIComponent(charCard.avatar)}`;
+            const safeName = name.replace(/['"\\]/g, '').trim() || 'My Character';
+            s.customPortraits['CHARACTER'] = avatarUrl;
+            s.customPortraits['PC'] = avatarUrl;
+            s.customPortraits[safeName] = avatarUrl;
+
+            // Also map the AI-generated clean name (if any) from the new state memo,
+            // so the State Tracker can match the portrait even if the AI changed the name.
+            const extractedName = extractCharNameFromMemo(s.currentMemo);
+            if (extractedName && extractedName !== safeName) {
+                s.customPortraits[extractedName] = avatarUrl;
+            }
+
+            if (ownsChat() && typeof saveChatState === 'function') {
+                saveChatState(passChatId);
+            }
+
+            // Force an immediate synchronous re-render of the State Tracker
+            // now that the customPortraits object has the PC avatar.
+            if (ownsChat() && typeof refreshRenderedView === 'function') {
+                refreshRenderedView();
+            }
+            document.dispatchEvent(new CustomEvent('rt_lore_agent_updated'));
         }
-        
-        const currentChatId = SillyTavern.getContext().chatId;
-        if (currentChatId && typeof saveChatState === 'function') {
-            saveChatState(currentChatId);
-        }
-        
-        // Force an immediate synchronous re-render of the State Tracker 
-        // now that the customPortraits object has the PC avatar.
-        if (typeof refreshRenderedView === 'function') {
-            refreshRenderedView();
-        }
-        document.dispatchEvent(new CustomEvent('rt_lore_agent_updated'));
+    } catch (error) {
+        console.error('[PC Import]', error);
+        toastr['error'](error?.message || String(error), 'PC Import', { timeOut: 8000 });
+        el.querySelectorAll('.rt-random-char-btn').forEach(b => { /** @type {HTMLButtonElement} */ (b).disabled = false; });
+        return;
     }
 
     el.querySelectorAll('.rt-random-char-btn').forEach(b => { /** @type {HTMLButtonElement} */ (b).disabled = false; });
+    if (!importSucceeded || !ownsChat()) return;
 
     // --- Step 2: Optional name-only ST persona ---
     if (s.onboardingCreateSillyTavernPersona !== false) {
         try {
-            await activateSillyTavernPersona(name);
+            await activateSillyTavernPersona(name, { chatId: passChatId, canCommit: ownsChat });
         } catch (error) {
             console.error('[PC Import] Could not create name-only ST persona:', error);
             toastr['warning'](`PC imported, but the ST persona for "${name}" could not be created.`, 'PC Import');
         }
     }
 
+    if (!ownsChat()) return;
+
     // --- Step 3: Optional Lorebook Agent Player Card ---
     if (!s.onboardingCreatePersona) return;
     toastr['info'](`Generating Lorebook Agent Player Card for "${name}"…`, 'PC Import');
     
     const bio = await generatePcImportBio(charCard, mode, wordCountStr);
+    if (!ownsChat()) return;
     if (bio) {
-        showPersonaConfirmOverlay(bio, name, wordCountStr === 'same' ? 150 : parseInt(wordCountStr, 10), '');
+        showPersonaConfirmOverlay(bio, name, wordCountStr === 'same' ? 150 : parseInt(wordCountStr, 10), '', { chatId: passChatId, canCommit: ownsChat });
     } else {
         toastr['warning']('State memo sent, but Player Card generation failed. You can add the Player Card manually.', 'PC Import');
     }
@@ -1309,20 +1485,8 @@ RULES — read carefully:
             : '';
         const userPrompt = `CARD TO TRANSCRIBE:\n${cardText}${worldSection}\n\nOutput the transcribed persona text now.`;
 
-        const aiSettings = {
-            connectionSource: s.routerConnectionSource ?? 'default',
-            connectionProfileId: s.routerConnectionProfileId || '',
-            completionPresetId: s.routerCompletionPresetId || '',
-            ollamaUrl: s.routerOllamaUrl || 'http://localhost:11434',
-            ollamaModel: s.routerOllamaModel || '',
-            openaiUrl: s.routerOpenaiUrl || '',
-            openaiKey: s.routerOpenaiKey || '',
-            openaiModel: s.routerOpenaiModel || '',
-            maxTokens: s.routerMaxTokens || 0,
-            debugMode: s.debugMode,
-        };
         try {
-            const result = await sendStateRequest(aiSettings, systemPrompt, userPrompt);
+            const result = await sendStateRequest(getCharacterCreationConnectionSettings(s), systemPrompt, userPrompt);
             return (result || '').trim() || null;
         } catch (err) {
             toastr['error'](`Bio generation failed: ${String(err.message || err).substring(0, 120)}`, 'PC Import');
@@ -1350,8 +1514,9 @@ ${wordCount === 'same'
     : `- Total word count across all sections: approximately ${wordCount} words.`}
 - Write in third person (he/she/they).
 - Keep prose grounded and natural. Avoid purple prose.
-- Do not include a preamble, title, or closing statement. Output ONLY the six sections.
+- Do not include a preamble, title, or closing statement. Output ONLY the ${coreSections.length} sections listed above.
 - Faithfully incorporate all provided traits, species, gender, and appearance from the card.
+- Do NOT describe worn clothing, armor, or gear in the Body section — that belongs exclusively in the Equipment section (if present).
 - CRITICAL: The world reference below is for setting context only — do NOT copy text from it.
 - CRITICAL: Never output template macro strings such as {{char}}, {{user}}, or any other {{...}} placeholders. Always replace them with the actual character's name or a fitting proper name.`;
 
@@ -1361,20 +1526,8 @@ ${wordCount === 'same'
     const userPrompt = `CHARACTER CARD:\n${cardText}${worldSection}\n\nWrite the persona description for ${name}.`;
 
 
-    const aiSettings = {
-        connectionSource: s.routerConnectionSource ?? 'default',
-        connectionProfileId: s.routerConnectionProfileId || '',
-        completionPresetId: s.routerCompletionPresetId || '',
-        ollamaUrl: s.routerOllamaUrl || 'http://localhost:11434',
-        ollamaModel: s.routerOllamaModel || '',
-        openaiUrl: s.routerOpenaiUrl || '',
-        openaiKey: s.routerOpenaiKey || '',
-        openaiModel: s.routerOpenaiModel || '',
-        maxTokens: s.routerMaxTokens || 0,
-        debugMode: s.debugMode,
-    };
     try {
-        const result = await sendStateRequest(aiSettings, systemPrompt, userPrompt);
+        const result = await sendStateRequest(getCharacterCreationConnectionSettings(s), systemPrompt, userPrompt);
         return (result || '').trim() || null;
     } catch (err) {
         toastr['error'](`Bio generation failed: ${String(err.message || err).substring(0, 120)}`, 'PC Import');

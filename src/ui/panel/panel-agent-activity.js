@@ -1,9 +1,33 @@
 import { runtimeState } from '../../app/runtime-state.js';
+import { getActiveChatId } from '../../../state-manager.js';
+import { createChatCommitGuard, chatCommitResult } from '../../state/pass-affinity.js';
+import {
+    findLoreHistoryIndexForChat,
+    isLoreRedoEntryForChat,
+} from '../../state/lorebook-history.js';
+import { isLocationMappingEnabled } from '../../state/section-enabled.js';
+
+function getActiveLoreHistoryScope(settings = {}) {
+    const chatId = runtimeState.currentChatId
+        || (typeof globalThis._rpgCurrentChatId === 'function' ? globalThis._rpgCurrentChatId() : null)
+        || (typeof SillyTavern !== 'undefined' ? SillyTavern.getContext()?.chatId : null)
+        || null;
+    return {
+        chatId,
+        campaignPrefix: settings.routerCampaignPrefix || '',
+    };
+}
+
+function getScopedRedoEntries(scope) {
+    return (runtimeState.loreRedoStack || []).filter(entry => isLoreRedoEntryForChat(entry, scope));
+}
 
 /** Wires Lorebook Agent history, active-key refresh, and last-run status controls. */
 export function wireAgentActivity({
     agentPanel,
+    captureRouterLoreState,
     getRouterTick,
+    getMapUpdaterTick,
     getSettings,
     reapplyRouterPass,
     refreshManifest,
@@ -16,9 +40,10 @@ export function wireAgentActivity({
 
     const syncAgentNav = () => {
         const s = getSettings();
-        const histLen = (s.routerHistory || []).length;
-        const redoLen = runtimeState.loreRedoStack.length;
-        if (agentNavBack) agentNavBack.disabled = histLen === 0;
+        const scope = getActiveLoreHistoryScope(s);
+        const histIdx = findLoreHistoryIndexForChat(s.routerHistory || [], scope);
+        const redoLen = getScopedRedoEntries(scope).length;
+        if (agentNavBack) agentNavBack.disabled = histIdx < 0;
         if (agentNavFwd) agentNavFwd.disabled = redoLen === 0;
         if (agentNavLabel) {
             if (redoLen === 0) {
@@ -32,59 +57,59 @@ export function wireAgentActivity({
         }
     };
 
-    /** Snapshot the current lorebook state for the books touched by the given history entry. */
-    const captureCurrentLoreState = async (histEntry) => {
-        const ctx = SillyTavern.getContext();
-        const s = getSettings();
-        const bookNames = Object.keys(histEntry.bookSnapshots || {});
-        const bookSnapshots = {};
-        for (const name of bookNames) {
-            try {
-                const book = await ctx.loadWorldInfo(name);
-                if (book) bookSnapshots[name] = JSON.parse(JSON.stringify(book));
-            } catch (_) { }
-        }
-        return {
-            timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            activeRouterKeys: JSON.parse(JSON.stringify(s.activeRouterKeys || [])),
-            activeWorldKeys: JSON.parse(JSON.stringify(s.activeWorldKeys || [])),
-            routerLastRunChatLength: s.routerLastRunChatLength ?? 0,
-            bookSnapshots,
-        };
-    };
-
     if (agentNavBack) {
         agentNavBack.addEventListener('click', async () => {
+            const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
             const s = getSettings();
-            if (!(s.routerHistory || []).length) return;
+            const scope = getActiveLoreHistoryScope(s);
+            const histIdx = findLoreHistoryIndexForChat(s.routerHistory || [], scope);
+            if (histIdx < 0) return;
             agentNavBack.disabled = true;
             if (agentNavFwd) agentNavFwd.disabled = true;
-            const histEntry = s.routerHistory[0];
-            const postPassState = await captureCurrentLoreState(histEntry);
-            const ok = await rollbackRouterPass(0);
-            if (ok) {
-                runtimeState.loreRedoStack.push({ prePassSnapshot: histEntry, postPassState });
-            } else {
-                toastr['error']('Rollback failed. Check console.', 'Lorebook Agent');
+            const histEntry = s.routerHistory[histIdx];
+            try {
+                const postPassState = chatCommitResult(ownsChat, await captureRouterLoreState());
+                const ok = chatCommitResult(ownsChat, await rollbackRouterPass(histIdx, postPassState));
+                if (ok) {
+                    runtimeState.loreRedoStack.push({ prePassSnapshot: histEntry, postPassState });
+                } else {
+                    toastr['error']('Rollback failed; safety recovery was attempted. Check console.', 'Lorebook Agent');
+                }
+            } catch (error) {
+                if (!ownsChat()) return;
+                console.error('[RPG Tracker] Could not capture a safe rollback recovery state:', error);
+                toastr['error']('Undo stopped because a complete safety snapshot could not be made.', 'Lorebook Agent');
             }
             syncAgentNav();
-            await refreshManifest();
+            await refreshManifest('rollback');
         });
     }
 
     if (agentNavFwd) {
         agentNavFwd.addEventListener('click', async () => {
-            if (!runtimeState.loreRedoStack.length) return;
+            const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
+            const s = getSettings();
+            const scope = getActiveLoreHistoryScope(s);
+            const scopedRedo = getScopedRedoEntries(scope);
+            if (!scopedRedo.length) return;
             if (agentNavBack) agentNavBack.disabled = true;
             agentNavFwd.disabled = true;
-            const redoEntry = runtimeState.loreRedoStack.pop();
-            const ok = await reapplyRouterPass(redoEntry.prePassSnapshot, redoEntry.postPassState);
+            const redoEntry = scopedRedo[scopedRedo.length - 1];
+            const stackIdx = runtimeState.loreRedoStack.lastIndexOf(redoEntry);
+            if (stackIdx >= 0) runtimeState.loreRedoStack.splice(stackIdx, 1);
+            let ok = false;
+            try {
+                ok = await reapplyRouterPass(redoEntry.prePassSnapshot, redoEntry.postPassState);
+            } catch (error) {
+                if (ownsChat()) console.error('[RPG Tracker] Could not redo lorebook pass:', error);
+            }
+            if (!ownsChat()) return;
             if (!ok) {
                 runtimeState.loreRedoStack.push(redoEntry);
                 toastr['error']('Redo failed. Check console.', 'Lorebook Agent');
             }
             syncAgentNav();
-            await refreshManifest();
+            await refreshManifest('redo');
         });
     }
 
@@ -115,13 +140,14 @@ export function wireAgentActivity({
     const keysRefreshBtn = agentPanel.querySelector('#rt-agent-keys-refresh');
     if (keysRefreshBtn) {
         keysRefreshBtn.addEventListener('click', async (e) => {
+            const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
             e.stopPropagation();
             keysRefreshBtn.querySelector('i')?.classList.add('fa-spin');
-            const _ctx = SillyTavern.getContext();
-            if (typeof _ctx.updateWorldInfoList === 'function') {
-                try { await _ctx.updateWorldInfoList(); } catch (_) { }
-            }
             await runtimeState.renderRouterUI();
+            if (!ownsChat()) return;
+            if (typeof runtimeState.refreshAgentManifest === 'function') {
+                await runtimeState.refreshAgentManifest('manual-button');
+            }
             keysRefreshBtn.querySelector('i')?.classList.remove('fa-spin');
         });
     }
@@ -151,22 +177,33 @@ export function wireAgentActivity({
             const nextIn = Math.max(0, runEvery - tick);
             parts.push(`Next in: ${nextIn} msg${nextIn !== 1 ? 's' : ''}`);
         }
+        if (s.mapUpdaterEnabled !== false && isLocationMappingEnabled(s)) {
+            const mapEvery = Math.max(1, Number(s.mapUpdaterRunEvery) || 1);
+            const mapTick = typeof getMapUpdaterTick === 'function' ? getMapUpdaterTick() : 0;
+            if (mapEvery > 1) {
+                const mapNext = Math.max(0, mapEvery - mapTick);
+                parts.push(`Map in: ${mapNext} msg${mapNext !== 1 ? 's' : ''}`);
+            } else {
+                parts.push('Map: every turn');
+            }
+        }
         lastRunEl.textContent = parts.join(' · ');
     }
     syncLastRunDisplay();
 
-    document.addEventListener('rt_lore_agent_updated', async () => {
+    document.addEventListener('rt_lore_agent_updated', async (event) => {
+        const ownsChat = createChatCommitGuard(getActiveChatId(), getActiveChatId);
         saveSettings();
-        // Flush ST's in-memory lorebook cache before re-rendering so that
-        // loadWorldInfo() picks up the entries we just wrote via the HTTP API.
-        const _ctx = SillyTavern.getContext();
-        if (typeof _ctx.updateWorldInfoList === 'function') {
-            try { await _ctx.updateWorldInfoList(); } catch (_) { }
-        }
+        // Rollback/redo requests use the manifest's dedicated disk-authoritative
+        // list path. Avoid updateWorldInfoList here: it downloads and parses the
+        // user's complete settings payload and made event bursts extremely costly.
         await runtimeState.renderRouterUI();
+        if (!ownsChat()) return;
         if (typeof runtimeState.refreshAgentManifest === 'function') {
-            await runtimeState.refreshAgentManifest();
+            const source = (/** @type {CustomEvent} */ (event)).detail?.source || 'auto';
+            await runtimeState.refreshAgentManifest(source);
         }
+        if (!ownsChat()) return;
         updateUndoLabel();
         syncLastRunDisplay();
     });

@@ -34,6 +34,12 @@ function normalizeEntityName(name) {
 }
 
 export { normalizeEntityName };
+export {
+    snapshotPortraitMapsForChat,
+    loadPortraitMapsForChat,
+    migrateLegacyPortraitMapsToChat,
+    portraitWriteMode,
+} from './src/state/portrait-chat-scope.js';
 
 /** Resolve a stored portrait ref for an entity label (handles HTML entities + class suffix). */
 export function lookupCustomPortraitSrc(settings, entityName, portraitsMap) {
@@ -184,6 +190,9 @@ export function countPortraitPathRefs(settings, targetPath) {
     for (const cs of Object.values(settings.chatStates || {})) {
         scan(cs.customPortraits);
         scan(cs.customLocationImages);
+    }
+    for (const rec of settings.npcLibrary || []) {
+        if (rec?.portraitPath === targetPath) count++;
     }
     return count;
 }
